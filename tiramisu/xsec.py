@@ -1456,18 +1456,7 @@ class ExomolNLTEXsec(ExomolHDF5Xsec):
         mu_values, mu_weights = np.polynomial.legendre.leggauss(n_angular_points)
         mu_values, mu_weights = (mu_values + 1) * 0.5, mu_weights / 2
 
-        # tau_plus_matrix = np.zeros_like(tau)
-        # tau_plus_matrix[:-1] = np.abs(tau[:-1] - tau[1:])
-        # # tau_plus_matrix = tau_plus_matrix[:, None, :] / mu_values[:, :, None]  # 2D mu, i.e.: layer dependent mu.
-        # tau_plus_matrix = tau_plus_matrix[:, None, :] / mu_values[None, :, None]  # 1D mu.
-        # tau_minus_matrix = np.zeros_like(tau)
-        # tau_minus_matrix[1:] = np.abs(tau[1:] - tau[:-1])
-        # # tau_minus_matrix = tau_minus_matrix[:, None, :] / mu_values[:, :, None]  # 2D mu.
-        # tau_minus_matrix = tau_minus_matrix[:, None, :] / mu_values[None, :, None]  # 1D mu.
-
         start_time = time.perf_counter()
-        # plus_coefficients = lambda_coefficients_new(tau_1_matrix=tau_plus_matrix, tau_2_matrix=tau_minus_matrix)
-        # minus_coefficients = lambda_coefficients_new(tau_1_matrix=tau_minus_matrix, tau_2_matrix=tau_plus_matrix)
 
         res = self.global_chi_matrix * self.dz_profile[:, None]
         dtau = res.decompose().value
@@ -1897,112 +1886,6 @@ class ExomolNLTEXsec(ExomolHDF5Xsec):
                 i_prec = (i_layer_grid - psi_approx_eta) * 4 * np.pi * u.sr
                 log.info(f"[L{layer_idx}] average I_prec = {i_prec.mean()}")
 
-                # # Cross Terms
-                # for trans_row in self.rates_grid.itertuples(index=False):
-                #     p_idx = trans_row[0]
-                #     q_idx = trans_row[1]
-                #     # p_idx != q_idx
-                #     # Note: E_p can be above or below E_q
-                #     abs_profile = self.abs_profile_grid[nlte_layer_idx].get((p_idx, q_idx))
-                #     emi_profile = self.emi_profile_grid[nlte_layer_idx].get((p_idx, q_idx))
-                #     emi_end_idx = emi_profile.start_idx + len(emi_profile.profile)
-                #
-                #     stim_emi_profile = (
-                #         emi_profile.profile
-                #         * emi_profile.integral
-                #         * u.erg
-                #         * u.cm
-                #         / (
-                #             2
-                #             * u.s
-                #             * ac.h.cgs
-                #             * ac.c.cgs**2
-                #             * wn_grid[emi_profile.start_idx : emi_end_idx] ** 3
-                #         )
-                #     )
-                #     stim_emi_profile = stim_emi_profile.value / simpson(
-                #         stim_emi_profile, x=wn_grid[emi_profile.start_idx : emi_end_idx]
-                #     )
-                #
-                #     chi_pq = np.zeros(lambda_layer_grid.shape[0]) << (u.m**2) / (u.J * u.s)
-                #     # Old:
-                #     # chi_pq[abs_profile.start_idx : abs_profile.start_idx + len(abs_profile.profile)] += (
-                #     #     self.pop_matrix[-1, layer_idx, trans_row[1]] * trans_row[4] * abs_profile.profile
-                #     # )
-                #     # # Approximate, works better in dense spectra. Relies on the grid point being roughly a line center.
-                #     # chi_pq[emi_profile.start_idx : emi_profile.start_idx + len(emi_profile.profile)] -= (
-                #     #     self.pop_matrix[-1, layer_idx, trans_row[0]]
-                #     #     * trans_row[3]
-                #     #     * emi_profile.profile
-                #     #     / wn_grid[emi_profile.start_idx : emi_profile.start_idx + len(emi_profile.profile)].value ** 3
-                #     # )
-                #     # chi_pq = (
-                #     #     chi_pq
-                #     #     * u.m**2
-                #     #     * u.cm
-                #     #     * ac.h
-                #     #     * wn_grid
-                #     #     * self.chem_profile[self.species][layer_idx]
-                #     #     / (4 * np.pi * u.J * u.s)
-                #     # )
-                #     # New:
-                #     chi_pq[abs_profile.start_idx : abs_profile.start_idx + len(abs_profile.profile)] += (
-                #         self.pop_matrix[-1, layer_idx, trans_row[1]] * abs_profile.profile * trans_row[4] * (u.m**2) / (u.J * u.s)
-                #     )
-                #     chi_pq[emi_profile.start_idx : emi_end_idx] -= (
-                #         self.pop_matrix[-1, layer_idx, trans_row[0]] * stim_emi_profile * trans_row[3] * (u.m**2) / (u.J * u.s)
-                #     )
-                #     # chi_pq = np.where(chi_pq < 0, self.negative_absorption_factor * abs(chi_pq), chi_pq)
-                #
-                #     # psi_approx_chi_pq = np.zeros(lambda_layer_grid.shape[0]) << chi_pq.unit / global_chi.unit
-                #     # psi_approx_chi_pq[global_chi != 0] = (
-                #     #     lambda_layer_grid[global_chi != 0] * chi_pq[global_chi != 0] / global_chi[global_chi != 0]
-                #     # )
-                #     # psi_approx_chi_pq = np.clip(abs(psi_approx_chi_pq), 0, abs(lambda_layer_grid))
-                #     for o_idx in np.arange(0, self.n_agg_states):
-                #         a_ox_cross = np.zeros(lambda_layer_grid.shape[0]) << u.erg
-                #         for ox_trans in self.rates_grid.loc[self.rates_grid["id_f_agg"] == o_idx].itertuples(
-                #             index=False
-                #         ):
-                #             # log.info(f"Adding A_{ox_trans[0], ox_trans[1]}")
-                #             ox_emi_profile = self.emi_profile_grid[nlte_layer_idx].get((ox_trans[0], ox_trans[1]))
-                #             ox_emi_end_idx = ox_emi_profile.start_idx + len(ox_emi_profile.profile)
-                #             # Old:
-                #             # a_ox_cross[ox_emi_profile.start_idx : ox_emi_end_idx] += (
-                #             #     ox_trans[2] * ox_emi_profile.profile / u.s  # A_fu
-                #             # )
-                #             # New:
-                #             a_ox_cross[ox_emi_profile.start_idx : ox_emi_end_idx] += (
-                #                 ox_emi_profile.profile
-                #                 * ox_emi_profile.integral
-                #                 * u.erg
-                #                 * u.cm
-                #                 * self.chem_profile[self.species][layer_idx]
-                #                 / (u.s * ac.c.cgs)
-                #             )
-                #         if np.all(a_ox_cross == 0):
-                #             continue
-                #
-                #         psi_approx_cross = np.zeros(lambda_layer_grid.shape[0]) << a_ox_cross.unit / global_chi.unit
-                #         psi_approx_cross[global_chi != 0] = (
-                #             lambda_layer_grid[global_chi != 0] * a_ox_cross[global_chi != 0] / global_chi[global_chi != 0]
-                #         )
-                #         if np.any(abs(psi_approx_cross) > i_layer_grid):
-                #             log.error(f"[L{layer_idx}] Psi*cross > Intensity!?")
-                #         psi_approx_cross = np.clip(abs(psi_approx_cross), 0, i_layer_grid)
-                #
-                #         psi_approx_cross = (
-                #             simpson(chi_pq * psi_approx_cross, x=wn_grid) << psi_approx_cross.unit * chi_pq.unit
-                #         ).decompose()
-                #         log.info(
-                #             f"[L{layer_idx}] Adding Chi_{q_idx, p_idx}Psi*[Sum_(j<{o_idx}) A_({o_idx}, j)] = {-psi_approx_cross}"
-                #         )
-                #         y_matrix[q_idx, o_idx] -= psi_approx_cross
-                #         log.info(
-                #             f"[L{layer_idx}] Adding Chi_{p_idx, q_idx}Psi*[Sum_(j<{o_idx}) A_({o_idx}, j)] = {psi_approx_cross}"
-                #         )
-                #         y_matrix[p_idx, o_idx] += psi_approx_cross
-
                 for trans_row in self.rates_grid.itertuples(index=False):
                     # 0 = id_f_agg, 1 = id_i_agg, 2 = A_fi, 3 = B_fi, 4 = B_if.
                     a_fi = trans_row[2] / u.s
@@ -2270,79 +2153,6 @@ class ExomolNLTEXsec(ExomolHDF5Xsec):
                     y_matrix[trans_row[0], trans_row[0]] -= u_fi + v_fi_prec
                     y_matrix[trans_row[1], trans_row[1]] -= v_if_prec
 
-                # # Cross Terms!
-                # if self.cont_rates is not None:
-                #     for cont_row in self.cont_rates.itertuples(index=False):
-                #         # p_idx = cont_row[0]
-                #         q_idx = cont_row[0]
-                #         # p_idx != q_idx
-                #         # Note: E_p can be above or below E_q
-                #         abs_profile = self.cont_profile_grid[nlte_layer_idx].get(q_idx)
-                #         chi_cq = np.zeros(lambda_layer_grid.shape[0]) << (u.m**2) / (u.J * u.s)
-                #         # Old:
-                #         # chi_cq[abs_profile.start_idx : abs_profile.start_idx + len(abs_profile.profile)] += (
-                #         #     self.pop_matrix[-1, layer_idx, cont_row[0]] * cont_row[3] * abs_profile.profile
-                #         # )
-                #         # chi_cq = (
-                #         #     chi_cq
-                #         #     * u.m**2
-                #         #     * u.cm
-                #         #     * ac.h
-                #         #     * wn_grid
-                #         #     * self.chem_profile[self.species][layer_idx]
-                #         #     / (4 * np.pi * u.J * u.s)
-                #         # )
-                #         # New
-                #         chi_cq[abs_profile.start_idx : abs_profile.start_idx + len(abs_profile.profile)] += (
-                #             self.pop_matrix[-1, layer_idx, cont_row[0]] * abs_profile.profile * cont_row[3] * (u.m**2) / (u.J * u.s)
-                #         )
-                #         # chi_cq = np.where(chi_cq < 0, self.negative_absorption_factor * abs(chi_cq), chi_cq)
-                #
-                #         # psi_approx_chi_cq = np.zeros(lambda_layer_grid.shape[0]) << chi_cq.unit / global_chi.unit
-                #         # psi_approx_chi_cq[global_chi != 0] = (
-                #         #     lambda_layer_grid[global_chi != 0] * chi_cq[global_chi != 0] / global_chi[global_chi != 0]
-                #         # )
-                #         # psi_approx_chi_cq = np.clip(abs(psi_approx_chi_cq), 0, abs(lambda_layer_grid))
-                #
-                #         for o_idx in np.arange(0, self.n_agg_states):
-                #             a_ox_cross = np.zeros(lambda_layer_grid.shape[0]) << u.erg
-                #             for ox_trans in self.rates_grid.loc[self.rates_grid["id_f_agg"] == o_idx].itertuples(
-                #                 index=False
-                #             ):
-                #                 # log.info(f"Adding A_{ox_trans[0], ox_trans[1]}")
-                #                 ox_emi_profile = self.emi_profile_grid[nlte_layer_idx].get((ox_trans[0], ox_trans[1]))
-                #                 ox_emi_end_idx = ox_emi_profile.start_idx + len(ox_emi_profile.profile)
-                #                 # Old:
-                #                 # a_ox_cross[ox_emi_profile.start_idx : ox_emi_end_idx] += (
-                #                 #     ox_trans[2] * ox_emi_profile.profile / u.s  # A_fu
-                #                 # )
-                #                 # New:
-                #                 a_ox_cross[ox_emi_profile.start_idx : ox_emi_end_idx] += (
-                #                     ox_emi_profile.profile
-                #                     * ox_emi_profile.integral
-                #                     * u.erg
-                #                     * u.cm
-                #                     * self.chem_profile[self.species][layer_idx]
-                #                     / (u.s * ac.c.cgs)
-                #                 )
-                #             if np.all(a_ox_cross == 0):
-                #                 continue
-                #             psi_approx_cross = np.zeros(lambda_layer_grid.shape[0]) << a_ox_cross.unit / global_chi.unit
-                #             psi_approx_cross[global_chi != 0] = (
-                #                     lambda_layer_grid[global_chi != 0] * a_ox_cross[global_chi != 0] / global_chi[
-                #                 global_chi != 0]
-                #             )
-                #             if np.any(abs(psi_approx_cross) > i_layer_grid):
-                #                 log.error(f"[L{layer_idx}] Psi*cross > Intensity!?")
-                #             psi_approx_cross = np.clip(abs(psi_approx_cross), 0, i_layer_grid)
-                #             psi_approx_cross = (
-                #                     simpson(chi_cq * psi_approx_cross, x=wn_grid) << psi_approx_cross.unit * chi_cq.unit
-                #             ).decompose()
-                #             log.info(
-                #                 f"[L{layer_idx}] Adding Chi_({q_idx}, c)Psi*[Sum_(j<{o_idx}) A_({o_idx}, j)] = {-psi_approx_cross}"
-                #             )
-                #             y_matrix[q_idx, o_idx] -= psi_approx_cross
-
                 if self.cont_rates is not None:
                     for cont_trans_row in self.cont_rates.itertuples(index=False):
                         a_ci = cont_trans_row[1] / u.s
@@ -2509,13 +2319,7 @@ class ExomolNLTEXsec(ExomolHDF5Xsec):
                         # y_matrix[cont_trans_row[0], cont_trans_row[0]] += a_ci * z_ci * limiting_scale_factor
                         y_matrix[cont_trans_row[0], cont_trans_row[0]] += a_ci * limiting_scale_factor
                         y_matrix[cont_trans_row[0], cont_trans_row[0]] += v_ic_prec * limiting_scale_factor
-                # y_matrix = y_matrix.value
-                # y_reduced_idx_map = [idx for idx in range(0, len(y_matrix)) if sum(abs(y_matrix[idx])) != 0]
-                # y_matrix_reduced = y_matrix[np.ix_(y_reduced_idx_map, y_reduced_idx_map)]
-                # log.info(y_matrix_reduced)
-                # log.info((self.chem_profile[SpeciesFormula("H")][layer_idx] * self.density_profile[layer_idx]).to(u.cm**-3))
-                # log.info(self.agg_states.head(11))
-                # exit()
+
                 y_matrix = self.add_col_chem_rates(y_matrix=y_matrix, layer_idx=layer_idx, layer_temp=layer_temp)
 
                 y_matrix = y_matrix.value
@@ -2683,7 +2487,7 @@ class ExomolNLTEXsec(ExomolHDF5Xsec):
                     0,
                     nlte_states["n"] * nlte_states["n_agg_nlte"] / nlte_states["n_agg"],
                 )
-                # TODO: The above is a placeholder: where n_agg_nlte is non-zero, n_nlte should be non-zero even if
+                # TODO: Above has some failure cases: where n_agg_nlte is non-zero, n_nlte should be non-zero even if
                 #  n_agg or n are zero. This matters at low temperatures where some of the high energy states will have
                 #  effectively 0 population. Does it? they will be small but never 0.
                 log.info(
@@ -2735,24 +2539,6 @@ class ExomolNLTEXsec(ExomolHDF5Xsec):
                 log.info(f"[L{layer_idx}] Numba Voigt duration = {time.perf_counter() - start_time}")
                 if np.any(abs_xsec < 0):
                     log.warn(f"[L{layer_idx}] Negative contribution in absorption (stimulated emission dominates)")
-                # plt.plot(wn_grid.value, abs_xsec, color="#33BBEEBB", label="Old (On-the-fly Voigt) Abs.")
-                # # plt.plot(xcross_wn, xcross_abs, color="#FFBB00BB", label="Old (ExoCross)")
-                # # plt.plot(xcross_wn2, xcross_abs2, color="#CC3311BB", label="Old (ExoCross LTE)")
-                # plt.plot(wn_grid.value, _temp_xsec, color="#EE3377BB", label="New (Stored band profiles) Abs.")
-                #
-                # plt.plot(wn_grid.value, emi_xsec, color="#33BBEEBB", label="Old (On-the-fly Voigt) Emi.")
-                # plt.yscale("log")
-                # plt.legend()
-                # plt.title(f"[L{layer_idx}] Absorption XSec Old vs. New")
-                # plt.tight_layout()
-                # plt.savefig(fr"/mnt/c/PhD/programs/charlesrex/L{layer_idx}_abs_emi_xsec_test.png", dpi=600)
-                # plt.show()
-                # abs_xsec_integral = simpson(abs_xsec, x=wn_grid.value)
-                # xcross_abs_nlte_integral = simpson(xcross_abs, x=xcross_wn)
-                # xcross_abs_lte_integral = simpson(xcross_abs2, x=xcross_wn2)
-                # log.info(f"[L{layer_idx}] On-the-fly Voigt integral = {abs_xsec_integral}.\n"
-                #       f"ExoCross LTE integral = {xcross_abs_lte_integral} (x {xcross_abs_lte_integral/abs_xsec_integral}) "
-                #       f"and nLTE = {xcross_abs_nlte_integral} (x {xcross_abs_nlte_integral/abs_xsec_integral}).")
 
                 if self.cont_states is not None and self.cont_trans_files is not None:
                     # start_time = time.perf_counter()
@@ -2921,51 +2707,6 @@ def bezier_debug(
         if not np.all(i_matrix[layer_idx] >= 0):
             log.warning(f"[L{layer_idx}] Warn: {direction} INTENSITY BEZIER BAD :(")
             log.warning(f"Negative intensities in previous layer? {np.any(i_matrix[also_check_idx] < 0)}")
-        # if not np.all(lambda_matrix[layer_idx] >= 0):
-        #     log.warning(f"[L{layer_idx}] Warn: {direction} LAMBDA BEZIER BAD :(")
-        # log.debug("delta = ", bezier_coefs[coefs_check_idx, 0])
-        # if np.any(bezier_coefs[coefs_check_idx, 0] < 0):
-        #     log.warning(f"[L{layer_idx}] Warn: Negative deltas!")
-        #     # np.savetxt(
-        #     #     (output_dir / f"delta_{direction}_L{layer_idx}.txt").resolve(),
-        #     #     bezier_coefs[coefs_check_idx, 0],
-        #     # )
-        # log.debug("alpha = ", bezier_coefs[coefs_check_idx, 1])
-        # if np.any(bezier_coefs[coefs_check_idx, 1] < 0):
-        #     log.warning(f"[L{layer_idx}] Warn: Negative alphas!")
-        #     # np.savetxt(
-        #     #     (output_dir / f"alpha_{direction}_L{layer_idx}.txt").resolve(),
-        #     #     bezier_coefs[coefs_check_idx, 1],
-        #     # )
-        # log.debug("beta = ", bezier_coefs[coefs_check_idx, 2])
-        # if np.any(bezier_coefs[coefs_check_idx, 2] < 0):
-        #     log.warning(f"[L{layer_idx}] Warn: Negative betas!")
-        #     np.savetxt(
-        #         (output_dir / f"beta_{direction}_L{layer_idx}.txt").resolve(),
-        #         bezier_coefs[coefs_check_idx, 2],
-        #     )
-        # log.debug("gamma = ", bezier_coefs[coefs_check_idx, 3])
-        # if np.any(bezier_coefs[coefs_check_idx, 3] < 0):
-        #     log.warning(f"[L{layer_idx}] Warn: Negative gammas!")
-        #     np.savetxt(
-        #         (output_dir / f"gamma_{direction}_L{layer_idx}.txt").resolve(),
-        #         bezier_coefs[coefs_check_idx, 3],
-        #     )
-        # log.debug("C = ", control_points[layer_idx, control_point_idx])
-        # if np.any(control_points[layer_idx, control_point_idx] < 0):
-        #     log.warning(f"[L{layer_idx}] Warn: Negative C!")
-        #     np.savetxt(
-        #         (output_dir / f"c_{direction}_L{layer_idx}.txt").resolve(),
-        #         control_points[layer_idx, control_point_idx].value,
-        #     )
-        # np.savetxt(
-        #     (output_dir / f"intens_{direction}_L{layer_idx}.txt").resolve(),
-        #     i_matrix[layer_idx].value,
-        # )
-        # np.savetxt(
-        #     (output_dir / f"intens_{direction}_L{layer_idx + 1}.txt").resolve(),
-        #     i_matrix[also_check_idx].value,
-        # )
 
 
 class XSecCollection(dict):

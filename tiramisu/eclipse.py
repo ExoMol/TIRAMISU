@@ -10,7 +10,7 @@ from .atmos import (
     density_profile,
     solve_scaleheight,
 )
-from .xsec import XSecCollection, ExomolNLTEXsec  # ,  blackbody
+from .xsec import XSecCollection, ExomolNLTEXsec
 from .nlte import blackbody
 from .config import log, output_dir
 

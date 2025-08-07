@@ -56,8 +56,6 @@ const_2_pi_c_kB = (2 * np.pi * ac.c.cgs * ac.k_B.cgs).value
 
 
 # TODO: Handles NANs in state lifetimes; treat as inf?
-# TODO: Continuum profiles can be generic? or other method to only return abs/emi?
-# TODO: Check TODOs!
 
 
 class BandProfile:
@@ -388,100 +386,6 @@ def calc_band_profile(
             return BandProfile(profile=_abs_xsec)
 
 
-# def update_tau_matrices(global_xsec_matrix, dz_profile) -> t.Tuple[
-#     npt.NDArray[np.float64],
-#     npt.NDArray[np.float64],
-#     npt.NDArray[np.float64],
-#     npt.NDArray[np.float64],
-#     npt.NDArray[np.float64],
-# ]:
-#     res = global_xsec_matrix * dz_profile[:, None]
-#     dtau = res.decompose()
-#     dtau_toa = dtau[::-1]
-#     tau = dtau_toa.cumsum(axis=0)[::-1]
-#     layer_tau = tau - dtau
-#     tau_matrix = np.exp(-layer_tau.value) - np.exp(-tau.value)
-#
-#     tau_plus_matrix = np.zeros_like(tau_matrix)
-#     tau_plus_matrix[:-1] = np.abs(tau_matrix[:-1] - tau_matrix[1:])
-#     tau_minus_matrix = np.zeros_like(tau_matrix)
-#     tau_minus_matrix[1:] = np.abs(tau_matrix[1:] - tau_matrix[:-1])
-#
-#     plus_coefficients = lambda_coefficients(tau_1_matrix=tau_plus_matrix, tau_2_matrix=tau_minus_matrix)
-#     minus_coefficients = lambda_coefficients(tau_1_matrix=tau_minus_matrix, tau_2_matrix=tau_plus_matrix)
-#
-#     return tau_matrix, tau_plus_matrix, tau_minus_matrix, plus_coefficients, minus_coefficients
-
-
-# def update_tau_matrices_new(
-#     global_xsec_matrix: u.Quantity, dz_profile: u.Quantity, mu_values: npt.NDArray[np.float64]
-# ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-#     res = global_xsec_matrix * dz_profile[:, None]
-#     dtau = res.decompose()
-#     tau = dtau[::-1].cumsum(axis=0)[::-1]
-#     layer_tau = tau - dtau
-#     # tau_matrix = np.exp(-layer_tau.value) - np.exp(-tau.value)
-#
-#     tau_plus_matrix = np.zeros_like(layer_tau)
-#     tau_plus_matrix[:-1] = np.abs(layer_tau[:-1] - layer_tau[1:])
-#     tau_plus_matrix = tau_plus_matrix[:, None, :] / mu_values[None, :, None]
-#     tau_minus_matrix = np.zeros_like(layer_tau)
-#     tau_minus_matrix[1:] = np.abs(layer_tau[1:] - layer_tau[:-1])
-#     tau_minus_matrix = tau_minus_matrix[:, None, :] / mu_values[None, :, None]
-#
-#     plus_coefficients = lambda_coefficients_new(tau_1_matrix=tau_plus_matrix, tau_2_matrix=tau_minus_matrix)
-#     minus_coefficients = lambda_coefficients_new(tau_1_matrix=tau_minus_matrix, tau_2_matrix=tau_plus_matrix)
-#
-#     return tau_plus_matrix, tau_minus_matrix, plus_coefficients, minus_coefficients
-
-
-# def merge_profiles(
-#     start_idxs: npt.NDArray[int],
-#     profiles: npt.NDArray[np.float64],
-#     normalise: bool = False,
-#     wn_grid: npt.NDArray[np.float64] = None,
-# ) -> pd.Series:
-#     if len(start_idxs) != len(profiles):
-#         raise RuntimeError("Length of start_idxs and profiles do not match.")
-#     if normalise and wn_grid is None:
-#         raise RuntimeError("Normalisation specified but no wn_grid provided for integration.")
-#
-#     min_start_idx = min(start_idxs)
-#
-#     if len(start_idxs) > 1:
-#         max_end_idx = max([start_idx + len(profile) for start_idx, profile in zip(start_idxs, profiles)])
-#         primary_idx = np.argmax(start_idxs == min_start_idx)
-#         offset = max_end_idx - min_start_idx - len(profiles[primary_idx])
-#
-#         merged_profile = np.pad(profiles[primary_idx], (0, offset), "constant")
-#
-#         for profile_idx in range(len(start_idxs)):
-#             if profile_idx != primary_idx:
-#                 profile_offset = start_idxs[profile_idx] - min_start_idx
-#                 merged_profile[profile_offset : profile_offset + len(profiles[profile_idx])] += profiles[profile_idx]
-#
-#         if normalise:
-#             merged_profile = normalise_band_profile(wn_grid=wn_grid, start_idx=min_start_idx, profile=merged_profile)
-#
-#         return pd.Series({"start_idx": min_start_idx, "profile": merged_profile})
-#     else:
-#         if normalise:
-#             profiles[0] = normalise_band_profile(wn_grid=wn_grid, start_idx=min_start_idx, profile=profiles[0])
-#         return pd.Series({"start_idx": min_start_idx, "profile": profiles[0]})
-
-
-# def normalise_band_profile(
-#     wn_grid: npt.NDArray[np.float64], start_idx: int, profile: npt.NDArray[np.float64]
-# ) -> npt.NDArray[np.float64]:
-#     if len(profile) == 1 and sum(profile) != 0:
-#         return np.ones_like(profile)
-#     elif sum(profile) == 0:
-#         return profile
-#     else:
-#         # TODO: Ignore below certain threshold? Not based on coef as if all band is below threshold then we do not see
-#         #  it. But a cut at say 10^-10 after normalisation might be effective and minimise the size of the profiles.
-#         return profile / simpson(profile, x=wn_grid[start_idx : start_idx + len(profile)])
-
 
 def calc_lambda_approx(
     band_profile: BandProfile,
@@ -512,26 +416,6 @@ def calc_lambda_approx(
             )
 
 
-# def calc_lambda_approx(band_profile: pd.Series, lambda_grid: npt.NDArray[np.float64], wn_grid: u.Quantity) -> float:
-#     """
-#
-#     :param band_profile:
-#     :param lambda_grid:
-#     :param wn_grid:
-#     :return:
-#     """
-#     if len(band_profile["profile"]) == 0:
-#         return 0
-#     else:
-#         start_idx = band_profile["start_idx"]
-#         end_idx = start_idx + len(band_profile["profile"])
-#
-#         if len(band_profile["profile"]) == 1 and sum(band_profile["profile"]) != 0:
-#             return sum(lambda_grid[start_idx:end_idx])
-#         else:
-#             return simpson(band_profile["profile"] * lambda_grid[start_idx:end_idx], x=wn_grid[start_idx:end_idx])
-
-
 def calc_imi(band_profile: BandProfile, i_grid: u.Quantity, wn_grid: u.Quantity) -> u.Quantity:
     """
     :param band_profile:
@@ -551,28 +435,6 @@ def calc_imi(band_profile: BandProfile, i_grid: u.Quantity, wn_grid: u.Quantity)
             return (
                 simpson(band_profile.profile * i_grid[start_idx:end_idx], x=wn_grid[start_idx:end_idx]) << i_grid.unit
             )
-
-
-# def calc_imi(band_profile: pd.Series, j_grid: u.Quantity, wn_grid: u.Quantity) -> u.Quantity:
-#     """
-#     :param band_profile:
-#     :param j_grid:
-#     :param wn_grid:
-#     :return:
-#     """
-#     if len(band_profile["profile"]) == 0:
-#         return 0 << j_grid.unit
-#     else:
-#         start_idx = band_profile["start_idx"]
-#         end_idx = start_idx + len(band_profile["profile"])
-#
-#         if len(band_profile["profile"]) == 1 and sum(band_profile["profile"]) != 0:
-#             return sum(j_grid[start_idx:end_idx]) << j_grid.unit
-#         else:
-#             return (
-#                 simpson(band_profile["profile"] * j_grid[start_idx:end_idx], x=wn_grid[start_idx:end_idx])
-#                 << j_grid.unit
-#             )
 
 
 def pad_or_trim_profile(
@@ -639,127 +501,6 @@ def calc_lambda_approx_source(
         return np.sum(product) << source_profile.unit
     else:
         return simpson(product, x=wn_grid[start_idx:end_idx]) << source_profile.unit
-
-
-# def mp_sum(data: pd.Series):
-#     return fsum(data)
-
-
-# @numba.njit(parallel=True)
-# def _band_profile_variable_width(
-#         wn_grid: npt.NDArray[np.float64],
-#         n_frac_i: npt.NDArray[np.float64],
-#         n_frac_f: npt.NDArray[np.float64],
-#         a_fi: npt.NDArray[np.float64],
-#         g_f: npt.NDArray[np.float64],
-#         g_i: npt.NDArray[np.float64],
-#         energy_fi: npt.NDArray[np.float64],
-#         lifetimes: npt.NDArray[np.float64],
-#         temperature: float,
-#         pressure: float,
-#         broad_n: npt.NDArray[np.float64],
-#         broad_gamma: npt.NDArray[np.float64],
-#         species_mass: float,
-#         gh_roots: npt.NDArray[np.float64],
-#         gh_weights: npt.NDArray[np.float64],
-#         t_ref: float = 296,
-#         pressure_ref: float = 1,
-# ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-#     _abs_xsec = np.zeros(wn_grid.shape)
-#     _emi_xsec = np.zeros(wn_grid.shape)
-#     num_trans = energy_fi.shape[0]
-#     num_grid = wn_grid.shape[0]
-#
-#     bin_widths = np.zeros(wn_grid.shape[0] + 1)
-#     bin_widths[1:-1] = (wn_grid[:-1] + wn_grid[1:]) / 2.0 - wn_grid[:-1]
-#
-#     abs_coef = g_f * n_frac_i * a_fi * (1 - np.exp(-const_h_c_on_kB * energy_fi / temperature)) / (
-#             const_8_pi_five_halves_c * g_i * energy_fi ** 2)
-#     emi_coef = n_frac_f * a_fi * energy_fi * const_h_c_on_4_pi_five_halves
-#     sigma = energy_fi * const_sqrt_NA_kB_on_c * np.sqrt(temperature / species_mass)
-#     gamma_pressure = np.sum(broad_gamma * pressure * (t_ref / temperature) ** broad_n / pressure_ref)
-#     gamma_lifetime = 1 / (const_4_pi_c * lifetimes)
-#     gamma_total = gamma_lifetime + gamma_pressure
-#
-#     for i in numba.prange(num_trans):
-#         gh_roots_sigma = gh_roots * sigma[i]
-#         start_sigma = wn_grid[0] - gh_roots_sigma
-#         end_sigma = wn_grid[-1] - gh_roots_sigma
-#         b_corr = np.pi / (
-#                 np.arctan((end_sigma - energy_fi[i]) / gamma_total[i]) -
-#                 np.arctan((start_sigma - energy_fi[i]) / gamma_total[i])
-#         )
-#         for j in range(num_grid):
-#             wn_shift = wn_grid[j] - energy_fi[i]
-#             upper_width = bin_widths[j + 1]
-#             lower_width = bin_widths[j]
-#             # if np.abs(wn_shift) <= 25:
-#             if min(abs(wn_shift - lower_width), abs(wn_shift + upper_width)) <= 25:
-#                 shift_sigma = wn_shift - gh_roots_sigma
-#                 bin_term = np.sum(gh_weights * b_corr * (
-#                         np.arctan((shift_sigma + upper_width) / gamma_total[i]) -
-#                         np.arctan((shift_sigma - lower_width) / gamma_total[i])
-#                 )) / (upper_width + lower_width)
-#                 _abs_xsec[j] += abs_coef[i] * bin_term
-#                 _emi_xsec[j] += emi_coef[i] * bin_term
-#     return _abs_xsec, _emi_xsec
-
-
-# @numba.njit(parallel=True)
-# def _band_profile_fixed_width(
-#         wn_grid: npt.NDArray[np.float64],
-#         n_frac_i: npt.NDArray[np.float64],
-#         n_frac_f: npt.NDArray[np.float64],
-#         a_fi: npt.NDArray[np.float64],
-#         g_f: npt.NDArray[np.float64],
-#         g_i: npt.NDArray[np.float64],
-#         energy_fi: npt.NDArray[np.float64],
-#         lifetimes: npt.NDArray[np.float64],
-#         temperature: float,
-#         pressure: float,
-#         broad_n: npt.NDArray[np.float64],
-#         broad_gamma: npt.NDArray[np.float64],
-#         species_mass: float,
-#         half_bin_width: float,
-#         gh_roots: npt.NDArray[np.float64],
-#         gh_weights: npt.NDArray[np.float64],
-#         t_ref: float = 296,
-#         pressure_ref: float = 1,
-# ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-#     bin_width = 2.0 * half_bin_width
-#     _abs_xsec = np.zeros(wn_grid.shape)
-#     _emi_xsec = np.zeros(wn_grid.shape)
-#     num_trans = energy_fi.shape[0]
-#     num_grid = wn_grid.shape[0]
-#     cutoff = 25 + half_bin_width
-#
-#     abs_coef = g_f * n_frac_i * a_fi * (1 - np.exp(-const_h_c_on_kB * energy_fi / temperature)) / (
-#             const_8_pi_five_halves_c * bin_width * g_i * energy_fi ** 2)
-#     emi_coef = n_frac_f * a_fi * energy_fi * const_h_c_on_4_pi_five_halves / bin_width
-#     sigma = energy_fi * const_sqrt_NA_kB_on_c * np.sqrt(temperature / species_mass)
-#     gamma_pressure = np.sum(broad_gamma * pressure * (t_ref / temperature) ** broad_n / pressure_ref)
-#     gamma_lifetime = 1 / (const_4_pi_c * lifetimes)
-#     gamma_total = gamma_lifetime + gamma_pressure
-#
-#     for i in numba.prange(num_trans):
-#         gh_roots_sigma = gh_roots * sigma[i]
-#         start_sigma = wn_grid[0] - gh_roots_sigma
-#         end_sigma = wn_grid[-1] - gh_roots_sigma
-#         b_corr = np.pi / (
-#                 np.arctan((end_sigma - energy_fi[i]) / gamma_total[i]) -
-#                 np.arctan((start_sigma - energy_fi[i]) / gamma_total[i])
-#         )
-#         for j in range(num_grid):
-#             wn_shift = wn_grid[j] - energy_fi[i]
-#             if np.abs(wn_shift) <= cutoff:
-#                 shift_sigma = wn_shift - gh_roots_sigma
-#                 bin_term = np.sum(gh_weights * b_corr * (
-#                         np.arctan((shift_sigma + half_bin_width) / gamma_total[i]) -
-#                         np.arctan((shift_sigma - half_bin_width) / gamma_total[i])
-#                 ))
-#                 _abs_xsec[j] += abs_coef[i] * bin_term
-#                 _emi_xsec[j] += emi_coef[i] * bin_term
-#     return _abs_xsec, _emi_xsec
 
 
 @numba.njit(parallel=True)
@@ -1035,45 +776,6 @@ def continuum_xsec(
                     temperature=temperature.value,
                 )
     return cont_xsec
-
-
-# @numba.njit(parallel=True)
-# def _sum_abs_emi_coefs(
-#     n_i: npt.NDArray[np.float64],
-#     n_f: npt.NDArray[np.float64],
-#     a_fi: npt.NDArray[np.float64],
-#     g_f: npt.NDArray[np.float64],
-#     g_i: npt.NDArray[np.float64],
-#     energy_fi: npt.NDArray[np.float64],
-#     temperature: float,
-# ) -> t.Tuple[float, float]:
-#     abs_coef = (
-#         g_f
-#         * n_i
-#         * a_fi
-#         * (1 - np.exp(-const_h_c_on_kB * energy_fi / temperature))
-#         / (const_8_pi_c * g_i * energy_fi**2)
-#     )
-#     emi_coef = n_f * a_fi * energy_fi * const_h_c_on_4_pi
-#     return sum(abs_coef), sum(emi_coef)
-
-
-# @numba.njit(parallel=True)
-# def _sum_abs_coefs(
-#     n_i: npt.NDArray[np.float64],
-#     a_fi: npt.NDArray[np.float64],
-#     g_f: npt.NDArray[np.float64],
-#     g_i: npt.NDArray[np.float64],
-#     energy_fi: npt.NDArray[np.float64],
-#     temperature: float,
-# ) -> float:
-#     return sum(
-#         g_f
-#         * n_i
-#         * a_fi
-#         * (1 - np.exp(-const_h_c_on_kB * energy_fi / temperature))
-#         / (const_8_pi_c * g_i * energy_fi**2)
-#     )
 
 
 @numba.njit(parallel=True)
@@ -1467,231 +1169,6 @@ def _continuum_binned_gauss_fixed_width(
     return _abs_xsec
 
 
-# # @numba.njit()
-# def calc_doppler_alpha(
-#     energy_fi: npt.NDArray[np.float64], species_mass: float, temperature: u.Quantity
-# ) -> npt.NDArray[np.float64]:
-#     alpha = (energy_fi << 1 / u.cm) * ac_sqrt_2_NA_kB_log2_on_c * np.sqrt(temperature / (species_mass << u.kg / u.mol))
-#     return alpha.to(1 / u.cm).value
-#
-#
-# # @numba.njit()
-# def calc_doppler_sigma(energy_trans: u.Quantity, temperature: u.Quantity, species_mass: float) -> u.Quantity:
-#     doppler_sigma = energy_trans * np.sqrt(ac.N_A * ac.k_B * temperature / (species_mass << u.kg / u.mol)) / ac.c
-#     return doppler_sigma.to(1 / u.cm, equivalencies=u.spectral())
-
-
-# @numba.njit()
-# def build_lambda(
-#     tau_matrix: npt.NDArray[np.float64],
-# ) -> npt.NDArray[np.float64]:
-#     # tau_plus_matrix = np.array([abs(tau_matrix[idx] - tau_matrix[idx + 1]) if idx <= (len(tau_matrix) - 2)
-#     #                             else np.zeros(tau_matrix.shape[1]) for idx in range(tau_matrix.shape[0])])
-#     tau_plus_matrix = np.zeros_like(tau_matrix)
-#     tau_plus_matrix[:-1] = np.abs(tau_matrix[:-1] - tau_matrix[1:])
-#     # tau_minus_matrix = np.array([abs(tau_matrix[idx] - tau_matrix[idx - 1]) if idx >= 1
-#     #                              else np.zeros(tau_matrix.shape[1]) for idx in range(tau_matrix.shape[0])])
-#     tau_minus_matrix = np.zeros_like(tau_matrix)
-#     tau_minus_matrix[1:] = np.abs(tau_matrix[1:] - tau_matrix[:-1])
-#     # PARABOLIC INTERPOLATION
-#     omega0_plus_matrix, omega1_plus_matrix, omega2_plus_matrix = build_omega_matrices(tau_plus_matrix)
-#     omega0_minus_matrix, omega1_minus_matrix, omega2_minus_matrix = build_omega_matrices(tau_minus_matrix)
-#
-#     sosc_alpha_plus_matrix, sosc_beta_plus_matrix, sosc_gamma_plus_matrix = sosc_build_lambda_matrices(
-#         omega0_plus_matrix, omega1_plus_matrix, omega2_plus_matrix, tau_plus_matrix, tau_minus_matrix
-#     )
-#     sosc_alpha_minus_matrix, sosc_beta_minus_matrix, sosc_gamma_minus_matrix = sosc_build_lambda_matrices(
-#         omega0_minus_matrix, omega1_minus_matrix, omega2_minus_matrix, tau_minus_matrix, tau_plus_matrix
-#     )
-#
-#     fosc_alpha_plus_matrix, fosc_beta_plus_matrix = fosc_build_lambda_matrices(
-#         omega0_plus_matrix, omega1_plus_matrix, tau_plus_matrix
-#     )  # Used for TOA (undefined at BOA)
-#     fosc_alpha_minus_matrix, fosc_beta_minus_matrix = fosc_build_lambda_matrices(
-#         omega0_minus_matrix, omega1_minus_matrix, tau_minus_matrix
-#     )  # Used for BOA (undefined at TOA)
-#
-#     alpha_minus_matrix = sosc_alpha_minus_matrix
-#     alpha_minus_matrix[0] = fosc_alpha_minus_matrix[0]
-#     alpha_minus_matrix[-1] = fosc_alpha_minus_matrix[-1]
-#     beta_minus_matrix = sosc_beta_minus_matrix
-#     beta_minus_matrix[0] = fosc_beta_minus_matrix[0]
-#     beta_minus_matrix[-1] = fosc_beta_minus_matrix[-1]
-#     gamma_minus_matrix = sosc_gamma_minus_matrix
-#     gamma_minus_matrix[0] = np.zeros(gamma_minus_matrix.shape[1])
-#     gamma_minus_matrix[-1] = np.zeros(gamma_minus_matrix.shape[1])
-#
-#     alpha_plus_matrix = sosc_alpha_plus_matrix
-#     alpha_plus_matrix[0] = fosc_alpha_plus_matrix[0]
-#     alpha_plus_matrix[-1] = fosc_alpha_plus_matrix[-1]
-#     beta_plus_matrix = sosc_beta_plus_matrix
-#     beta_plus_matrix[0] = fosc_beta_plus_matrix[0]
-#     beta_plus_matrix[-1] = fosc_beta_plus_matrix[-1]
-#     gamma_plus_matrix = sosc_gamma_plus_matrix
-#     gamma_plus_matrix[0] = np.zeros(gamma_plus_matrix.shape[1])
-#     gamma_plus_matrix[-1] = np.zeros(gamma_plus_matrix.shape[1])
-#
-#     # minus_coefs = np.stack((alpha_minus_matrix, beta_minus_matrix, gamma_minus_matrix), axis=1)
-#     # plus_coefs = np.stack((alpha_plus_matrix, beta_plus_matrix, gamma_plus_matrix), axis=1)
-#
-#     n_layers, n_grid = tau_plus_matrix.shape
-#     tri_lambda = np.zeros((n_layers, n_layers, n_grid))
-#     # Tridiagonal; SOSC:
-#     for n_layer in range(n_layers):
-#         # Set diagonal elements.
-#         if n_layer == 0:  # BOA
-#             tri_lambda[n_layer, n_layer] = 0.5 * (
-#                 beta_minus_matrix[n_layer]
-#                 + alpha_plus_matrix[n_layer + 1] * np.exp(-tau_plus_matrix[n_layer])
-#                 + beta_plus_matrix[n_layer]
-#             )
-#         elif n_layer == n_layers - 1:  # TOA
-#             tri_lambda[n_layer, n_layer] = 0.5 * (
-#                 gamma_minus_matrix[n_layer - 1] * np.exp(-tau_minus_matrix[n_layer])
-#                 + beta_minus_matrix[n_layer]
-#                 + beta_plus_matrix[n_layer]
-#             )
-#         else:
-#             tri_lambda[n_layer, n_layer] = 0.5 * (
-#                 gamma_minus_matrix[n_layer - 1] * np.exp(-tau_minus_matrix[n_layer])
-#                 + beta_minus_matrix[n_layer]
-#                 + alpha_plus_matrix[n_layer + 1] * np.exp(-tau_plus_matrix[n_layer])
-#                 + beta_plus_matrix[n_layer]
-#             )
-#
-#         # Set below-diagonal elements.
-#         if 0 < n_layer < n_layers - 1:
-#             tri_lambda[n_layer + 1, n_layer] = 0.5 * (
-#                 (gamma_minus_matrix[n_layer - 1] * np.exp(-tau_minus_matrix[n_layer]) + beta_minus_matrix[n_layer])
-#                 * np.exp(-tau_plus_matrix[n_layer])
-#                 + alpha_minus_matrix[n_layer + 1]
-#                 + alpha_plus_matrix[n_layer + 1]
-#             )
-#         elif n_layer == 0:
-#             tri_lambda[n_layer + 1, n_layer] = 0.5 * (
-#                 beta_minus_matrix[n_layer] * np.exp(-tau_plus_matrix[n_layer])
-#                 + alpha_minus_matrix[n_layer + 1]
-#                 + alpha_plus_matrix[n_layer + 1]
-#             )
-#
-#         # Set above-diagonal elements.
-#         if 0 < n_layer < n_layers - 1:
-#             tri_lambda[n_layer - 1, n_layer] = 0.5 * (
-#                 gamma_minus_matrix[n_layer - 1]
-#                 + gamma_plus_matrix[n_layer - 1]
-#                 + (alpha_plus_matrix[n_layer + 1] * np.exp(-tau_plus_matrix[n_layer]) + beta_plus_matrix[n_layer])
-#                 * np.exp(-tau_minus_matrix[n_layer])
-#             )
-#         elif n_layer == n_layers - 1:
-#             tri_lambda[n_layer - 1, n_layer] = 0.5 * (
-#                 gamma_minus_matrix[n_layer - 1]
-#                 + gamma_plus_matrix[n_layer - 1]
-#                 + beta_plus_matrix[n_layer] * np.exp(-tau_minus_matrix[n_layer])
-#             )
-#
-#     log.debug("Tridiagonal Lambda operator = ", tri_lambda)
-#     return tri_lambda
-
-
-# @numba.njit()
-# def lambda_coefficients(
-#     tau_1_matrix: npt.NDArray[np.float64],
-#     tau_2_matrix: npt.NDArray[np.float64],
-# ) -> npt.NDArray[np.float64]:
-#     omega0_matrix, omega1_matrix, omega2_matrix = build_omega_matrices(tau_1_matrix)
-#
-#     sosc_alpha_matrix, sosc_beta_matrix, sosc_gamma_matrix = sosc_build_lambda_matrices(
-#         omega0_matrix, omega1_matrix, omega2_matrix, tau_1_matrix, tau_2_matrix
-#     )
-#
-#     fosc_alpha_matrix, fosc_beta_matrix = fosc_build_lambda_matrices(
-#         omega0_matrix, omega1_matrix, tau_1_matrix
-#     )  # Used for BOA (undefined at TOA)
-#
-#     sosc_alpha_matrix[0] = fosc_alpha_matrix[0]
-#     sosc_alpha_matrix[-1] = fosc_alpha_matrix[-1]
-#     sosc_beta_matrix[0] = fosc_beta_matrix[0]
-#     sosc_beta_matrix[-1] = fosc_beta_matrix[-1]
-#     sosc_gamma_matrix[0] = np.zeros(sosc_gamma_matrix.shape[1])
-#     sosc_gamma_matrix[-1] = np.zeros(sosc_gamma_matrix.shape[1])
-#
-#     return np.stack((sosc_alpha_matrix, sosc_beta_matrix, sosc_gamma_matrix), axis=1)
-
-
-# @numba.njit()
-# def lambda_coefficients_new(
-#     tau_1_matrix: npt.NDArray[np.float64],
-#     tau_2_matrix: npt.NDArray[np.float64],
-# ) -> npt.NDArray[np.float64]:
-#     """
-#     Construct tridiagonal lambda operator coefficients for interpolating the source function.
-#
-#     :param tau_1_matrix: Primary Delta_tau matrix; tau_plus when propagating radiation into the atmosphere, and tau_minus
-#         when propagating radiation out of the atmosphere.
-#     :param tau_2_matrix: The other Delt tau matrix.
-#
-#     :return: A tensor containing the lambda operator interpolation coefficients. The first index is the layer index, the
-#         second ranges from 0 to 2 for the alpha, beta and gamma coefficients respectively, the third for the angular
-#         integration points and the fourth for the wavenumber grid points.
-#     """
-#     tau_1_matrix_limit = 1.0e-4  # 1.0e-15
-#     tau_2_matrix_limit = 1.0e-10  # 1.0e-15
-#
-#     tau_limit_logic = (tau_1_matrix < tau_1_matrix_limit) | (tau_2_matrix < tau_2_matrix_limit)
-#
-#     omega0_matrix = np.where(tau_limit_logic, 0, 1 - np.exp(-tau_1_matrix))
-#     omega1_matrix = np.where(tau_limit_logic, 0, tau_1_matrix - omega0_matrix)
-#     omega2_matrix = np.where(tau_limit_logic, 0, (tau_1_matrix**2) - (2 * omega1_matrix))
-#
-#     # If dtu is small!
-#     # w0 = dtu * (1. - dtu / 2. + dtu ** 2 / 6. - dtu ** 3 / 24. + dtu ** 4 / 120. \
-#     #             - dtu ** 5 / 720. + dtu ** 6 / 5040. - dtu ** 7 / 40320. \
-#     #             + dtu ** 8 / 362880.)
-#     # w1 = dtu ** 2 * (0.5 - dtu / 3. + dtu ** 2 / 8. - dtu ** 3 / 30. + dtu ** 4 / 144. \
-#     #                  - dtu ** 5 / 840. + dtu ** 6 / 5760. - dtu ** 7 / 45360. \
-#     #                  + dtu ** 8 / 403200.)
-#     # w2 = dtu ** 3 * (1. / 3. - dtu / 4. + dtu ** 2 / 10. - dtu ** 3 / 36. \
-#     #                  + dtu ** 4 / 168. - dtu ** 5 / 960. + dtu ** 6 / 6480. \
-#     #                  - dtu ** 7 / 50400. + dtu ** 8 / 443520.)
-#
-#     out_coefficients = np.zeros((tau_1_matrix.shape[0], 3, tau_1_matrix.shape[1], tau_1_matrix.shape[2]))
-#
-#     # SOSC
-#     out_coefficients[1:-1, 0, :, :] = np.where(
-#         tau_limit_logic[1:-1],
-#         0,  # fraction term goes to 0 at tau_matrix_1=0, infinity at tau_matrix_1=-tau_matrix_2.
-#         omega0_matrix[1:-1]
-#         + (omega2_matrix[1:-1] - omega1_matrix[1:-1] * (tau_2_matrix[1:-1] + 2 * tau_1_matrix[1:-1]))
-#         / (tau_1_matrix[1:-1] * (tau_1_matrix[1:-1] + tau_2_matrix[1:-1])),
-#     )
-#     out_coefficients[1:-1, 1, :, :] = np.where(
-#         tau_limit_logic[1:-1],
-#         0,  # Limit as tau_matrix_1 -> 0 is 0, tau_matrix_2 -> 0 is inf.
-#         (omega1_matrix[1:-1] * (tau_1_matrix[1:-1] - tau_2_matrix[1:-1]) - omega2_matrix[1:-1])
-#         / (tau_1_matrix[1:-1] * tau_2_matrix[1:-1]),
-#     )
-#     out_coefficients[1:-1, 2, :, :] = np.where(
-#         tau_limit_logic[1:-1],
-#         0,  # goes to infinity at tau_matrix_2=0 and tau_matrix_1=-tau_matrix_2
-#         (omega2_matrix[1:-1] - omega1_matrix[1:-1] * tau_1_matrix[1:-1])
-#         / (tau_2_matrix[1:-1] * (tau_1_matrix[1:-1] + tau_2_matrix[1:-1])),
-#     )
-#     # FOSC at boundaries.
-#     out_coefficients[0, 1, :, :] = np.where(tau_limit_logic[0], 0, omega1_matrix[0] / tau_1_matrix[0])
-#     out_coefficients[0, 0, :, :] = np.where(tau_limit_logic[0], 0, omega0_matrix[0] - out_coefficients[0, 1, :, :])
-#
-#     out_coefficients[-1, 1, :, :] = np.where(tau_limit_logic[-1], 0, omega1_matrix[-1] / tau_1_matrix[-1])
-#     out_coefficients[-1, 0, :, :] = np.where(tau_limit_logic[-1], 0, omega0_matrix[-1] - out_coefficients[-1, 1, :, :])
-#
-#     # out_coefficients[0, 0, :, :], out_coefficients[0, 1, :, :] = fosc_build_lambda_matrices(
-#     #     omega0_matrix[0], omega1_matrix[0], tau_1_matrix[0]
-#     # )
-#     # out_coefficients[-1, 0, :, :], out_coefficients[-1, 1, :, :] = fosc_build_lambda_matrices(
-#     #     omega0_matrix[-1], omega1_matrix[-1], tau_1_matrix[-1]
-#     # )
-#     return out_coefficients
-
-
 def effective_source_tau_mu(
     global_source_func_matrix: u.Quantity,
     global_chi_matrix: u.Quantity,
@@ -1701,18 +1178,6 @@ def effective_source_tau_mu(
     mu_values: npt.NDArray[np.float64],
     negative_absorption_factor: float = 0.1,
 ) -> t.Tuple[u.Quantity, npt.NDArray[np.float64]]:
-    # Old:
-    # effective_chi = np.where(
-    #     global_chi_matrix < 0,
-    #     negative_absorption_factor * abs(global_chi_matrix),
-    #     global_chi_matrix
-    # )
-    # effective_source_func_matrix = np.where(
-    #     global_source_func_matrix < 0,
-    #     negative_absorption_factor * abs(global_source_func_matrix),
-    #     global_source_func_matrix
-    # )
-    # New:
     chi_prime = negative_absorption_factor * np.max(global_chi_matrix, axis=1)
     effective_chi = np.where(
         global_chi_matrix < 0, chi_prime[:, None] * np.exp(-abs(global_chi_matrix.value)), global_chi_matrix
@@ -1724,9 +1189,6 @@ def effective_source_tau_mu(
         ),
         global_source_func_matrix,
     )
-    # effective_source_func_matrix = (global_eta_matrix * density_profile[:, None] / (ac.c.cgs * effective_chi)).to(
-    #     u.J / (u.sr * u.m**2), equivalencies=u.spectral()
-    # )
     res = effective_chi * dz_profile[:, None]
     dtau = res.decompose().value
     tau = dtau[::-1].cumsum(axis=0)[::-1]
@@ -1945,130 +1407,6 @@ def bezier_coefficients(
     return coefficients, control_points
 
 
-# @numba.njit()
-# def bezier_coefficients_old(
-#     tau_matrix: npt.NDArray[np.float64],
-#     source_function_matrix: npt.NDArray[np.float64],
-#     mu_values: npt.NDArray[np.float64],
-# ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-#     coefficients = np.zeros((tau_matrix.shape[0] + 1, 4, tau_matrix.shape[1], tau_matrix.shape[2]))
-#     # coefficients[1:-1, 0, :, :] = tau_matrix[1:] - tau_matrix[:-1]
-#     # coefficients[1:, 0, :, :] = tau_matrix
-#     # coefficients[:-1, 0, :, :] -= tau_matrix
-#     coefficients[1:-1, 0, :, :] = tau_matrix[:-1]
-#     coefficients[1:-1, 0, :, :] -= tau_matrix[1:]
-#     # tau_plus is delta_tau_matrix[1:], tau_minus is delta_tau_matrix[:-1]
-#
-#     delta_tau_limit = 1.5e-1
-#
-#     # TODO: Change indices on delta_tau_matrix based on direction!
-#     coefficients[:, 1, :, :] = np.where(
-#         coefficients[:, 0, :, :] < delta_tau_limit,
-#         (coefficients[:, 0, :, :] / 3)
-#         - ((coefficients[:, 0, :, :] ** 2) / 12)
-#         + ((coefficients[:, 0, :, :] ** 3) / 60),
-#         (2 + coefficients[:, 0, :, :] ** 2 - 2 * coefficients[:, 0, :, :] - 2 * np.exp(-coefficients[:, 0, :, :]))
-#         / (coefficients[:, 0, :, :] ** 2),
-#     )
-#     coefficients[:, 2, :, :] = np.where(
-#         coefficients[:, 0, :, :] < delta_tau_limit,
-#         (coefficients[:, 0, :, :] / 3) - ((coefficients[:, 0, :, :] ** 2) / 4) + ((coefficients[:, 0, :, :] ** 3) / 10),
-#         (2 - (2 + 2 * coefficients[:, 0, :, :] + coefficients[:, 0, :, :] ** 2) * np.exp(-coefficients[:, 0, :, :]))
-#         / (coefficients[:, 0, :, :] ** 2),
-#     )
-#     coefficients[:, 3, :, :] = np.where(
-#         coefficients[:, 0, :, :] < delta_tau_limit,
-#         (coefficients[:, 0, :, :] / 3) - ((coefficients[:, 0, :, :] ** 2) / 6) + ((coefficients[:, 0, :, :] ** 3) / 20),
-#         (2 * coefficients[:, 0, :, :] - 4 + (2 * coefficients[:, 0, :, :] + 4) * np.exp(-coefficients[:, 0, :, :]))
-#         / (coefficients[:, 0, :, :] ** 2),
-#     )
-#
-#     source_func_mu = source_function_matrix[:, None, :] / mu_values[None, :, None]
-#     min_source_mu = np.fmin(source_func_mu[:-1], source_func_mu[1:])
-#     max_source_mu = np.fmax(source_func_mu[:-1], source_func_mu[1:])
-#
-#     if np.any(min_source_mu < 0):
-#         print(f"WARN: Min source below 0!")
-#     if np.any(max_source_mu < 0):
-#         print(f"WARN: Max source below 0!")
-#
-#     control_points = np.zeros((tau_matrix.shape[0], 2, tau_matrix.shape[1], tau_matrix.shape[2]))
-#
-#     d_diff_out = np.where(
-#         tau_matrix[:-1] - tau_matrix[1:] == 0,
-#         0,
-#         (source_func_mu[:-1] - source_func_mu[1:]) / (tau_matrix[:-1] - tau_matrix[1:]),
-#     )
-#     zeta_out = np.where(
-#         tau_matrix[:-2] - tau_matrix[2:] == 0,
-#         1 / 3,
-#         (1 + (tau_matrix[:-2] - tau_matrix[1:-1]) / (tau_matrix[:-2] - tau_matrix[2:])) / 3,
-#     )
-#
-#     d_s_d_tau_out = np.zeros_like(tau_matrix)
-#     d_s_d_tau_out[1:-1] = np.where(
-#         (d_diff_out[1:] * d_diff_out[:-1] < 0) | (zeta_out * d_diff_out[:-1] + (1 - zeta_out) * d_diff_out[1:] == 0),
-#         0,
-#         d_diff_out[1:] * d_diff_out[:-1] / (zeta_out * d_diff_out[:-1] + (1 - zeta_out) * d_diff_out[1:]),
-#     )
-#
-#     control_0_out = source_func_mu[1:] + 0.5 * (tau_matrix[:-1] - tau_matrix[1:]) * d_s_d_tau_out[1:]
-#     control_1_out = source_func_mu[:-1] - 0.5 * (tau_matrix[:-1] - tau_matrix[1:]) * d_s_d_tau_out[:-1]
-#
-#     control_0_out = np.fmax(control_0_out, min_source_mu)
-#     control_0_out = np.fmin(control_0_out, max_source_mu)
-#     control_1_out = np.fmax(control_1_out, min_source_mu)
-#     control_1_out = np.fmin(control_1_out, max_source_mu)
-#
-#     control_points[2:, 0, :, :] = 0.5 * (control_0_out[1:] + control_1_out[1:])
-#     control_points[1, 0, :, :] = control_0_out[0]
-#
-#     d_diff_in = np.where(
-#         tau_matrix[1:] - tau_matrix[:-1] == 0,
-#         0,
-#         (source_func_mu[1:] - source_func_mu[:-1]) / (tau_matrix[1:] - tau_matrix[:-1]),
-#     )
-#     zeta_in = np.where(
-#         tau_matrix[2:] - tau_matrix[:-2] == 0,
-#         1 / 3,
-#         (1 + (tau_matrix[2:] - tau_matrix[1:-1]) / (tau_matrix[2:] - tau_matrix[:-2])) / 3,
-#     )
-#
-#     d_s_d_tau_in = np.zeros_like(tau_matrix)
-#     d_s_d_tau_in[1:-1] = np.where(
-#         (d_diff_in[:-1] * d_diff_in[1:] < 0) | (zeta_in * d_diff_in[1:] + (1 - zeta_in) * d_diff_in[:-1] == 0),
-#         0,
-#         d_diff_in[:-1] * d_diff_in[1:] / (zeta_in * d_diff_in[1:] + (1 - zeta_in) * d_diff_in[:-1]),
-#     )
-#
-#     control_0_in = source_func_mu[:-1] + 0.5 * (tau_matrix[1:] - tau_matrix[:-1]) * d_s_d_tau_in[:-1]
-#     control_1_in = source_func_mu[1:] - 0.5 * (tau_matrix[1:] - tau_matrix[:-1]) * d_s_d_tau_in[1:]
-#
-#     control_0_in = np.fmax(control_0_in, min_source_mu)
-#     control_0_in = np.fmin(control_0_in, max_source_mu)
-#     control_1_in = np.fmax(control_1_in, min_source_mu)
-#     control_1_in = np.fmin(control_1_in, max_source_mu)
-#
-#     elements_in_bounds_0 = np.sum(
-#         (np.fmin(source_func_mu[:-1], source_func_mu[1:]) <= control_0_in)
-#         & (control_0_in <= np.fmax(source_func_mu[:-1], source_func_mu[1:]))
-#     )
-#     if control_0_in.size != elements_in_bounds_0:
-#         print(f"WARN: {control_0_in.size - elements_in_bounds_0} C_0 (in) elements outside source bounds.")
-#
-#     elements_in_bounds_1 = np.sum(
-#         (np.fmin(source_func_mu[:-1], source_func_mu[1:]) <= control_1_in)
-#         & (control_1_in <= np.fmax(source_func_mu[:-1], source_func_mu[1:]))
-#     )
-#     if control_1_in.size != elements_in_bounds_1:
-#         print(f"WARN: {control_1_in.size - elements_in_bounds_1} C_1 (in) elements outside source bounds.")
-#
-#     control_points[:-2, 1, :, :] = 0.5 * (control_0_in[:-1] + control_1_in[:-1])
-#     control_points[-2, 1, :, :] = control_0_in[-1]
-#
-#     return coefficients, control_points
-
-
 def blackbody(spectral_grid: u.Quantity, temperature: u.Quantity) -> u.Quantity:
     freq_grid = spectral_grid.to(u.Hz, equivalencies=u.spectral())
     temperature = np.atleast_1d(temperature)[:, None]
@@ -2091,96 +1429,6 @@ def incident_stellar_radiation(
     star_bb = blackbody(spectral_grid=wn_grid, temperature=star_temperature)[0]
     incident_radiation = star_bb * (planet_radius / orbital_radius) ** 2
     return incident_radiation.to(star_bb.unit, equivalencies=u.spectral())
-
-
-# @numba.njit()
-# def build_omega_matrices(tau_matrix: npt.NDArray[np.float64]) -> t.Tuple[npt.NDArray, npt.NDArray, npt.NDArray]:
-#     omega0_matrix = 1 - np.exp(-tau_matrix)
-#     omega1_matrix = tau_matrix - omega0_matrix
-#     omega2_matrix = (tau_matrix**2) - (2 * omega1_matrix)
-#     return omega0_matrix, omega1_matrix, omega2_matrix
-
-
-# @numba.njit()
-# def sosc_build_lambda_matrices(
-#     omega0_matrix: npt.NDArray[np.float64],
-#     omega1_matrix: npt.NDArray[np.float64],
-#     omega2_matrix: npt.NDArray[np.float64],
-#     tau_matrix_1: npt.NDArray[np.float64],
-#     tau_matrix_2: npt.NDArray[np.float64],
-# ) -> t.Tuple[npt.NDArray, npt.NDArray, npt.NDArray]:
-#     tau_matrix_1_limit = 1.0e-4  # 1.0e-15
-#     tau_matrix_2_limit = 1.0e-10  # 1.0e-15
-#
-#     alpha_matrix = np.where(
-#         (np.abs(tau_matrix_1) < tau_matrix_1_limit)
-#         | (np.abs(tau_matrix_2) < tau_matrix_2_limit)
-#         | (tau_matrix_1 * (tau_matrix_1 + tau_matrix_2) == 0),
-#         omega0_matrix,  # fraction term goes to 0 at tau_matrix_1=0, infinity at tau_matrix_1=-tau_matrix_2.
-#         omega0_matrix
-#         + (omega2_matrix - omega1_matrix * (tau_matrix_2 + 2 * tau_matrix_1))
-#         / (tau_matrix_1 * (tau_matrix_1 + tau_matrix_2)),
-#     )
-#     # lambda_plus_matrix = np.where(
-#     #     (tau_matrix_1 == 0) | (np.abs(tau_matrix_1) < tau_matrix_1_limit),
-#     #     omega0_matrix,  # Limit as tau_matrix_1 -> 0 is 0
-#     #     np.where(
-#     #         (tau_matrix_2 == 0) | (np.abs(tau_matrix_2) < tau_matrix_2_limit) | (tau_matrix_1 == - tau_matrix_2),
-#     #         np.inf,  # Limit as tau_matrix_2 -> 0 is inf.
-#     #         omega0_matrix + (
-#     #                 omega2_matrix - omega1_matrix * (tau_matrix_2 + 2 * tau_matrix_1)
-#     #         ) / (tau_matrix_1 * (tau_matrix_1 + tau_matrix_2))
-#     #     )
-#     # )
-#
-#     beta_matrix = np.where(
-#         (np.abs(tau_matrix_1) < tau_matrix_1_limit)
-#         | (np.abs(tau_matrix_2) < tau_matrix_2_limit)
-#         | (tau_matrix_1 * tau_matrix_2 == 0),
-#         0,  # Limit as tau_matrix_1 -> 0 is 0, tau_matrix_2 -> 0 is inf.
-#         (omega1_matrix * (tau_matrix_1 - tau_matrix_2) - omega2_matrix) / (tau_matrix_1 * tau_matrix_2),
-#     )
-#     # lambda_0_matrix = np.where(
-#     #     (tau_matrix_1 == 0) | (np.abs(tau_matrix_1) < tau_matrix_1_limit),
-#     #     0,  # Limit as tau_matrix_1 -> 0 is 0
-#     #     np.where(
-#     #         (tau_matrix_2 == 0) | (np.abs(tau_matrix_2) < tau_matrix_2_limit),
-#     #         np.inf,  # Limit as tau_matrix_2 -> 0 is inf.
-#     #         (omega1_matrix * (tau_matrix_1 - tau_matrix_2) - omega2_matrix) / (tau_matrix_1 * tau_matrix_2)
-#     #     )
-#     # )
-#
-#     gamma_matrix = np.where(
-#         (np.abs(tau_matrix_1) < tau_matrix_1_limit)
-#         | (np.abs(tau_matrix_2) < tau_matrix_2_limit)
-#         | (tau_matrix_2 * (tau_matrix_1 + tau_matrix_2) == 0),
-#         0,  # goes to infinity at tau_matrix_2=0 and tau_matrix_1=-tau_matrix_2
-#         (omega2_matrix - omega1_matrix * tau_matrix_1) / (tau_matrix_2 * (tau_matrix_1 + tau_matrix_2)),
-#     )
-#     # lambda_minus_matrix = np.where(
-#     #     (tau_matrix_1 == 0) | (tau_matrix_1 < tau_matrix_1_limit),
-#     #     0,  # Limit as tau_matrix_1 -> 0 is 0
-#     #     np.where(
-#     #         (tau_matrix_2 == 0) | (tau_matrix_2 < tau_matrix_2_limit) | (tau_matrix_1 == - tau_matrix_2),
-#     #         np.inf,  # Limit as tau_matrix_2 -> 0 is inf.
-#     #         (omega2_matrix - omega1_matrix * tau_matrix_1) / (tau_matrix_2 * (tau_matrix_1 + tau_matrix_2))
-#     #     )
-#     # )
-#
-#     return alpha_matrix, beta_matrix, gamma_matrix
-
-
-# @numba.njit()
-# def fosc_build_lambda_matrices(
-#     omega0_matrix: npt.NDArray[np.float64],
-#     omega1_matrix: npt.NDArray[np.float64],
-#     tau_matrix: npt.NDArray[np.float64],
-# ) -> t.Tuple[npt.NDArray, npt.NDArray]:
-#     tau_matrix_limit = 1.0e-15
-#
-#     beta_matrix = np.where((tau_matrix == 0) | (np.abs(tau_matrix) < tau_matrix_limit), 0, omega1_matrix / tau_matrix)
-#     alpha_matrix = omega0_matrix - beta_matrix
-#     return alpha_matrix, beta_matrix
 
 
 @numba.njit()
@@ -2240,36 +1488,36 @@ def sample_grid_new(
     return np.stack((wn_grid, ev_grid))
 
 
-def unified_opacity_sampling_grid(
-    wn_start: float, wn_end: float, temperature_profile: u.Quantity, const: float = None, max_step: float = 1000
-) -> u.Quantity:
-    if const is None:
-        # Needs testing for very low wn_start - density of points might get too high so impose conservative max_step?
-        const = 10 ** (-(6 - np.log10(wn_start)))
-    layer_samples = [
-        sample_grid_new(wn_start=wn_start, wn_end=wn_end, temperature=temperature, const=const, max_step=max_step)
-        for temperature in temperature_profile.value
-    ]
-
-    temperature_sorted_idxs = np.argsort(temperature_profile.value)
-
-    merged_wn = [wn_start]
-    current_step = 0
-
-    while current_step < len(temperature_sorted_idxs) - 1:
-        current_next_idx = np.searchsorted(layer_samples[temperature_sorted_idxs[current_step]][0], merged_wn[-1]) + 1
-        current_next_point = layer_samples[temperature_sorted_idxs[current_step]][:, current_next_idx]
-        next_idx = np.searchsorted(layer_samples[temperature_sorted_idxs[current_step + 1]][0], merged_wn[-1])
-        next_point = layer_samples[temperature_sorted_idxs[current_step + 1]][:, next_idx]
-        if next_point[0] <= current_next_point[0] and next_point[1] > current_next_point[1]:
-            merged_wn.append(next_point[0])
-            current_step += 1
-        else:
-            merged_wn.append(current_next_point[0])
-    final_next_idx = np.searchsorted(layer_samples[temperature_sorted_idxs[current_step]][0], merged_wn[-1]) + 1
-    final_next_points = layer_samples[temperature_sorted_idxs[current_step]][:, final_next_idx:]
-    # merged_wn.append(final_next_points[0])
-    return np.append(np.array(merged_wn), final_next_points[0]) << u.k
+# def unified_opacity_sampling_grid(
+#     wn_start: float, wn_end: float, temperature_profile: u.Quantity, const: float = None, max_step: float = 1000
+# ) -> u.Quantity:
+#     if const is None:
+#         # Needs testing for very low wn_start - density of points might get too high so impose conservative max_step?
+#         const = 10 ** (-(6 - np.log10(wn_start)))
+#     layer_samples = [
+#         sample_grid_new(wn_start=wn_start, wn_end=wn_end, temperature=temperature, const=const, max_step=max_step)
+#         for temperature in temperature_profile.value
+#     ]
+#
+#     temperature_sorted_idxs = np.argsort(temperature_profile.value)
+#
+#     merged_wn = [wn_start]
+#     current_step = 0
+#
+#     while current_step < len(temperature_sorted_idxs) - 1:
+#         current_next_idx = np.searchsorted(layer_samples[temperature_sorted_idxs[current_step]][0], merged_wn[-1]) + 1
+#         current_next_point = layer_samples[temperature_sorted_idxs[current_step]][:, current_next_idx]
+#         next_idx = np.searchsorted(layer_samples[temperature_sorted_idxs[current_step + 1]][0], merged_wn[-1])
+#         next_point = layer_samples[temperature_sorted_idxs[current_step + 1]][:, next_idx]
+#         if next_point[0] <= current_next_point[0] and next_point[1] > current_next_point[1]:
+#             merged_wn.append(next_point[0])
+#             current_step += 1
+#         else:
+#             merged_wn.append(current_next_point[0])
+#     final_next_idx = np.searchsorted(layer_samples[temperature_sorted_idxs[current_step]][0], merged_wn[-1]) + 1
+#     final_next_points = layer_samples[temperature_sorted_idxs[current_step]][:, final_next_idx:]
+#     # merged_wn.append(final_next_points[0])
+#     return np.append(np.array(merged_wn), final_next_points[0]) << u.k
 
 
 @numba.njit()

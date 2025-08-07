@@ -22,139 +22,138 @@ pd.set_option("display.max_columns", 500)
 pd.set_option("display.width", 1000)
 
 
-def plot_emission(
-    plot_grid: u.Quantity,
-    plot_flux: u.Quantity,
-    plot_tau: u.Quantity,
-    plot_xsecs: t.Dict[SpeciesFormula, u.Quantity],
-    label_fontsize: int = 22,
-    tick_fontsize: int = 18,
-    save_file: str | Path | None = None,
-) -> None:
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
-    x_axis_left = plot_grid[0].value
-    x_axis_right = plot_grid[-1].value
-    # ax1.plot(plot_grid, plot_flux.to(u.W / u.m ** 2 / u.um))
-    ax1.plot(plot_grid, plot_flux.to(u.J / u.m**2, equivalencies=u.spectral()))
-    ax1.set_xlabel(r"Spectral Grid (cm$^\mathbf{-1}$)", fontsize=label_fontsize)
-    ax1.set_xlim(left=x_axis_left, right=x_axis_right)
-    ax1.set_ylim(bottom=1e-11)
-    ax1.set_ylabel(
-        f"Flux ({plot_flux.to(u.J / u.m ** 2, equivalencies=u.spectral()).unit:latex})", fontsize=label_fontsize
-    )
-    ax1.set_yscale("log")
-    ax1.set_title("Emission Spectrum", fontsize=label_fontsize)
-    ax1.tick_params(labelsize=tick_fontsize)
-    ax2.imshow(
-        plot_tau,
-        aspect="auto",
-        origin="lower",
-        # extent=[x_axis_left, x_axis_right, 0, plot_tau.shape[0]],
-        interpolation="none",
-        cmap="plasma",
-    )
-    ax2.set_title("Optical Depth", fontsize=label_fontsize)
-    ax2.set_xlabel(r"Spectral Grid (cm$^\mathbf{-1}$)", fontsize=label_fontsize)
-    ax2.set_ylabel("Altitude (km)", fontsize=label_fontsize)
-    # X ticks wrong if using linear grid.
-    if not np.all(np.isclose(np.diff(plot_grid.value), np.abs(plot_grid.value[1] - plot_grid.value[0]), atol=0)):
-        x_tick_locs = np.linspace(0, len(plot_grid) - 1, 9, dtype=int)
-        x_ticks = [int(plot_grid.value[x_tick_loc]) for x_tick_loc in x_tick_locs]
-        ax2.set_xticks(x_tick_locs, x_ticks)
-    ax2.tick_params(labelsize=tick_fontsize)
-
-    # ax2.axis("off")
-    # toa_offset = 5
-    def get_vibrant_colors(n_colors: int, ordered: bool = False) -> t.List[str]:
-        if ordered:
-            vibrant_color_list = [
-                "#0077BB",
-                "#33BBEE",
-                "#44EE66",
-                "#229933",
-                "#FFBB00",  # FFCC11
-                "#EE7733",
-                "#CC3311",
-                "#EE3377",
-                "#BB33BB",
-                "#8833EE",
-            ]
-        else:
-            vibrant_color_list = [
-                "#EE7733",
-                "#0077BB",
-                "#CC3311",
-                "#33BBEE",
-                "#229933",
-                "#EE3377",
-                "#44EE66",
-                "#BB33BB",
-                "#FFBB00",  # FFCC11
-                "#8833EE",
-            ]
-        if n_colors > len(vibrant_color_list):
-            return list(islice(cycle(vibrant_color_list), n_colors))
-        else:
-            colors_list_idx = np.linspace(0, len(vibrant_color_list) - 1, n_colors, dtype=int).tolist()
-            return list([vibrant_color_list[idx] for idx in colors_list_idx])
-
-    plt.tight_layout()
-    if save_file is not None:
-        plt.savefig(save_file, bbox_inches="tight", dpi=600)
-    # plt.show()
-    plt.close()
-
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
-    plot_colours = get_vibrant_colors(n_colors=len(plot_xsecs))
-    # n_nlte_layers = 31
-    for species_idx, xsec_key in enumerate(plot_xsecs.keys()):
-        if xsec_key == "HO":
-            for layer_idx in np.concatenate((np.arange(0, plot_tau.shape[0], 10), [plot_tau.shape[0] - 1])):
-                ax1.plot(
-                    plot_grid,
-                    plot_xsecs.get(xsec_key)[layer_idx] / oh_vmr[layer_idx],
-                    label=f"{xsec_key} [L{layer_idx}]",
-                    color=plot_colours[species_idx],
-                    alpha=0.5 + 0.5 * layer_idx / plot_tau.shape[0],
-                    zorder=layer_idx,
-                )
-    ax1.set_xlabel(r"Spectral Grid (cm$^\mathbf{-1}$)", fontsize=label_fontsize)
-    ax1.set_xlim(left=x_axis_left, right=x_axis_right)
-    ax1.set_ylabel(r"Cross Section (cm$^\mathbf{2}$ molecule$^\mathbf{-1}$)", fontsize=label_fontsize)
-    ax1.set_yscale("log")
-    ax1.set_ylim(bottom=1e-35, top=1e-16)
-    ax1.set_title(f"Non-LTE Molecular Opacities", fontsize=label_fontsize)
-    ax1.tick_params(labelsize=tick_fontsize)
-    ax1.legend(
-        loc="best",
-        prop={"size": tick_fontsize},
-        ncol=int(np.ceil(len(plot_xsecs) / 2)),
-    )
-    plot_colours = get_vibrant_colors(n_colors=len(plot_xsecs))
-    for idx, xsec_key in enumerate(plot_xsecs.keys()):
-        ax2.plot(
-            plot_grid,
-            plot_xsecs.get(xsec_key)[-1],
-            label=xsec_key,
-            color=plot_colours[idx],
-        )
-    ax2.set_xlabel(r"Spectral Grid (cm$^\mathbf{-1}$)", fontsize=label_fontsize)
-    ax2.set_xlim(left=x_axis_left, right=x_axis_right)
-    ax2.set_ylabel(r"VMR x Cross Section (cm$^\mathbf{2}$ molecule$^\mathbf{-1}$)", fontsize=label_fontsize)
-    ax2.set_yscale("log")
-    ax2.set_ylim(bottom=1e-40, top=1e-20)
-    ax2.set_title(f"Molecular Opacities at TOA", fontsize=label_fontsize)
-    ax2.tick_params(labelsize=tick_fontsize)
-    ax2.legend(
-        loc="best",
-        prop={"size": tick_fontsize},
-        ncol=int(np.ceil(len(plot_xsecs) / 2)),
-    )
-    plt.tight_layout()
-    if save_file is not None:
-        plt.savefig(save_file, bbox_inches="tight", dpi=600)
-    # plt.show()
-    plt.close()
+# def plot_emission(
+#     plot_grid: u.Quantity,
+#     plot_flux: u.Quantity,
+#     plot_tau: u.Quantity,
+#     plot_xsecs: t.Dict[SpeciesFormula, u.Quantity],
+#     label_fontsize: int = 22,
+#     tick_fontsize: int = 18,
+#     save_file: str | Path | None = None,
+# ) -> None:
+#     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
+#     x_axis_left = plot_grid[0].value
+#     x_axis_right = plot_grid[-1].value
+#     # ax1.plot(plot_grid, plot_flux.to(u.W / u.m ** 2 / u.um))
+#     ax1.plot(plot_grid, plot_flux.to(u.J / u.m**2, equivalencies=u.spectral()))
+#     ax1.set_xlabel(r"Spectral Grid (cm$^\mathbf{-1}$)", fontsize=label_fontsize)
+#     ax1.set_xlim(left=x_axis_left, right=x_axis_right)
+#     ax1.set_ylim(bottom=1e-11)
+#     ax1.set_ylabel(
+#         f"Flux ({plot_flux.to(u.J / u.m ** 2, equivalencies=u.spectral()).unit:latex})", fontsize=label_fontsize
+#     )
+#     ax1.set_yscale("log")
+#     ax1.set_title("Emission Spectrum", fontsize=label_fontsize)
+#     ax1.tick_params(labelsize=tick_fontsize)
+#     ax2.imshow(
+#         plot_tau,
+#         aspect="auto",
+#         origin="lower",
+#         # extent=[x_axis_left, x_axis_right, 0, plot_tau.shape[0]],
+#         interpolation="none",
+#         cmap="plasma",
+#     )
+#     ax2.set_title("Optical Depth", fontsize=label_fontsize)
+#     ax2.set_xlabel(r"Spectral Grid (cm$^\mathbf{-1}$)", fontsize=label_fontsize)
+#     ax2.set_ylabel("Altitude (km)", fontsize=label_fontsize)
+#     # X ticks wrong if using linear grid.
+#     if not np.all(np.isclose(np.diff(plot_grid.value), np.abs(plot_grid.value[1] - plot_grid.value[0]), atol=0)):
+#         x_tick_locs = np.linspace(0, len(plot_grid) - 1, 9, dtype=int)
+#         x_ticks = [int(plot_grid.value[x_tick_loc]) for x_tick_loc in x_tick_locs]
+#         ax2.set_xticks(x_tick_locs, x_ticks)
+#     ax2.tick_params(labelsize=tick_fontsize)
+#
+#     # ax2.axis("off")
+#     # toa_offset = 5
+#     def get_vibrant_colors(n_colors: int, ordered: bool = False) -> t.List[str]:
+#         if ordered:
+#             vibrant_color_list = [
+#                 "#0077BB",
+#                 "#33BBEE",
+#                 "#44EE66",
+#                 "#229933",
+#                 "#FFBB00",  # FFCC11
+#                 "#EE7733",
+#                 "#CC3311",
+#                 "#EE3377",
+#                 "#BB33BB",
+#                 "#8833EE",
+#             ]
+#         else:
+#             vibrant_color_list = [
+#                 "#EE7733",
+#                 "#0077BB",
+#                 "#CC3311",
+#                 "#33BBEE",
+#                 "#229933",
+#                 "#EE3377",
+#                 "#44EE66",
+#                 "#BB33BB",
+#                 "#FFBB00",  # FFCC11
+#                 "#8833EE",
+#             ]
+#         if n_colors > len(vibrant_color_list):
+#             return list(islice(cycle(vibrant_color_list), n_colors))
+#         else:
+#             colors_list_idx = np.linspace(0, len(vibrant_color_list) - 1, n_colors, dtype=int).tolist()
+#             return list([vibrant_color_list[idx] for idx in colors_list_idx])
+#
+#     plt.tight_layout()
+#     if save_file is not None:
+#         plt.savefig(save_file, bbox_inches="tight", dpi=600)
+#     # plt.show()
+#     plt.close()
+#
+#     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
+#     plot_colours = get_vibrant_colors(n_colors=len(plot_xsecs))
+#     for species_idx, xsec_key in enumerate(plot_xsecs.keys()):
+#         if xsec_key == "HO":
+#             for layer_idx in np.concatenate((np.arange(0, plot_tau.shape[0], 10), [plot_tau.shape[0] - 1])):
+#                 ax1.plot(
+#                     plot_grid,
+#                     plot_xsecs.get(xsec_key)[layer_idx] / oh_vmr[layer_idx],
+#                     label=f"{xsec_key} [L{layer_idx}]",
+#                     color=plot_colours[species_idx],
+#                     alpha=0.5 + 0.5 * layer_idx / plot_tau.shape[0],
+#                     zorder=layer_idx,
+#                 )
+#     ax1.set_xlabel(r"Spectral Grid (cm$^\mathbf{-1}$)", fontsize=label_fontsize)
+#     ax1.set_xlim(left=x_axis_left, right=x_axis_right)
+#     ax1.set_ylabel(r"Cross Section (cm$^\mathbf{2}$ molecule$^\mathbf{-1}$)", fontsize=label_fontsize)
+#     ax1.set_yscale("log")
+#     ax1.set_ylim(bottom=1e-35, top=1e-16)
+#     ax1.set_title(f"Non-LTE Molecular Opacities", fontsize=label_fontsize)
+#     ax1.tick_params(labelsize=tick_fontsize)
+#     ax1.legend(
+#         loc="best",
+#         prop={"size": tick_fontsize},
+#         ncol=int(np.ceil(len(plot_xsecs) / 2)),
+#     )
+#     plot_colours = get_vibrant_colors(n_colors=len(plot_xsecs))
+#     for idx, xsec_key in enumerate(plot_xsecs.keys()):
+#         ax2.plot(
+#             plot_grid,
+#             plot_xsecs.get(xsec_key)[-1],
+#             label=xsec_key,
+#             color=plot_colours[idx],
+#         )
+#     ax2.set_xlabel(r"Spectral Grid (cm$^\mathbf{-1}$)", fontsize=label_fontsize)
+#     ax2.set_xlim(left=x_axis_left, right=x_axis_right)
+#     ax2.set_ylabel(r"VMR x Cross Section (cm$^\mathbf{2}$ molecule$^\mathbf{-1}$)", fontsize=label_fontsize)
+#     ax2.set_yscale("log")
+#     ax2.set_ylim(bottom=1e-40, top=1e-20)
+#     ax2.set_title(f"Molecular Opacities at TOA", fontsize=label_fontsize)
+#     ax2.tick_params(labelsize=tick_fontsize)
+#     ax2.legend(
+#         loc="best",
+#         prop={"size": tick_fontsize},
+#         ncol=int(np.ceil(len(plot_xsecs) / 2)),
+#     )
+#     plt.tight_layout()
+#     if save_file is not None:
+#         plt.savefig(save_file, bbox_inches="tight", dpi=600)
+#     # plt.show()
+#     plt.close()
 
 
 # KELT-20 b profiles
@@ -215,18 +214,14 @@ oh_vmr = oh_rmmr / sum_rmmr
 fe_vmr = fe_rmmr / sum_rmmr
 
 nlayers = len(profiles)
-# nlayers = 100
 
-# temperature_profile = np.linspace(1600, 2900, nlayers) << u.K
 temperature_profile = profiles["T"].to_numpy()[::-1] << u.K
 log.info(temperature_profile[20])
 
-# spectral_grid = create_r_wn_grid(low=100, high=80000, resolving_power=10000)
-# spectral_grid = unified_opacity_sampling_grid(wn_start=100, wn_end=80000, temperature_profile=temperature_profile,
-#                                               max_step=500)
 spectral_grid = cdf_opacity_sampling(
     wn_start=10, wn_end=30000, temperature_profile=temperature_profile, num_points=1000, max_step=50
-)  # THIS ONE
+)
+
 # # HD 209458 b
 # planet_mass = 0.682 << u.Mjup
 # planet_radius = 1.37 << u.Rjup
@@ -245,11 +240,6 @@ orbital_radius = 0.057 << u.AU
 incident_radiation_field = incident_stellar_radiation(
     wn_grid=spectral_grid, star_temperature=star_temperature, orbital_radius=orbital_radius, planet_radius=planet_radius
 )
-
-# TEST
-# oh_vmr = np.ones(len(profiles)) * 0.5
-# h_vmr = np.ones(len(profiles)) * 0.5
-# END TEST
 
 chemistry_profile = ChemicalProfile.from_species_definition(
     species_definition={
@@ -278,8 +268,8 @@ emission = ExoplanetEmission(
     planet_mass=planet_mass,
     planet_radius=planet_radius,
     temperature_profile=temperature_profile,
-    boa_pressure=1e2 << u.bar,  # 1e6 << u.Pa,  pressure_levels[0]
-    toa_pressure=1e-6 << u.bar,  # 1e-6 << u.Pa, pressure_levels[-1]
+    boa_pressure=1e2 << u.bar,
+    toa_pressure=1e-6 << u.bar,
     nlayers=nlayers,
     chemistry_profile=chemistry_profile,
     ngauss=4,
@@ -288,7 +278,6 @@ emission = ExoplanetEmission(
 )
 xsecs = xsec.XSecCollection()
 
-# Here I have an implementation that discovers all HDF5 files in a directory.
 hdf5_xsecs = xsec.ExomolHDF5Xsec.discover_all(
     pathlib.Path(r"/mnt/c/PhD/programs/charlesrex/tests/inputs"),
     load_in_memory=True,
@@ -339,9 +328,6 @@ nlte_xsec = xsec.ExomolNLTEXsec(
 #     incident_radiation_field=incident_radiation_field,
 # )
 xsecs.add_replace_xsec_data(nlte_xsec)
-# If you have some xsec format you can add it here.
-# xsec.add_xsec_data(MyXsecData())
-# If an existing molecule is added, it will be replaced.
 
 start = time.perf_counter()
 
@@ -349,7 +335,6 @@ start = time.perf_counter()
 spectral_grid, emission_flux, emission_tau, emission_xsecs = emission.compute_emission(
     xsecs, spectral_grid=spectral_grid, output_intensity=True
 )
-
 # plot_emission(plot_grid=spectral_grid, plot_flux=emission_flux, plot_tau=emission_tau, plot_xsecs=emission_xsecs)
 # np.savetxt(
 #     (output_dir / f"KELT-20b_LTE_cont_{oh_scale_factor}xOH_boundaryL{n_lte_layers}.txt").resolve(),
@@ -378,42 +363,10 @@ while not is_converged:
         is_converged = True
     iter_num += 1
 
-# Save converged transmission or iteration grid
-# np.savetxt(
-#     (output_dir / f"KELT-20b_cont_{oh_scale_factor}xOH_boundaryL{n_lte_layers}_transmission.txt").resolve(),
-#     np.array([spectral_grid.value, emission_flux.to(u.J / u.m ** 2, equivalencies=u.spectral()).value]).T,
-#     fmt="%17.8E",
-# )
-
-# result gives the spectral grid requested, the emission flux, the optical depth and the cross-sections used.
+# Result gives the spectral grid requested, the emission flux, the optical depth and the cross-sections used.
 high_res_grid = create_r_wn_grid(low=spectral_grid[0].value, high=spectral_grid[-1].value, resolving_power=15000)
 spectral_grid, emission_flux, emission_tau, emission_xsecs = emission.compute_emission(
     xsecs, spectral_grid=high_res_grid, output_intensity=True
 )
-# plot_emission(
-#     plot_grid=high_res_grid,
-#     plot_flux=emission_flux,
-#     plot_tau=emission_tau,
-#     plot_xsecs=emission_xsecs,
-#     save_file=(
-#         output_dir / f"KELT-20b_cont_{oh_scale_factor}xOH_boundaryL{n_lte_layers}_emission_CONVERGED.png"
-#     ).resolve(),
-# )
 
 log.info(f"Time taken: {time.perf_counter() - start:.2f} s")
-# np.savetxt(
-#     (output_dir / f"KELT-20b_cont_{oh_scale_factor}xOH_boundaryL{n_lte_layers}_transmission_highres.txt").resolve(),
-#     np.array([high_res_grid.value, emission_flux.to(u.J / u.m**2, equivalencies=u.spectral()).value]).T,
-#     fmt="%17.8E",
-# )
-
-# TODO: Compute final spectra on fixed resolving power grid with new populations.
-#  What population diagnostics to perform?
-#  Plot log of population change as a function of level energy?
-
-# TODO: Show total emission with a non-LTE envelope.
-#  Vary the size (number of layers of the envelope) - how does the observed emission change?
-#  Vary the number of collisional partners driving into higher v's (fixed size of envelope) - how does emission change?
-#  When does this effect become observable?
-#  How much more OH in A state? relates to production of H2O in higher v's.
-#  What happens when you add water in?

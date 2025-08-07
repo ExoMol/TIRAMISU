@@ -11,7 +11,9 @@ from astropy import units as u
 from pathlib import Path
 from .format import output_data
 
-_EXOCROSS_PATH = r"/mnt/c/PhD/exocross/xcross.x"  # TODO: Store elsewhere.
+_EXOCROSS_PATH = r"/mnt/c/PhD/exocross/xcross.x"
+
+# TODO: Deprecated - Remove.
 
 
 def build_exocross_input(
@@ -27,7 +29,6 @@ def build_exocross_input(
     profile: str,
     linear_grid: bool = True,
 ) -> Path:
-    # working_name = f"{states_file.stem}__{temperature.value:.1f}K_{pressure.value:.2E}P_{spec_type}"
     input_file = working_name + f"_{spec_type}.inp"
     if spec_type[:3] not in ["abs", "emi"]:
         raise RuntimeError(
