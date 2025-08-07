@@ -1,0 +1,24 @@
+[project]
+name = "tiramisu"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.1",
+    "astropy>6.1.4",
+    "scipy>1.14.0",
+    "molmass>2024.5.24",
+    "h5py>3.11.0",
+    "pandas>2.2.2",
+    "tqdm>4.66.4",
+    "numba>=0.61.0",
+    "matplotlib>=3.10.1",
+]
+
+[dependency-groups]
+dev = [
+    "matplotlib>3.9.1",
+    "ipython>8.26.0"
+]
+
+[tool.setuptools]
+packages = ["tiramisu"]
