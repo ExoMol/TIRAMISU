@@ -1,5 +1,5 @@
-/tests/holding/
-/tests/inputs/
+/tests/
+/tests/
 /.idea/
 /outputs/
 /tiramisu.egg-info/
