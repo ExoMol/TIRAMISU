@@ -139,7 +139,11 @@ class ExoplanetEmission:
         self.density = density_profile(self.temperature_profile, self.central_pressure)
 
     def compute_emission(
-            self, xsecs: XSecCollection, spectral_grid: t.Optional[u.Quantity] = None, output_intensity: bool = False
+            self,
+            xsecs: XSecCollection,
+            spectral_grid: t.Optional[u.Quantity] = None,
+            output_intensity: bool = False,
+            incident_radiation_field: u.Quantity = None
     ) -> t.Tuple[u.Quantity, u.Quantity, u.Quantity, t.Dict[SpeciesFormula, u.Quantity]]:
 
         if spectral_grid is None:
@@ -189,7 +193,8 @@ class ExoplanetEmission:
                 dtau=dtau,
                 source_function=source_func,
                 mu_values=mu_values,
-                mu_weights=mu_weights
+                mu_weights=mu_weights,
+                incident_radiation_field=incident_radiation_field,
             )
 
             if xsecs.is_converged():
@@ -270,67 +275,55 @@ def formal_solve_general(
         source_function: u.Quantity,
         mu_values: npt.NDArray[np.float64],
         mu_weights: npt.NDArray[np.float64],
+        incident_radiation_field: u.Quantity = None,
         surface_albedo: float = 0
 ) -> t.Tuple[u.Quantity, u.Quantity]:
     """
-    Calculates the up- and down-welling intensity at each layer interface
-    for a general (optically thick or thin) atmosphere.
-    Convention: index 0 is the Bottom of the Atmosphere (BOA).
+    Calculates the upward and downward intensity at the interface between each layer.
+    Index 0 is the Bottom of the Atmosphere (BOA).
 
-    Args:
-        dtau (u.Quantity): Optical depth of each layer. Shape (n_layers, n_wavelengths).
-        source_function (u.Quantity): Source function in each layer. Shape (n_layers, n_wavelengths).
-        mu_values (np.ndarray): Array of mu cosines.
-        mu_weights (np.ndarray): Array of angular integration weights.
+    :param dtau: Optical depth of each layer. Shape (n_layers, n_wavelengths).
+    :param source_function: Source function in each layer. Shape (n_layers, n_wavelengths).
+    :param mu_values: Array of mu cosines.
+    :param mu_weights: Array of angular integration weights.
+    :param incident_radiation_field: Radiation field incident on the top of the atmosphere (J. m^2).
+    :param surface_albedo: ...
 
-    Returns:
-        Tuple[u.Quantity, u.Quantity]:
-            - I_up: Up-welling intensity at the top interface of each layer. Shape (n_mu_up, n_layers+1, n_wavelengths).
-            - I_down: Down-welling intensity at the top interface of each layer. Shape (n_mu_down, n_layers+1, n_wavelengths).
+    :return: Upwards and Downwards directed intensity at the upper interface of each layer.
     """
     n_layers, n_wavelengths = dtau.shape
 
-    # Intensity is at the interfaces, so n_layers + 1 levels.
-    # Level 0 is BOA, Level n_layers is TOA.
+    # Compute intensity at interfaces.
     i_up = np.zeros((len(mu_values), n_layers + 1, n_wavelengths)) * source_function.unit
     i_down = np.zeros((len(mu_values), n_layers + 1, n_wavelengths)) * source_function.unit
 
-    # --- Down-welling Calculation (I_down) ---
-    # Boundary condition at the top (level n_layers) is zero.
-    i_down[:, n_layers, :] = 0.0 * source_function.unit
+    # Upper boundary condition at the top (level n_layers) is zero, unless incident radiation field!
+    if incident_radiation_field is not None:
+        i_down[:, n_layers, :] = incident_radiation_field
+    else:
+        i_down[:, n_layers, :] = 0.0 * source_function.unit
 
     # Integrate from TOA (k=n_layers-1) down to BOA (k=0)
     for k in range(n_layers - 1, -1, -1):
-        # Use abs(mu) for path length
         delta_tau_mu = dtau[k, :] / np.abs(mu_values[:, None])
         exp_term = np.exp(-delta_tau_mu)
         source_contribution = source_function[k, :] * (1 - exp_term)
 
-        # Intensity at the top interface of the layer (level k)
+        # Intensity at the top interface of each layer
         i_down[:, k, :] = i_down[:, k + 1, :] * exp_term + source_contribution
 
-    # --- 2. Define the Bottom Boundary Condition ---
-    # Calculate down-welling flux at the surface (level 0)
-    # The integral of 2 * pi * I * mu * d(mu) from -1 to 0
-    # Note: mu_weights from leggauss are for an integral from -1 to 1.
-    # We are only integrating over the downward hemisphere.
+    # Include an albedo for terrestrial planets?
     # downward_flux = 2 * np.pi * (i_down[:, 0, :] * mu_values[:, None] * mu_weights[mu_weights > 0, None]).sum(axis=0)
     # Reflected intensity is diffuse (same in all directions)
     # reflected_intensity = surface_albedo * downward_flux / np.pi
 
-    # Total surface emission (level 0)
-    # Use a Planck function calculator for thermal emission
-    # from astropy.modeling.models import BlackBody
-    # bb = BlackBody(surface_temperature)
+    # bb = blackbody(...)
     # thermal_emission = bb(dtau.shape[1] * u.nm) # Example wavelength
     # thermal_emission = source_function[-1] * surface_emissivity # Placeholder
     # surface_emission = thermal_emission + reflected_intensity
     surface_emission = source_function[0, :]  # USE THIS IN PROD!
 
-    # --- Up-welling Calculation (I_up) ---
-    # Boundary condition at the bottom (level 0).
-    # This is the intensity entering the lowest layer from below.
-    # We'll use the source function of the bottom layer as the surface emission.
+    # Lower boundary source function (black body) is surface upwards emission.
     i_up[:, 0, :] = surface_emission
 
     # Integrate from BOA (k=0) to TOA (k=n_layers-1)
