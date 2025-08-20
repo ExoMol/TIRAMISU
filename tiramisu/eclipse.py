@@ -87,7 +87,14 @@ def integrate_emission_quadrature(
         mu_tau: npt.NDArray[np.float64],
         mu_weights: npt.NDArray[np.float64],
 ) -> u.Quantity:
-    """Integrate emission using quadrature points."""
+    """
+    Deprecated. See :func:`formal_solve_general` for the current implementation.
+
+    :param emission_mu:
+    :param mu_tau:
+    :param mu_weights:
+    :return:
+    """
     emission_mu = emission_mu
 
     return 2 * np.pi * (emission_mu * mu_tau[:, None] * mu_weights[:, None]).sum(axis=0) * u.sr
@@ -151,9 +158,6 @@ class ExoplanetEmission:
 
         spectral_grid = spectral_grid
 
-        # NB: MOVED! TEST!
-        # source_func = self.source_function(spectral_grid, xsecs)
-
         self.mu_tau, self.mu_weights = emission_quadratures(4)
         opacities = xsecs.compute_opacities_profile(
             self.chemistry_profile,
@@ -164,14 +168,11 @@ class ExoplanetEmission:
         opac_dens = [x * self.density[:, None] for x in opacities.values()]
         dtau = boa_toa_optical_depth(opac_dens, self.dz)
 
-        # Moved after opacity calculations so that final computation of high-res spectra can be used to compute high-res
-        # source function.
         source_func, global_chi, global_eta = self.source_function(spectral_grid, xsecs, opacities)
-        # dtau = global_chi * self.density[:, None] * self.dz[:, None]
-        # dtau = dtau.decompose()
 
+
+        # These two lines are now defunct and their results are not used.
         emission_mu, emission_tau = emission_1d(dtau, self.mu_tau, source_func)
-
         emission = integrate_emission_quadrature(emission_mu, self.mu_tau, self.mu_weights)
 
         for species in xsecs:
@@ -183,7 +184,6 @@ class ExoplanetEmission:
                 xsecs[species].global_eta_matrix = global_eta
                 xsecs[species].global_source_func_matrix = source_func  # Now redundant?
 
-        # TEMP!
         if output_intensity:
             mu_values, mu_weights = np.polynomial.legendre.leggauss(50)
             mu_values, mu_weights = (mu_values + 1) * 0.5, mu_weights / 2
@@ -282,15 +282,19 @@ def formal_solve_general(
     Calculates the upward and downward intensity at the interface between each layer.
     Index 0 is the Bottom of the Atmosphere (BOA).
 
-    :param dtau: Optical depth of each layer. Shape (n_layers, n_wavelengths).
-    :param source_function: Source function in each layer. Shape (n_layers, n_wavelengths).
-    :param mu_values: Array of mu cosines.
-    :param mu_weights: Array of angular integration weights.
+    :param dtau:                     Optical depth of each layer.
+    :param source_function:          Source function in each layer.
+    :param mu_values:                Array of mu cosines.
+    :param mu_weights:               Array of angular integration weights.
     :param incident_radiation_field: Radiation field incident on the top of the atmosphere (J. m^2).
-    :param surface_albedo: ...
+    :param surface_albedo:           Albedo of the planet's surface, in the range [0, 1] [Not tested].
 
-    :return: Upwards and Downwards directed intensity at the upper interface of each layer.
+    :return: Upwards and Downwards directed intensity at the interface of each layer.
     """
+    if surface_albedo < 0 or surface_albedo > 1:
+        log.warning(f"Surface albedo {surface_albedo} is outside of [0, 1], clipping.")
+        surface_albedo = np.clip(surface_albedo, 0, 1)
+
     n_layers, n_wavelengths = dtau.shape
 
     # Compute intensity at interfaces.
