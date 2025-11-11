@@ -82,7 +82,7 @@ class ChemicalProfile:
     @classmethod
     def from_species_definition(
         cls,
-        species_definition: t.Dict[SpeciesIdentType, float],
+        species_definition: t.Dict[SpeciesIdentType, float | npt.NDArray[np.float64]],
         fill_species: t.List[SpeciesFormula | str],
         fill_ratios: t.List[float],
         nlayers: int,

@@ -10,7 +10,7 @@ from .atmos import (
     density_profile,
     solve_scaleheight,
 )
-from .xsec import XSecCollection, ExomolNLTEXsec
+from .xsec import XSecCollection, ExomolNLTEXsec, is_nlte_xsec
 from .nlte import blackbody
 from .config import log, output_dir
 
@@ -161,43 +161,28 @@ class ExoplanetEmission:
         self.mu_tau, self.mu_weights = emission_quadratures(4)
         opacities = xsecs.compute_opacities_profile(
             self.chemistry_profile,
+            self.density,
+            self.dz,
             self.temperature_profile,
             self.central_pressure,
             spectral_grid,
         )
-        opac_dens = [x * self.density[:, None] for x in opacities.values()]
-        dtau = boa_toa_optical_depth(opac_dens, self.dz)
+        source_func, global_chi, global_eta = self.source_function(spectral_grid, xsecs)
 
-        source_func, global_chi, global_eta = self.source_function(spectral_grid, xsecs, opacities)
-
-
-        # These two lines are now defunct and their results are not used.
-        emission_mu, emission_tau = emission_1d(dtau, self.mu_tau, source_func)
-        emission = integrate_emission_quadrature(emission_mu, self.mu_tau, self.mu_weights)
-
-        for species in xsecs:
-            if type(xsecs[species]) is ExomolNLTEXsec:
-                xsecs[species].density_profile = self.density
-                xsecs[species].dz_profile = self.dz
-                xsecs[species].tau_matrix = emission_tau
-                xsecs[species].global_chi_matrix = sum(opac_dens)
-                xsecs[species].global_eta_matrix = global_eta
-                xsecs[species].global_source_func_matrix = source_func  # Now redundant?
+        mu_values, mu_weights = np.polynomial.legendre.leggauss(50)
+        mu_values, mu_weights = (mu_values + 1) * 0.5, mu_weights / 2
+        res = global_chi * self.density[:, None] * self.dz[:, None]
+        dtau = res.decompose().value
+        i_up, i_down = formal_solve_general(
+            dtau=dtau,
+            source_function=source_func,
+            mu_values=mu_values,
+            mu_weights=mu_weights,
+            incident_radiation_field=incident_radiation_field,
+        )
 
         if output_intensity:
-            mu_values, mu_weights = np.polynomial.legendre.leggauss(50)
-            mu_values, mu_weights = (mu_values + 1) * 0.5, mu_weights / 2
-            res = global_chi * self.density[:, None] * self.dz[:, None]
-            dtau = res.decompose().value
-            i_up, i_down = formal_solve_general(
-                dtau=dtau,
-                source_function=source_func,
-                mu_values=mu_values,
-                mu_weights=mu_weights,
-                incident_radiation_field=incident_radiation_field,
-            )
-
-            if xsecs.is_converged():
+            if xsecs.is_converged:
                 out_name = "KELT-20b_nLTE_intensity_"
             else:
                 out_name = "KELT-20b_LTE_intensity_"
@@ -214,60 +199,25 @@ class ExoplanetEmission:
                 fmt="%17.8E",
             )
 
-        return spectral_grid, emission, emission_tau, opacities
+        # return spectral_grid, emission, emission_tau, opacities
+        return spectral_grid, i_up, i_down, opacities
 
     def source_function(
-            self, spectral_grid: u.Quantity, xsecs: XSecCollection, opacities: t.Dict[SpeciesFormula, u.Quantity]
+            self, spectral_grid: u.Quantity, xsecs: XSecCollection,
     ) -> t.Tuple[u.Quantity, u.Quantity, u.Quantity]:
-        lte_fraction = np.ones(len(self.temperature_profile))
-        # # nlte_source_func = np.zeros((len(self.temperature_profile), len(spectral_grid))) << u.J / (u.s * u.sr * u.m ** 3)  # LAMBDA
-        # nlte_source_func = np.zeros((len(self.temperature_profile), len(spectral_grid))) << u.J / (
-        #     u.sr * u.m**2
-        # )  # FREQUENCY
-        # # nlte_source_func = np.zeros((len(self.temperature_profile), len(spectral_grid))) << u.J / u.m ** 2  # WAVENUMBER
-        chi = np.zeros((len(self.temperature_profile), len(spectral_grid))) << u.cm ** 2
-        eta = np.zeros((len(self.temperature_profile), len(spectral_grid))) << u.erg * u.cm / (u.s * u.sr)
-
         lte_source_func = blackbody(spectral_grid, self.temperature_profile)
 
-        # Chi and Eta are both in terms of per molecule. In each layer the number density iis the same so we can just
-        # multiply by the VMR (species_profile) to obtain the contributions from each).
-        for species in xsecs:
-            if species in self.chemistry_profile.species:
-                species_profile = self.chemistry_profile[species]
-                if type(xsecs[species]) is ExomolNLTEXsec and xsecs[species].mol_chi_matrix is not None:
-                    # Remove the NLTE fractional abundances to scale the LTE blackbody contributions.
-                    lte_fraction -= species_profile
-                    # Multiply species source function by fractional abundance
-                    # nlte_source_func += xsecs[species].mol_source_func_matrix * species_profile[:, None]
-                    chi += xsecs[species].mol_chi_matrix * species_profile[:, None]
-                    eta += xsecs[species].mol_eta_matrix * species_profile[:, None]
-                else:
-                    # Chi is known for the LTE species, Eta = Blackbody*chi
-                    chi += opacities[species] * species_profile[:, None]
-                    eta += opacities[species] * species_profile[:, None] * lte_source_func * ac.c
-
-        negative_chi_cap = - 1e-5 * chi.max(axis=1)[:, None]
-        chi = np.clip(chi, min=negative_chi_cap)
+        negative_chi_cap = - 1e-6 * xsecs.global_chi_matrix.max(axis=1)[:, None]
+        effective_chi = np.clip(xsecs.global_chi_matrix, min=negative_chi_cap)
         negative_source_func_cap = - lte_source_func.max(axis=1)[:, None]
-        # if sum(lte_fraction) == len(self.temperature_profile):
-        #     combined_source_func = blackbody(spectral_grid, self.temperature_profile)
-        # elif sum(lte_fraction) != 0:
-        #     lte_source_func *= lte_fraction[:, None]
-        #     combined_source_func = lte_source_func + nlte_source_func
-        # else:
-        #     combined_source_func = nlte_source_func
 
-        combined_source_func = (eta / (ac.c * chi)).to(u.J / (u.sr * u.m ** 2), equivalencies=u.spectral())
+        effective_source_func = (xsecs.global_eta_matrix / (ac.c * effective_chi)).to(u.J / (u.sr * u.m ** 2),
+                                                                               equivalencies=u.spectral())
         # Limit the effects of stimulated emission to avoid exponential overflows.
         # combined_source_func[combined_source_func < negative_source_func_cap] = negative_source_func_cap
-        combined_source_func = np.clip(combined_source_func, min=negative_source_func_cap)
+        effective_source_func = np.clip(effective_source_func, min=negative_source_func_cap)
 
-        # for species in xsecs:
-        #     if type(xsecs[species]) is ExomolNLTEXsec:
-        #         xsecs[species].global_source_func_matrix = combined_source_func
-
-        return combined_source_func, chi, eta
+        return effective_source_func, effective_chi, xsecs.global_eta_matrix
 
 
 def formal_solve_general(

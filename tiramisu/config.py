@@ -8,6 +8,7 @@ output_dir = (pathlib.Path(os.getcwd()) / "./outputs").resolve()
 
 log = logging.getLogger()
 log.setLevel(logging.INFO)
+# log.setLevel(logging.DEBUG)
 
 # stream_handler = logging.StreamHandler()
 # stream_formatter = logging.Formatter("%(asctime)s [%(levelname)s]  %(message)s")
@@ -31,3 +32,6 @@ if numba.get_num_threads() != _DEFAULT_NUM_THREADS:
 _DEFAULT_CHUNK_SIZE = 10000000
 _N_GH_QUAD_POINTS = 30
 _INTENSITY_CUTOFF = 1e-100
+
+
+os.environ["RUST_BACKTRACE"] = "1"
