@@ -152,18 +152,32 @@ def _process_cont_batch(
         layer_temperature_tuple: t.Tuple[int, u.Quantity],
         serialised_states: bytes,
         wn_grid: npt.NDArray[np.float64],
+        species_mass: float,
+        cont_box_length: float,
         n_lte_layers: int,
 ) -> t.Tuple[int, t.Optional[pl.DataFrame], t.Optional[pl.DataFrame]]:
     """
-    Calculates the Einstein coefficient A_fi, B_fi, B_if and the vibronic band profiles of transitions in the
-    chunk.
+    Calculates the Einstein coefficient A_fi, B_fi, B_if and the vibronic band profiles of transitions in the chunk.
 
-    :param serialised_batch: Serialized form of Polars DataFrame chunk read from the large file.
-    :param layer_temperature_tuple: (layer_idx, temperature) for the current layer.
-    :param serialised_states: Serialized form of the pre-calculated state data with populations for all layers.
-    :param wn_grid: The full wavenumber grid.
-    :param n_lte_layers: Number of LTE layers.
-    :return: (layer_idx, band_profile_data, agg_batch_rates)
+    Parameters
+    ----------
+    serialised_batch: bytes
+        Serialised form of Polars DataFrame chunk read from the large file.
+    layer_temperature_tuple: tuple
+        (layer_idx, temperature) for the current layer.
+    serialised_states: bytes
+        Serialised form of the pre-calculated state data with populations for all layers.
+    wn_grid: ndarray
+        The full wavenumber grid.
+    species_mass: float
+        Mass of the species for broadening.
+    cont_box_length: float
+        Box length off to use in continuum box broadening.
+    n_lte_layers: int
+        Number of LTE layers.
+    Returns
+    -------
+        (layer_idx, band_profile_data, agg_batch_rates)
     """
     nlte_layer_idx, layer_temp = layer_temperature_tuple
     layer_idx = n_lte_layers + nlte_layer_idx
@@ -182,24 +196,24 @@ def _process_cont_batch(
         col: f"{col}_i" for col in select_cols_i
     })
 
-    select_cols_c = ["id", "g", "energy", "n_frac", ]
-    layer_cont_states_c = layer_cont_states.select(select_cols_c).rename({
-        col: f"{col}_c" for col in select_cols_c
+    select_cols_f = ["id", "g", "energy", "n_frac", "v_f"]
+    layer_cont_states_f = layer_cont_states.select(select_cols_f).rename({
+        col: f"{col}_f" for col in select_cols_f
     })
 
     trans_batch = trans_batch.join(layer_cont_states_i, on="id_i", how="inner")
-    trans_batch = trans_batch.join(layer_cont_states_c, on="id_c", how="inner")
+    trans_batch = trans_batch.join(layer_cont_states_f, on="id_f", how="inner")
 
     trans_batch = trans_batch.with_columns(
-        (pl.col("energy_c") - pl.col("energy_i")).alias("energy_ci")
+        (pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi")
     )
     wn_min = wn_grid[0]
     wn_max = wn_grid[-1]
     trans_batch = trans_batch.filter(
-        (pl.col("energy_c") >= wn_min)
+        (pl.col("energy_f") >= wn_min)
         & (pl.col("energy_i") <= wn_max)
-        & (pl.col("energy_ci") >= wn_min)
-        & (pl.col("energy_ci") <= wn_max)
+        & (pl.col("energy_fi") >= wn_min)
+        & (pl.col("energy_fi") <= wn_max)
     )
     if trans_batch.height == 0:
         return nlte_layer_idx, None, None
@@ -212,6 +226,9 @@ def _process_cont_batch(
     band_profile_partial = partial(
         calc_cont_band_profile,
         wn_grid,
+        layer_temp,
+        species_mass,
+        cont_box_length,
     )
     band_profile_data = trans_batch.group_by("id_agg_i").map_groups(band_profile_partial)
     log.info(f"[L{layer_idx}] Continuum profile duration = {time.perf_counter() - start_time:.2f}.")
@@ -220,27 +237,27 @@ def _process_cont_batch(
     if nlte_layer_idx == 0:
         # chunk = chunk.loc[(chunk["energy_ci"] >= wn_grid[0].value) & (chunk["energy_ci"] <= wn_grid[-1].value)]
         b_ci_vals = calc_einstein_b_fi(
-            a_fi=trans_batch["A_ci"].to_numpy(),
-            energy_fi=(trans_batch["energy_ci"].to_numpy() << 1 / u.cm)
+            a_fi=trans_batch["A_fi"].to_numpy(),
+            energy_fi=(trans_batch["energy_fi"].to_numpy() << 1 / u.cm)
             .to(u.Hz, equivalencies=u.spectral())
             .value,
         )
         b_ic_vals = calc_einstein_b_if(
             b_fi=b_ci_vals,
-            g_f=trans_batch["g_c"].to_numpy(),
+            g_f=trans_batch["g_f"].to_numpy(),
             g_i=trans_batch["g_i"].to_numpy(),
         )
         agg_batch = (
             trans_batch
             .with_columns([
-                pl.Series("B_ci", b_ci_vals),
-                pl.Series("B_ic", b_ic_vals),
+                pl.Series("B_fi", b_ci_vals),
+                pl.Series("B_if", b_ic_vals),
             ])
             .group_by("id_agg_i")
             .agg([
-                pl.col("A_ci").sum().alias("A_ci"),
-                pl.col("B_ci").sum().alias("B_ci"),
-                pl.col("B_ic").sum().alias("B_ic"),
+                pl.col("A_fi").sum().alias("A_i"),
+                pl.col("B_fi").sum().alias("B_fi"),
+                pl.col("B_if").sum().alias("B_if"),
             ])
         )
 
@@ -261,6 +278,8 @@ class NLTEProcessor:
             n_lte_layers: int = 0,
             cont_states_file: pathlib.Path = None,
             cont_trans_files: pathlib.Path | t.List[pathlib.Path] = None,
+            cont_box_length: float = None,
+            cont_broad_col_num: int = None,
             dissociation_products: t.Tuple = None,
             debug: bool = False,
             debug_pop_matrix: npt.NDArray[np.float64] = None,
@@ -300,7 +319,14 @@ class NLTEProcessor:
             cont_trans_files = [cont_trans_files]
         self.cont_trans_files: t.List[pathlib.Path] = cont_trans_files
         self.cont_profile_store: ContinuumProfileStore | None = None
-        # self.cont_profile_grid: BandProfileCollection | None = None  # Deprecated
+        self.cont_box_length: float | None = cont_box_length
+        self.cont_broad_col_num: int | None = cont_broad_col_num
+        if (self.cont_states is None) ^ (self.cont_trans_files is None) ^ (self.cont_box_length is None) ^ (
+                self.cont_broad_col_num is None):
+            raise RuntimeError(
+                "Continuum states and trans files must both be provided with a box length for broadening and "
+                "column index for box broadening n."
+            )
         self.dissociation_products: t.Tuple = dissociation_products
         self.debug: bool = debug
         self.debug_pop_matrix: npt.NDArray[np.float64] | None = debug_pop_matrix
@@ -484,9 +510,18 @@ class NLTEProcessor:
     ):
         log.info(f"Loading continuum absorption rates and profiles.")
 
-        read_col_names = ["id", "energy", "g"] + self.agg_col_names
-        read_col_indices = [0, 1, 2] + self.agg_col_nums
-        fixed_dtypes = {"id": "Int64", "energy": np.float64, "g": np.float64}
+        read_col_map = {num: "v" if num == self.cont_broad_col_num else name for num, name in
+                        zip(self.agg_col_nums, self.agg_col_names)}
+        if self.cont_broad_col_num not in read_col_map:
+            read_col_map[self.cont_broad_col_num] = "v"
+
+        # extra_col_indices = [k for k, _ in sorted(read_col_map.items())]
+        # extra_col_names = [v for _, v in sorted(read_col_map.items())]
+        extra_col_indices, extra_col_names = (list(x) for x in zip(*sorted(read_col_map.items())))
+
+        read_col_names = ["id", "energy", "g"] + extra_col_names
+        read_col_indices = [0, 1, 2] + extra_col_indices
+        fixed_dtypes = {"id": "Int64", "energy": np.float64, "g": np.float64, "v": "Int64"}
 
         self.cont_states = pl.from_pandas(pd.read_csv(
             self.cont_states_file,
@@ -525,7 +560,7 @@ class NLTEProcessor:
         self.cont_rates = []
         self.cont_profile_store = ContinuumProfileStore(n_layers=n_nlte_layers)
 
-        dask_dtypes = {"id_c": "int64", "id_i": "int64", "A_ci": "float64", "broad": "float64"}
+        dask_dtypes = {"id_f": "int64", "id_i": "int64", "A_fi": "float64"}
         dask_blocksize = "256MB"
 
         serialised_states = layers_cont_states.serialize()
@@ -538,8 +573,8 @@ class NLTEProcessor:
                 sep=r"\s+",
                 engine="python",
                 header=None,
-                names=["id_c", "id_i", "A_ci", "broad"],
-                usecols=[0, 1, 2, 3],
+                names=["id_f", "id_i", "A_fi"],
+                usecols=[0, 1, 2],
                 dtype=dask_dtypes,
                 blocksize=dask_blocksize,
             )
@@ -558,6 +593,8 @@ class NLTEProcessor:
                     serialised_batch,
                     serialised_states=serialised_states,
                     wn_grid=wn_grid.value,
+                    species_mass=self.species_mass,
+                    cont_box_length=self.cont_box_length,
                     n_lte_layers=self.n_lte_layers
                 )
                 log.info(trans_batch)
@@ -580,9 +617,9 @@ class NLTEProcessor:
 
         self.cont_rates: pl.DataFrame = pl.concat(self.cont_rates)
         self.cont_rates = self.cont_rates.group_by("id_agg_i").agg([
-            pl.col("A_ci").sum().alias("A_ci"),
-            pl.col("B_ci").sum().alias("B_ci"),
-            pl.col("B_ic").sum().alias("B_ic"),
+            pl.col("A_fi").sum().alias("A_fi"),
+            pl.col("B_fi").sum().alias("B_fi"),
+            pl.col("B_if").sum().alias("B_if"),
         ])
         log.info(f"[I0] Continuum rates = \n{self.cont_rates}")
         # Done.
@@ -1452,6 +1489,9 @@ class NLTEProcessor:
                     continuum_trans_files=self.cont_trans_files,
                     layer_idx=layer_idx,
                     wn_grid=wn_grid.value,
+                    temperature=layer_temp,
+                    species_mass=self.species_mass,
+                    cont_box_length=self.cont_box_length
                 )
                 abs_xsec += cont_xsec
                 np.savetxt(
@@ -1472,6 +1512,9 @@ class NLTEProcessor:
                     continuum_trans_files=self.cont_trans_files,
                     layer_idx=layer_idx,
                     wn_grid=wn_grid.value,
+                    temperature=layer_temp,
+                    species_mass=self.species_mass,
+                    cont_box_length=self.cont_box_length
                 )
                 np.savetxt(
                     (
@@ -1987,14 +2030,12 @@ class XSecCollection(dict):
             ) * chemical_profile[species][:, None]
             for species in active_species
         }
-        if nlte_species.size == 0:
-            return output_opacities
 
         # TODO: Add check to fit T_ex for each layer in first combined inward+outward pass, use for boltzmann (not T_k).
 
         n_layers = temperature.shape[0]
 
-        # Configure global_eta_matrix from the LTE species.
+        # -------------------------- GLOBAL PROPERTY CONFIGURATION --------------------------
         self.global_chi_matrix: u.Quantity = np.zeros((n_layers, spectral_grid.shape[0])) << u.cm ** 2
         self.global_eta_matrix: u.Quantity = np.zeros(self.global_chi_matrix.shape) << u.erg * u.cm / (u.s * u.sr)
         lte_source_func = blackbody(spectral_grid, temperature)
@@ -2024,6 +2065,10 @@ class XSecCollection(dict):
         self.global_source_func_matrix[~zero_chi_mask] = (
                 self.global_eta_matrix[~zero_chi_mask] / (ac.c * self.global_chi_matrix[~zero_chi_mask])
         )
+
+        if nlte_species.size == 0:
+            # Early exit when no NLTE species.
+            return output_opacities
 
         # Perform Gauss-Seidel passes.
         n_angular_points = 50

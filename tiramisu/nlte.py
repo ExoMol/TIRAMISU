@@ -15,11 +15,13 @@ from astropy import units as u
 from astropy import constants as ac
 
 from scipy.integrate import simpson, cumulative_simpson
-from scipy.special import roots_hermite
+from scipy.special import roots_hermite, erf
 
-from .config import log, _DEFAULT_CHUNK_SIZE, _N_GH_QUAD_POINTS, _INTENSITY_CUTOFF
+from .config import log, _DEFAULT_CHUNK_SIZE, _N_GH_QUAD_POINTS, _INTENSITY_CUTOFF, _DEFAULT_NUM_THREADS
 
 # Constants with units:
+ac_h_on_8_c = ac.h.cgs / (8 * ac.c.cgs)
+
 ac_h_c_on_kB = ac.h * ac.c.cgs / ac.k_B
 ac_2_hc = 2 * ac.h * ac.c.cgs
 
@@ -41,6 +43,8 @@ ac_2_h_on_c_sq = 2 * ac.h / ac.c ** 2
 ac_h_on_kB = ac.h / ac.k_B
 
 # Dimensionless version for numba
+const_amu = ac.u.cgs.value
+const_h_on_8_c = ac_h_on_8_c.value
 const_h_c_on_kB = ac_h_c_on_kB.value
 const_2_hc = ac_2_hc.value
 const_4_pi_c = ac_4_pi_c.value
@@ -64,6 +68,77 @@ const_2_pi_c_kB = (2 * np.pi * ac.c.cgs * ac.k_B.cgs).value
 #  cutoffs during computation and not because the state has no deexcitation pathways.
 
 
+def create_erf_lut(
+        n_points: int = 20000, arg_max: float = 6.0
+) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """
+    Create lookup table for erf() for samlpling by :func:`tiramisu.nlte.get_erf_lut`
+    Only stores [0, arg_max] due to symmetry.
+
+    Parameters
+    ----------
+    n_points: int
+        Number of linearly spaced points up to arg_max.
+    arg_max: float
+        Maximum argument value for erf().
+    Returns
+    -------
+        Values of erf() at n_points linearly spaced points up to arg_max.
+    """
+    args = np.linspace(0, arg_max, n_points, dtype=np.float64)
+    erf_values = erf(args)
+    return args, erf_values
+
+
+# --------------- ERF LOOKUP TABLE ---------------
+global_erf_arg_max = 6.0
+_, global_erf_lut = create_erf_lut(n_points=20000, arg_max=global_erf_arg_max)
+
+
+# ------------------------------------------------
+
+
+@numba.njit(cache=True, error_model="numpy", inline="always")
+def get_erf_lut(erf_arg: float, erf_lut: npt.NDArray[np.float64], erf_arg_max: float) -> float:
+    """
+    Fast erf lookup with linear interpolation between points. Uses symmetry; erf(-x) = -erf(x).
+
+    Parameters
+    ----------
+    erf_arg: float
+        Argument to look up erf() result for.
+    erf_lut: ndarray
+        Lookup table to search.
+    erf_arg_max: float
+        Maximum erf() argument value associated with the lookup table
+
+    Returns
+    -------
+        Value of erf() at given argument, linearly interpolated between lookup table points.
+    """
+    n_points = erf_lut.shape[0]
+
+    sign = 1.0 if erf_arg >= 0 else -1.0
+    abs_arg = abs(erf_arg)
+
+    # Saturation for large arguments.
+    if abs_arg >= erf_arg_max:
+        return sign * 1.0
+
+    # Map to index; linear interpolation.
+    float_idx = (abs_arg / erf_arg_max) * (n_points - 1)
+    idx = int(float_idx)
+    frac = float_idx - idx
+
+    # Bounds check for safety.
+    if idx >= n_points - 1:
+        return sign * erf_lut[n_points - 1]
+
+    # Linear interpolation.
+    val = erf_lut[idx] * (1.0 - frac) + erf_lut[idx + 1] * frac
+    return sign * val
+
+
 def _sum_profiles(group: pl.DataFrame) -> pl.DataFrame:
     summed_profiles = np.stack(group["profile"].to_numpy(), axis=0).sum(axis=0)
     return pl.DataFrame({
@@ -82,7 +157,7 @@ def _build_xsec(
         pop_matrix: npt.NDArray[np.float64],
         wn_grid_len: int,
         is_abs: bool,
-):
+) -> npt.NDArray[np.float64]:
     """
     For use only by :class:`tiramisu.nlte.CompactProfile` instances.
 
@@ -393,217 +468,56 @@ class ContinuumProfileStore:
         return abs_profile
 
 
-# class BandProfile:
-#     __slots__ = ("start_idx", "profile", "integral")
-#
-#     def __init__(self, profile: npt.NDArray[np.float64], start_idx: int = None, trim: bool = True) -> None:
-#         """
-#
-#         :param start_idx: Index on the spectroscopic grid where the trimmed band profile begins.
-#         :param profile:   The band profile of the transition.
-#         integral:         The integral of the absorption profile pre-normalisation.
-#         """
-#         self.integral = 0.0
-#         if not trim:
-#             self.start_idx = 0
-#             self.profile = profile
-#         elif start_idx is None:
-#             if np.all(profile < _INTENSITY_CUTOFF):
-#                 log.warning(f"All of something is below the cutoff! len={len(self.profile)}")
-#                 self.start_idx = 0
-#                 self.profile = np.empty(0)
-#             else:
-#                 self.start_idx = np.argmax(profile >= _INTENSITY_CUTOFF)
-#                 end_idx = len(profile) - np.argmax(profile[::-1] >= _INTENSITY_CUTOFF)
-#                 self.profile = profile[self.start_idx: end_idx]
-#         else:
-#             self.start_idx = start_idx
-#             self.profile = profile
-#
-#     def __repr__(self):
-#         return f"BandProfile([{self.start_idx}, {self.profile}, {self.integral}])"
-#
-#     def __str__(self):
-#         return (
-#             f"BandProfile(start_idx: {self.start_idx}, profile: "
-#             f"{self.profile}"
-#             f"({self.profile.size} points),"
-#             f" integral: {self.integral},"
-#             ")"
-#         )
-#
-#     def merge_band_profiles(
-#             self, band_profiles: t.List["BandProfile"], normalise: bool = False, spectral_grid: u.Quantity = None
-#     ) -> None:
-#         # TODO: Handle case where some band_profiles are empty?
-#         if len(band_profiles) > 0:
-#             start_idxs = np.concatenate(([self.start_idx], [band_profile.start_idx for band_profile in band_profiles]))
-#             profiles = [self.profile] + [band_profile.profile for band_profile in band_profiles]
-#
-#             min_start_idx = min(start_idxs)
-#             primary_idx = np.argmax(start_idxs == min_start_idx)
-#             max_end_idx = max(
-#                 np.concatenate(
-#                     (
-#                         [self.start_idx + len(self.profile)],
-#                         [band_profile.start_idx + len(band_profile.profile) for band_profile in band_profiles],
-#                     )
-#                 )
-#             )
-#             offset = max_end_idx - min_start_idx - len(profiles[primary_idx])
-#
-#             merged_profile = np.pad(profiles[primary_idx], (0, offset), "constant")
-#
-#             for profile_idx in range(len(start_idxs)):
-#                 if profile_idx != primary_idx:
-#                     profile_offset = start_idxs[profile_idx] - min_start_idx
-#                     merged_profile[profile_offset: profile_offset + len(profiles[profile_idx])] += profiles[
-#                         profile_idx
-#                     ]
-#
-#             self.start_idx = min_start_idx
-#             self.profile = merged_profile
-#         if normalise:
-#             if spectral_grid is None:
-#                 raise RuntimeError("Normalisation specified but no wn_grid provided for integration.")
-#             self.normalise_band_profile(spectral_grid=spectral_grid)
-#
-#     def normalise_band_profile(self, spectral_grid: u.Quantity) -> None:
-#         if self.profile.size == 0:
-#             pass
-#         else:
-#             if len(self.profile) == 1 and sum(self.profile) != 0:
-#                 self.integral = self.profile.sum()
-#             else:
-#                 self.integral = simpson(
-#                     self.profile,
-#                     x=spectral_grid[self.start_idx: self.start_idx + len(self.profile)].value,
-#                 )
-#             if self.integral == 0:
-#                 raise RuntimeError("Abs factor is 0 - Why?")
-#             self.profile /= self.integral
-#
-#
-# class BandProfileCollection(dict):
-#     def __init__(self, band_profiles: npt.NDArray[BandProfile] | t.List[BandProfile] | pd.Series):
-#         if type(band_profiles) is pd.Series:
-#             for row_key, row in band_profiles.items():
-#                 if row.profile.size > 0:
-#                     if row_key in self:
-#                         self[row_key].merge_band_profiles(row)
-#                     else:
-#                         self[row_key] = row
-#                 else:
-#                     log.info(f"BandProfile for key={row_key} is empty.")
-#         # elif type(band_profiles) in (npt.NDArray[BandProfile], t.List[BandProfile]):
-#         #     keys = [(band_profile.id_u, band_profile.id_l) for band_profile in band_profiles]
-#         #     unique_keys = set(keys)
-#         #     for unique_key in unique_keys:
-#         #         key_idxs = [key_idx for key_idx, key in enumerate(keys) if key == unique_key]
-#         #         key_profiles = band_profiles[key_idxs]
-#         #         self[unique_key] = key_profiles[0]
-#         #         if len(key_profiles) > 1:
-#         #             self[unique_key].merge_band_profiles(band_profiles=key_profiles[1:])
-#         else:
-#             raise RuntimeError(
-#                 "BandProfileCollection construction only implemented for list, np.array or pd.Series."
-#                 f"Received {type(band_profiles)}."
-#             )
-#         super().__init__()
-#
-#     def __getitem__(self, key: t.Tuple[int, int] | int) -> BandProfile:
-#         return super().__getitem__(key)
-#
-#     def get(self, key: t.Tuple[int, int] | int, default: t.Optional[t.Any] = None) -> BandProfile:
-#         return super().get(key)
-#
-#     def __setitem__(self, key: t.Tuple[int, int] | int, value: BandProfile) -> None:
-#         return super().__setitem__(key, value)
-#
-#     def __contains__(self, key: t.Tuple[int, int] | int) -> bool:
-#         return super().__contains__(key)
-#
-#     def __delitem__(self, key: t.Tuple[int, int] | int) -> None:
-#         return super().__delitem__(key)
-#
-#     def merge_collections(
-#             self,
-#             band_profile_collections: t.List["BandProfileCollection"] | npt.NDArray["BandProfileCollection"],
-#             normalise: bool = False,
-#             spectral_grid: u.Quantity = None,
-#     ) -> None:
-#         keys = [band_profile_collection.keys() for band_profile_collection in band_profile_collections]
-#         keys = [key for sublist in keys for key in sublist]
-#         unique_keys = set(keys)
-#         for unique_key in unique_keys:
-#             key_profiles = [
-#                 band_profile_collection.get(unique_key) for band_profile_collection in band_profile_collections
-#             ]
-#             key_profiles = [profile for profile in key_profiles if profile is not None]
-#             if unique_key in self:
-#                 self[unique_key].merge_band_profiles(
-#                     band_profiles=key_profiles, normalise=normalise, spectral_grid=spectral_grid
-#                 )
-#             else:
-#                 self[unique_key] = key_profiles[0]
-#                 if len(key_profiles) > 1:
-#                     self[unique_key].merge_band_profiles(
-#                         band_profiles=key_profiles[1:], normalise=normalise, spectral_grid=spectral_grid
-#                     )
-#                 else:
-#                     self[unique_key].normalise_band_profile(spectral_grid=spectral_grid)
-#
-#     def normalise(self, spectral_grid: u.Quantity, sanitise: bool = True) -> None:
-#         for key in list(self.keys()):
-#             self[key].normalise_band_profile(spectral_grid=spectral_grid)
-#             if sanitise and self[key].profile.size == 0:
-#                 del self[key]
-#
-#     def add_no_trim(self, key: t.Tuple[int, int] | int, profile: npt.NDArray[np.float64]):
-#         self[key] = BandProfile(profile=profile, trim=False)
-
-
 def calc_cont_band_profile(
         wn_grid: npt.NDArray[np.float64],
+        temperature: float,
+        species_mass: float,
+        box_length: float,
         group: pl.DataFrame,
 ) -> pl.DataFrame:
-    a_ci = np.ascontiguousarray(group["A_ci"].to_numpy())
+    a_fi = np.ascontiguousarray(group["A_fi"].to_numpy())
     g_i = np.ascontiguousarray(group["g_i"].to_numpy())
-    g_c = np.ascontiguousarray(group["g_c"].to_numpy())
-    energy_ci = np.ascontiguousarray(group["energy_ci"].to_numpy())
+    g_f = np.ascontiguousarray(group["g_f"].to_numpy())
+    energy_fi = np.ascontiguousarray(group["energy_fi"].to_numpy())
     n_frac_i = np.ascontiguousarray(group["n_frac_i"].to_numpy())
-    n_frac_c = np.ascontiguousarray(group["n_frac_c"].to_numpy())
-    cont_broad = np.ascontiguousarray(group["broad"].to_numpy())
+    n_frac_f = np.ascontiguousarray(group["n_frac_f"].to_numpy())
+    v_f = np.ascontiguousarray(group["v_f"].to_numpy())
 
-    assert a_ci.shape[0] == g_i.shape[0] == g_c.shape[0] == energy_ci.shape[0] == n_frac_i.shape[0] == n_frac_c.shape[0]
+    assert a_fi.shape[0] == g_i.shape[0] == g_f.shape[0] == energy_fi.shape[0] == n_frac_i.shape[0] == n_frac_f.shape[0]
 
-    if energy_ci.min() > wn_grid.max() or energy_ci.max() < wn_grid.min():
+    if energy_fi.min() > wn_grid.max() or energy_fi.max() < wn_grid.min():
         raise RuntimeError("Computing band profile for band with no transitions on grid: check workflow logic.")
 
     is_fixed_width = np.all(np.isclose(np.diff(wn_grid), np.abs(wn_grid[1] - wn_grid[0]), atol=0))
 
     if is_fixed_width:
-        _abs_xsec = _continuum_band_profile_fixed_width(
+        _abs_xsec = _continuum_binned_gauss_fixed_width(
             wn_grid=wn_grid,
-            n_frac_f=n_frac_c,
-            n_frac_i=n_frac_i,
-            a_fi=a_ci,
-            g_f=g_c,
+            n_f=n_frac_f,
+            n_i=n_frac_i,
+            a_fi=a_fi,
+            g_f=g_f,
             g_i=g_i,
-            energy_fi=energy_ci,
-            cont_broad=cont_broad,
+            energy_fi=energy_fi,
+            v_f=v_f,
+            temperature=temperature,
+            species_mass=species_mass,
+            box_length=box_length,
             half_bin_width=np.abs(wn_grid[1] - wn_grid[0]) / 2.0,
         )
     else:
-        _abs_xsec = _continuum_band_profile_variable_width(
+        _abs_xsec = _continuum_binned_gauss_variable_width(
             wn_grid=wn_grid,
-            n_frac_f=n_frac_c,
-            n_frac_i=n_frac_i,
-            a_fi=a_ci,
-            g_f=g_c,
+            n_f=n_frac_f,
+            n_i=n_frac_i,
+            a_fi=a_fi,
+            g_f=g_f,
             g_i=g_i,
-            energy_fi=energy_ci,
-            cont_broad=cont_broad,
+            energy_fi=energy_fi,
+            v_f=v_f,
+            temperature=temperature,
+            species_mass=species_mass,
+            box_length=box_length,
         )
     return pl.DataFrame({
         "id_agg_i": [group["id_agg_i"][0]],
@@ -641,7 +555,7 @@ def calc_band_profile(
     gh_roots, gh_weights = roots_hermite(_N_GH_QUAD_POINTS)
 
     if is_fixed_width:
-        _abs_xsec, _spe_xsec = _band_profile_binned_voigt_fixed_width(
+        _abs_xsec, _ste_xsec, _spe_xsec = _band_profile_binned_voigt_fixed_width(
             wn_grid=wn_grid,
             n_i=n_frac_i,
             n_f=n_frac_f,
@@ -686,368 +600,164 @@ def calc_band_profile(
     })
 
 
-# def calc_band_profile_old(
+# @numba.njit(parallel=True, cache=True, error_model="numpy")
+# def _continuum_band_profile_variable_width(
 #         wn_grid: npt.NDArray[np.float64],
+#         n_frac_f: npt.NDArray[np.float64],
 #         n_frac_i: npt.NDArray[np.float64],
 #         a_fi: npt.NDArray[np.float64],
 #         g_f: npt.NDArray[np.float64],
 #         g_i: npt.NDArray[np.float64],
 #         energy_fi: npt.NDArray[np.float64],
+#         cont_broad: npt.NDArray[np.float64],
+# ) -> npt.NDArray[np.float64]:
+#     assert n_frac_f.shape[0] == n_frac_i.shape[0] == a_fi.shape[0] == g_f.shape[0] == g_i.shape[0] == energy_fi.shape[
+#         0] == \
+#            cont_broad.shape[0]
+#     sqrtln2 = math.sqrt(math.log(2))
+#     num_grid = wn_grid.shape[0]
+#     _abs_xsec = np.zeros(num_grid, dtype=np.float64)
+#     num_trans = energy_fi.shape[0]
+#     # cutoff = 1500
+#     min_cutoff = 25.0
+#     max_cutoff = 3000.0
+#     cutoff_fwhm_multiple = 5.0
+#
+#     # bin_widths = np.zeros(num_grid + 1)
+#     # bin_widths[1:-1] = (wn_grid[:-1] + wn_grid[1:]) / 2.0 - wn_grid[:-1]
+#     bin_edges = np.empty(num_grid + 1, dtype=np.float64)
+#     bin_edges[0] = wn_grid[0] - (wn_grid[1] - wn_grid[0]) * 0.5
+#     for j in range(1, num_grid):
+#         bin_edges[j] = (wn_grid[j - 1] + wn_grid[j]) * 0.5
+#     bin_edges[-1] = wn_grid[-1] + (wn_grid[-1] - wn_grid[-2]) * 0.5
+#
+#     bin_widths_lower = wn_grid - bin_edges[:-1]
+#     bin_widths_upper = bin_edges[1:] - wn_grid
+#     inv_bin_widths = 1.0 / (bin_widths_lower + bin_widths_upper)
+#
+#     abs_coef = a_fi * ((n_frac_i * g_f / g_i) - n_frac_f) / (const_16_pi_c * energy_fi * energy_fi)
+#     sqrtln2_on_alpha = sqrtln2 / cont_broad
+#
+#     for i in numba.prange(num_trans):
+#         energy_fi_i = energy_fi[i]
+#         abs_coef_i = abs_coef[i]
+#         sqrtln2_on_alpha_i = sqrtln2_on_alpha[i]
+#         cont_broad_i = cont_broad[i]
+#         cutoff_i = cont_broad_i * cutoff_fwhm_multiple
+#         cutoff_i = max(min_cutoff, min(cutoff_i, max_cutoff))
+#
+#         transition_min = energy_fi_i - cutoff_i
+#         transition_max = energy_fi_i + cutoff_i
+#
+#         j_start = binary_search_right(bin_edges, transition_min) - 1
+#         j_start = max(0, j_start)
+#         j_end = binary_search_left(bin_edges, transition_max, start=j_start)
+#         j_end = min(num_grid, j_end)
+#
+#         for j in range(j_start, j_end):
+#             wn_shift = wn_grid[j] - energy_fi_i
+#             # upper_width = bin_widths[j + 1]
+#             # lower_width = bin_widths[j]
+#             upper_width = bin_widths_upper[j]
+#             lower_width = bin_widths_lower[j]
+#             # if min(abs(wn_shift - lower_width), abs(wn_shift + upper_width)) <= cutoff:
+#             _abs_xsec[j] += (
+#                     abs_coef_i
+#                     * (
+#                             math.erf(sqrtln2_on_alpha_i * (wn_shift + upper_width))
+#                             - math.erf(sqrtln2_on_alpha_i * (wn_shift - lower_width))
+#                     ) * inv_bin_widths[j]
+#             )
+#     return _abs_xsec
+
+
+# @numba.njit(parallel=True, cache=True, error_model="numpy")
+# def _continuum_band_profile_fixed_width(
+#         wn_grid: npt.NDArray[np.float64],
+#         n_frac_f: npt.NDArray[np.float64],
+#         n_frac_i: npt.NDArray[np.float64],
+#         a_fi: npt.NDArray[np.float64],
+#         g_f: npt.NDArray[np.float64],
+#         g_i: npt.NDArray[np.float64],
+#         energy_fi: npt.NDArray[np.float64],
+#         v_f: npt.NDArray[np.float64],
 #         temperature: float,
 #         species_mass: float,
-#         n_frac_f: npt.NDArray[np.float64] = None,
-#         lifetimes: npt.NDArray[np.float64] = None,
-#         pressure: float = None,
-#         broad_n: npt.NDArray[np.float64] = None,
-#         broad_gamma: npt.NDArray[np.float64] = None,
-#         cont_broad: npt.NDArray[np.float64] = None,
-#         n_gh_quad_points: int = _N_GH_QUAD_POINTS,
-# ) -> BandProfile | pd.Series:
-#     """
-#     Compute the integrated BandProfiles for a set of transitions between the same upper and lower aggregated states.
-#     The absorption profiles are only for the f<-i upward transitions, and the emission profiles are for downward f->i
-#     spontaneous emission. Stimulated Emission profiles can be reconstructed from the spontaneous emission profiles.
+#         box_length: float,
+#         # cont_broad: npt.NDArray[np.float64],
+#         erf_lut: npt.NDArray[np.float64],
+#         erf_arg_max: float,
+#         half_bin_width: float,
+#         numba_num_threads: int = _DEFAULT_NUM_THREADS,
+# ) -> npt.NDArray[np.float64]:
+#     assert (n_frac_f.shape[0] == n_frac_i.shape[0] == a_fi.shape[0] == g_f.shape[0] == g_i.shape[0] ==
+#             energy_fi.shape[0] == v_f.shape[0])
+#     twice_bin_width = 4.0 * half_bin_width
+#     sqrtln2 = math.sqrt(math.log(2))
 #
-#     :param wn_grid:          Spectral grid in wavenumbers.
-#     :param n_frac_i:         Populations of the lower states as a fraction of the total aggregated lower states.
-#     :param a_fi:             Einstein A coefficients.
-#     :param g_f:              Upper state degeneracies.
-#     :param g_i:              Lower state degeneracies.
-#     :param energy_fi:        Transition energies in wavenumbers.
-#     :param temperature:      Temperature of the atmospheric layer.
-#     :param species_mass:     Mass of the species in Daltons.
-#     :param n_frac_f:         Populations of the upper states as a fraction of the total aggregated upper states.
-#     :param lifetimes:        Lower state lifetimes.
-#     :param pressure:         Pressure of atmospheric layer.
-#     :param broad_n:          Pressure broadening exponent.
-#     :param broad_gamma:      Pressure broadening Lorentzian half-width half-maximum, gamma.
-#     :param cont_broad:       Continuum broadening half-width half-maximum.
-#     :param n_gh_quad_points: Number of Gauss-Hermite quadrature points.
+#     num_grid = wn_grid.shape[0]
+#     num_trans = energy_fi.shape[0]
 #
-#     :return: For continuum transitions, a BandProfile object is returned. For bound-bound transitions, returns a
-#         pandas.Series object containing two BandProfile objects for the absorption and emission profiles respectively.
-#     """
-#     if energy_fi.min() > wn_grid.max() or energy_fi.max() < wn_grid.min():
-#         raise RuntimeError("Computing band profile for band with no transitions on grid: check workflow logic.")
-#     else:
-#         # Handle transitions outside wn range by calculating their corresponding coefficients to scale normalisation.
-#         # trans_outside_logic = (energy_fi < wn_grid.min()) | (energy_fi > wn_grid.max())
-#         # trans_inside_logic = (energy_fi >= wn_grid.min()) & (energy_fi <= wn_grid.max())
+#     min_cutoff = 25.0
+#     max_cutoff = 3000.0
+#     cutoff_fwhm_multiple = 5.0
 #
-#         is_fixed_width = np.all(np.isclose(np.diff(wn_grid), np.abs(wn_grid[1] - wn_grid[0]), atol=0))
-#         if cont_broad is None:
-#             if broad_n is None or broad_gamma is None:
-#                 if is_fixed_width:
-#                     # _abs_xsec, _emi_xsec = _abs_emi_binned_doppler_fixed_width(
-#                     #     wn_grid=wn_grid,
-#                     #     n_i=n_frac_i,
-#                     #     n_f=n_frac_f,
-#                     #     a_fi=a_fi,
-#                     #     g_f=g_f,
-#                     #     g_i=g_i,
-#                     #     energy_fi=energy_fi,
-#                     #     temperature=temperature,
-#                     #     species_mass=species_mass,
-#                     #     half_bin_width=np.abs(wn_grid[1] - wn_grid[0]) / 2.0,
-#                     # )
-#                     _abs_xsec, _emi_xsec = _band_profile_binned_doppler_fixed_width(
-#                         wn_grid=wn_grid,
-#                         n_i=n_frac_i,
-#                         n_f=n_frac_f,
-#                         a_fi=a_fi,
-#                         g_f=g_f,
-#                         g_i=g_i,
-#                         energy_fi=energy_fi,
-#                         temperature=temperature,
-#                         species_mass=species_mass,
-#                         half_bin_width=np.abs(wn_grid[1] - wn_grid[0]) / 2.0,
-#                     )
-#                 else:
-#                     # _abs_xsec, _emi_xsec = _abs_emi_binned_doppler_variable_width(
-#                     #     wn_grid=wn_grid,
-#                     #     n_i=n_frac_i,
-#                     #     n_f=n_frac_f,
-#                     #     a_fi=a_fi,
-#                     #     g_f=g_f,
-#                     #     g_i=g_i,
-#                     #     energy_fi=energy_fi,
-#                     #     temperature=temperature,
-#                     #     species_mass=species_mass,
-#                     # )
-#                     _abs_xsec, _emi_xsec = _band_profile_binned_doppler_variable_width(
-#                         wn_grid=wn_grid,
-#                         n_i=n_frac_i,
-#                         n_f=n_frac_f,
-#                         a_fi=a_fi,
-#                         g_f=g_f,
-#                         g_i=g_i,
-#                         energy_fi=energy_fi,
-#                         temperature=temperature,
-#                         species_mass=species_mass,
-#                     )
-#             else:
-#                 if n_frac_f is None or lifetimes is None or pressure is None or broad_n is None or broad_gamma is None:
-#                     raise RuntimeError("Missing inputs for calc_band_profile when computing Voigt profiles.")
-#                 gh_roots, gh_weights = roots_hermite(n_gh_quad_points)
-#                 if is_fixed_width:
-#                     # _abs_xsec, _emi_xsec = _abs_emi_binned_voigt_fixed_width(
-#                     #     wn_grid=wn_grid,
-#                     #     n_i=n_frac_i,
-#                     #     n_f=n_frac_f,
-#                     #     a_fi=a_fi,
-#                     #     g_f=g_f,
-#                     #     g_i=g_i,
-#                     #     energy_fi=energy_fi,
-#                     #     lifetimes=lifetimes,
-#                     #     temperature=temperature,
-#                     #     pressure=pressure,
-#                     #     broad_n=broad_n,
-#                     #     broad_gamma=broad_gamma,
-#                     #     species_mass=species_mass,
-#                     #     half_bin_width=np.abs(wn_grid[1] - wn_grid[0]) / 2.0,
-#                     #     gh_roots=gh_roots,
-#                     #     gh_weights=gh_weights,
-#                     # )
-#                     _abs_xsec, _emi_xsec = _band_profile_binned_voigt_fixed_width(
-#                         wn_grid=wn_grid,
-#                         n_i=n_frac_i,
-#                         n_f=n_frac_f,
-#                         a_fi=a_fi,
-#                         g_f=g_f,
-#                         g_i=g_i,
-#                         energy_fi=energy_fi,
-#                         lifetimes=lifetimes,
-#                         temperature=temperature,
-#                         pressure=pressure,
-#                         broad_n=broad_n,
-#                         broad_gamma=broad_gamma,
-#                         species_mass=species_mass,
-#                         half_bin_width=np.abs(wn_grid[1] - wn_grid[0]) / 2.0,
-#                         gh_roots=gh_roots,
-#                         gh_weights=gh_weights,
-#                     )
-#                 else:
-#                     # _abs_xsec, _emi_xsec = _abs_emi_binned_voigt_variable_width(
-#                     #     wn_grid=wn_grid,
-#                     #     n_i=n_frac_i,
-#                     #     n_f=n_frac_f,
-#                     #     a_fi=a_fi,
-#                     #     g_f=g_f,
-#                     #     g_i=g_i,
-#                     #     energy_fi=energy_fi,
-#                     #     lifetimes=lifetimes,
-#                     #     temperature=temperature,
-#                     #     pressure=pressure,
-#                     #     broad_n=broad_n,
-#                     #     broad_gamma=broad_gamma,
-#                     #     species_mass=species_mass,
-#                     #     gh_roots=gh_roots,
-#                     #     gh_weights=gh_weights,
-#                     # )
-#                     _abs_xsec, _emi_xsec = _band_profile_binned_voigt_variable_width(
-#                         wn_grid=wn_grid,
-#                         n_i=n_frac_i,
-#                         n_f=n_frac_f,
-#                         a_fi=a_fi,
-#                         g_f=g_f,
-#                         g_i=g_i,
-#                         energy_fi=energy_fi,
-#                         lifetimes=lifetimes,
-#                         temperature=temperature,
-#                         pressure=pressure,
-#                         broad_n=broad_n,
-#                         broad_gamma=broad_gamma,
-#                         species_mass=species_mass,
-#                         gh_roots=gh_roots,
-#                         gh_weights=gh_weights,
-#                     )
-#             return pd.Series([BandProfile(profile=_abs_xsec), BandProfile(profile=_emi_xsec)], index=["abs", "emi"])
-#         else:
-#             # abs_coef_outside = _sum_abs_coefs(
-#             #     n_i=n_frac_i[trans_outside_logic],
-#             #     a_fi=a_fi[trans_outside_logic],
-#             #     g_f=g_f[trans_outside_logic],
-#             #     g_i=g_i[trans_outside_logic],
-#             #     energy_fi=energy_fi[trans_outside_logic],
-#             #     temperature=temperature,
+#     bin_edges = np.empty(num_grid + 1, dtype=np.float64)
+#     bin_edges[0] = wn_grid[0] - (wn_grid[1] - wn_grid[0]) * 0.5
+#     for j in range(1, num_grid):
+#         bin_edges[j] = (wn_grid[j - 1] + wn_grid[j]) * 0.5
+#     bin_edges[-1] = wn_grid[-1] + (wn_grid[-1] - wn_grid[-2]) * 0.5
+#
+#     abs_coef = a_fi * ((n_frac_i * g_f / g_i) - n_frac_f) / (const_8_pi_c * twice_bin_width * energy_fi * energy_fi)
+#
+#     alpha_doppler = energy_fi * const_sqrt_2_NA_kB_log2_on_c * np.sqrt(temperature / species_mass)
+#     alpha_box = const_h_on_8_c * (2 * v_f + 1) / (species_mass * const_amu * box_length * box_length)
+#     alpha_total = alpha_box + alpha_doppler
+#     sqrtln2_on_alpha = sqrtln2 / alpha_total
+#
+#     cutoff = np.clip(alpha_total * cutoff_fwhm_multiple, a_min=min_cutoff, a_max=max_cutoff)
+#
+#     xsec_buffer = np.zeros((numba_num_threads, num_grid), dtype=np.float64)
+#
+#     for i in numba.prange(num_trans):
+#         thread_id = numba.get_thread_id()
+#
+#         energy_fi_i = energy_fi[i]
+#         abs_coef_i = abs_coef[i]
+#         sqrtln2_on_alpha_i = sqrtln2_on_alpha[i]
+#         cutoff_i = cutoff[i]
+#
+#         transition_min = energy_fi_i - cutoff_i
+#         transition_max = energy_fi_i + cutoff_i
+#
+#         j_start = binary_search_right(bin_edges, transition_min) - 1
+#         j_start = max(0, j_start)
+#         j_end = binary_search_left(bin_edges, transition_max, start=j_start)
+#         j_end = min(num_grid, j_end)
+#
+#         for j in range(j_start, j_end):
+#             wn_shift = wn_grid[j] - energy_fi_i
+#
+#             erf_plus_arg = sqrtln2_on_alpha_i * (wn_shift + half_bin_width)
+#             erf_minus_arg = sqrtln2_on_alpha_i * (wn_shift - half_bin_width)
+#
+#             erf_plus = get_erf_lut(erf_plus_arg, erf_lut, erf_arg_max)
+#             erf_minus = get_erf_lut(erf_minus_arg, erf_lut, erf_arg_max)
+#
+#             xsec_buffer[thread_id, j] += abs_coef_i * (erf_plus - erf_minus)
+#
+#             # _abs_xsec[j] += abs_coef_i * (
+#             #         math.erf(sqrtln2_on_alpha_i * (wn_shift + half_bin_width))
+#             #         - math.erf(sqrtln2_on_alpha_i * (wn_shift - half_bin_width))
 #             # )
-#             if is_fixed_width:
-#                 _abs_xsec = _continuum_band_profile_fixed_width(
-#                     wn_grid=wn_grid,
-#                     n_frac_f=n_frac_f,
-#                     n_frac_i=n_frac_i,
-#                     a_fi=a_fi,
-#                     g_f=g_f,
-#                     g_i=g_i,
-#                     energy_fi=energy_fi,
-#                     temperature=temperature,
-#                     cont_broad=cont_broad,
-#                     half_bin_width=np.abs(wn_grid[1] - wn_grid[0]) / 2.0,
-#                 )
-#             else:
-#                 _abs_xsec = _continuum_band_profile_variable_width(
-#                     wn_grid=wn_grid,
-#                     n_frac_f=n_frac_f,
-#                     n_frac_i=n_frac_i,
-#                     a_fi=a_fi,
-#                     g_f=g_f,
-#                     g_i=g_i,
-#                     energy_fi=energy_fi,
-#                     temperature=temperature,
-#                     cont_broad=cont_broad,
-#                 )
-#             return BandProfile(profile=_abs_xsec)
-
-
-@numba.njit(parallel=True)
-def _continuum_band_profile_variable_width(
-        wn_grid: npt.NDArray[np.float64],
-        n_frac_f: npt.NDArray[np.float64],
-        n_frac_i: npt.NDArray[np.float64],
-        a_fi: npt.NDArray[np.float64],
-        g_f: npt.NDArray[np.float64],
-        g_i: npt.NDArray[np.float64],
-        energy_fi: npt.NDArray[np.float64],
-        cont_broad: npt.NDArray[np.float64],
-) -> npt.NDArray[np.float64]:
-    """
-    Note that the area of a Gaussian within 5 * HWHM is equal to erf(5*sqrt(ln(2))). The reciprocal of this can be used
-    to recover the total intensity, though this value is 99.99999960685046% percent. Hence, this should only affect the
-    9th decimal place, and Einstein A coefficients are only provided to 5 significant figures.
-
-    Parameters
-    ----------
-    wn_grid
-    n_frac_f
-    n_frac_i
-    a_fi
-    g_f
-    g_i
-    energy_fi
-    cont_broad
-
-    Returns
-    -------
-
-    """
-    assert n_frac_f.shape[0] == n_frac_i.shape[0] == a_fi.shape[0] == g_f.shape[0] == g_i.shape[0] == energy_fi.shape[
-        0] == \
-           cont_broad.shape[0]
-    sqrtln2 = math.sqrt(math.log(2))
-    num_grid = wn_grid.shape[0]
-    _abs_xsec = np.zeros(num_grid, dtype=np.float64)
-    num_trans = energy_fi.shape[0]
-    # cutoff = 1500
-    min_cutoff = 25.0
-    max_cutoff = 3000.0
-    cutoff_fwhm_multiple = 5.0
-
-    # bin_widths = np.zeros(num_grid + 1)
-    # bin_widths[1:-1] = (wn_grid[:-1] + wn_grid[1:]) / 2.0 - wn_grid[:-1]
-    bin_edges = np.empty(num_grid + 1, dtype=np.float64)
-    bin_edges[0] = wn_grid[0] - (wn_grid[1] - wn_grid[0]) * 0.5
-    for j in range(1, num_grid):
-        bin_edges[j] = (wn_grid[j - 1] + wn_grid[j]) * 0.5
-    bin_edges[-1] = wn_grid[-1] + (wn_grid[-1] - wn_grid[-2]) * 0.5
-
-    bin_widths_lower = wn_grid - bin_edges[:-1]
-    bin_widths_upper = bin_edges[1:] - wn_grid
-    inv_bin_widths = 1.0 / (bin_widths_lower + bin_widths_upper)
-
-    abs_coef = a_fi * ((n_frac_i * g_f / g_i) - n_frac_f) / (const_16_pi_c * energy_fi * energy_fi)
-    sqrtln2_on_alpha = sqrtln2 / cont_broad
-
-    for i in numba.prange(num_trans):
-        energy_fi_i = energy_fi[i]
-        abs_coef_i = abs_coef[i]
-        sqrtln2_on_alpha_i = sqrtln2_on_alpha[i]
-        cont_broad_i = cont_broad[i]
-        cutoff_i = cont_broad_i * cutoff_fwhm_multiple
-        cutoff_i = max(min_cutoff, min(cutoff_i, max_cutoff))
-
-        transition_min = energy_fi_i - cutoff_i
-        transition_max = energy_fi_i + cutoff_i
-
-        j_start = binary_search_right(bin_edges, transition_min) - 1
-        j_start = max(0, j_start)
-        j_end = binary_search_left(bin_edges, transition_max, start=j_start)
-        j_end = min(num_grid, j_end)
-
-        for j in range(j_start, j_end):
-            wn_shift = wn_grid[j] - energy_fi_i
-            # upper_width = bin_widths[j + 1]
-            # lower_width = bin_widths[j]
-            upper_width = bin_widths_upper[j]
-            lower_width = bin_widths_lower[j]
-            # if min(abs(wn_shift - lower_width), abs(wn_shift + upper_width)) <= cutoff:
-            _abs_xsec[j] += (
-                    abs_coef_i
-                    * (
-                            math.erf(sqrtln2_on_alpha_i * (wn_shift + upper_width))
-                            - math.erf(sqrtln2_on_alpha_i * (wn_shift - lower_width))
-                    ) * inv_bin_widths[j]
-            )
-    return _abs_xsec
-
-
-@numba.njit(parallel=True)
-def _continuum_band_profile_fixed_width(
-        wn_grid: npt.NDArray[np.float64],
-        n_frac_f: npt.NDArray[np.float64],
-        n_frac_i: npt.NDArray[np.float64],
-        a_fi: npt.NDArray[np.float64],
-        g_f: npt.NDArray[np.float64],
-        g_i: npt.NDArray[np.float64],
-        energy_fi: npt.NDArray[np.float64],
-        cont_broad: npt.NDArray[np.float64],
-        half_bin_width: float,
-) -> npt.NDArray[np.float64]:
-    assert n_frac_f.shape[0] == n_frac_i.shape[0] == a_fi.shape[0] == g_f.shape[0] == g_i.shape[0] == energy_fi.shape[
-        0] == \
-           cont_broad.shape[0]
-    twice_bin_width = 4.0 * half_bin_width
-    sqrtln2 = math.sqrt(math.log(2))
-    num_grid = wn_grid.shape[0]
-    _abs_xsec = np.zeros(num_grid, dtype=np.float64)
-    num_trans = energy_fi.shape[0]
-    # cutoff = 1500 + half_bin_width
-    min_cutoff = 25.0
-    max_cutoff = 3000.0
-    cutoff_fwhm_multiple = 5.0
-
-    bin_edges = np.empty(num_grid + 1, dtype=np.float64)
-    bin_edges[0] = wn_grid[0] - (wn_grid[1] - wn_grid[0]) * 0.5
-    for j in range(1, num_grid):
-        bin_edges[j] = (wn_grid[j - 1] + wn_grid[j]) * 0.5
-    bin_edges[-1] = wn_grid[-1] + (wn_grid[-1] - wn_grid[-2]) * 0.5
-
-    abs_coef = a_fi * ((n_frac_i * g_f / g_i) - n_frac_f) / (const_8_pi_c * twice_bin_width * energy_fi * energy_fi)
-    sqrtln2_on_alpha = sqrtln2 / cont_broad
-
-    for i in numba.prange(num_trans):
-        energy_fi_i = energy_fi[i]
-        abs_coef_i = abs_coef[i]
-        sqrtln2_on_alpha_i = sqrtln2_on_alpha[i]
-        cont_broad_i = cont_broad[i]
-        cutoff_i = cont_broad_i * cutoff_fwhm_multiple
-        cutoff_i = max(min_cutoff, min(cutoff_i, max_cutoff))
-
-        transition_min = energy_fi_i - cutoff_i
-        transition_max = energy_fi_i + cutoff_i
-
-        j_start = binary_search_right(bin_edges, transition_min) - 1
-        j_start = max(0, j_start)
-        j_end = binary_search_left(bin_edges, transition_max, start=j_start)
-        j_end = min(num_grid, j_end)
-
-        for j in range(j_start, j_end):
-            wn_shift = wn_grid[j] - energy_fi_i
-            # if np.abs(wn_shift) <= cutoff:
-            _abs_xsec[j] += abs_coef_i * (
-                    math.erf(sqrtln2_on_alpha_i * (wn_shift + half_bin_width))
-                    - math.erf(sqrtln2_on_alpha_i * (wn_shift - half_bin_width))
-            )
-    return _abs_xsec
+#     # Accumulate buffers.
+#     _abs_xsec = np.zeros(num_grid, dtype=np.float64)
+#     for k in numba.prange(num_grid):
+#         xsec_point = 0.0
+#         for t in range(numba_num_threads):
+#             xsec_point += xsec_buffer[t, k]
+#         _abs_xsec[k] = xsec_point
+#     return _abs_xsec
 
 
 def abs_emi_xsec(
@@ -1201,6 +911,9 @@ def continuum_xsec(
         continuum_trans_files: t.List[pathlib.Path],
         layer_idx: int,
         wn_grid: npt.NDArray[np.float64],
+        temperature: float,
+        species_mass: float,
+        cont_box_length: float,
 ) -> npt.NDArray[np.float64]:
     is_fixed_width = np.all(np.isclose(np.diff(wn_grid), np.abs(wn_grid[1] - wn_grid[0]), atol=0))
     cont_xsec = np.zeros(wn_grid.shape, dtype=np.float64)
@@ -1216,14 +929,15 @@ def continuum_xsec(
         pl.col(n_col).alias("n_nlte_i"),
         pl.col("g").alias("g_i"),
     )
-    pl_states_c = continuum_states.select(
+    pl_states_f = continuum_states.select(
         pl.col("id"),
-        pl.col("energy").alias("energy_c"),
-        pl.col(n_col).alias("n_nlte_c"),
-        pl.col("g").alias("g_c"),
+        pl.col("energy").alias("energy_f"),
+        pl.col(n_col).alias("n_nlte_f"),
+        pl.col("g").alias("g_f"),
+        pl.col("v").alias("v_f"),
     )
 
-    dask_dtypes = {"id_c": "int64", "id_i": "int64", "A_ci": "float64", "broad": "float64"}
+    dask_dtypes = {"id_f": "int64", "id_i": "int64", "A_fi": "float64"}
     dask_blocksize = "256MB"
 
     for trans_file in continuum_trans_files:
@@ -1232,8 +946,8 @@ def continuum_xsec(
             sep=r"\s+",
             engine="python",
             header=None,
-            names=["id_c", "id_i", "A_ci", "broad"],
-            usecols=[0, 1, 2, 3],
+            names=["id_f", "id_i", "A_fi"],
+            usecols=[0, 1, 2],
             dtype=dask_dtypes,
             blocksize=dask_blocksize,
         )
@@ -1241,52 +955,58 @@ def continuum_xsec(
         for delayed_batch in delayed_batches:
             trans_batch = pl.from_pandas(delayed_batch.compute())
             trans_batch = trans_batch.join(pl_states_i, left_on="id_i", right_on="id", how="left")
-            trans_batch = trans_batch.join(pl_states_c, left_on="id_c", right_on="id", how="left")
+            trans_batch = trans_batch.join(pl_states_f, left_on="id_f", right_on="id", how="left")
             trans_batch = trans_batch.with_columns(
-                (pl.col("energy_c") - pl.col("energy_i")).alias("energy_ci")
+                (pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi")
             )
             trans_batch = trans_batch.filter(
-                (pl.col("energy_c") >= wn_min)
+                (pl.col("energy_f") >= wn_min)
                 & (pl.col("energy_i") <= wn_max)
-                & (pl.col("energy_ci") >= wn_min)
-                & (pl.col("energy_ci") <= wn_max)
+                & (pl.col("energy_fi") >= wn_min)
+                & (pl.col("energy_fi") <= wn_max)
             )
-            final_cols = ["n_nlte_c", "n_nlte_i", "A_ci", "g_c", "g_i", "energy_ci", "broad"]
+            final_cols = ["n_nlte_f", "n_nlte_i", "A_fi", "g_f", "g_i", "energy_fi", "v_f"]
             trans_batch = trans_batch.select(final_cols)
             trans_chunk_np = trans_batch.to_numpy()
 
             # Matches final_cols ordering.
-            n_c = np.ascontiguousarray(trans_chunk_np[:, 0])
+            n_f = np.ascontiguousarray(trans_chunk_np[:, 0])
             n_i = np.ascontiguousarray(trans_chunk_np[:, 1])
-            a_ci = np.ascontiguousarray(trans_chunk_np[:, 2])
-            g_c = np.ascontiguousarray(trans_chunk_np[:, 3])
+            a_fi = np.ascontiguousarray(trans_chunk_np[:, 2])
+            g_f = np.ascontiguousarray(trans_chunk_np[:, 3])
             g_i = np.ascontiguousarray(trans_chunk_np[:, 4])
-            energy_ci = np.ascontiguousarray(trans_chunk_np[:, 5])
-            broad = np.ascontiguousarray(trans_chunk_np[:, 6])
+            energy_fi = np.ascontiguousarray(trans_chunk_np[:, 5])
+            v_f = np.ascontiguousarray(trans_chunk_np[:, 6])
 
             if is_fixed_width:
                 half_bin_width = abs(wn_grid[1] - wn_grid[0]) / 2.0
                 cont_xsec += _continuum_binned_gauss_fixed_width(
                     wn_grid=wn_grid,
-                    n_f=n_c,
+                    n_f=n_f,
                     n_i=n_i,
-                    a_fi=a_ci,
-                    g_f=g_c,
+                    a_fi=a_fi,
+                    g_f=g_f,
                     g_i=g_i,
-                    energy_fi=energy_ci,
-                    cont_broad=broad,
+                    energy_fi=energy_fi,
+                    v_f=v_f,
+                    temperature=temperature,
+                    species_mass=species_mass,
+                    box_length=cont_box_length,
                     half_bin_width=half_bin_width,
                 )
             else:
                 cont_xsec += _continuum_binned_gauss_variable_width(
                     wn_grid=wn_grid,
-                    n_f=n_c,
+                    n_f=n_f,
                     n_i=n_i,
-                    a_fi=a_ci,
-                    g_f=g_c,
+                    a_fi=a_fi,
+                    g_f=g_f,
                     g_i=g_i,
-                    energy_fi=energy_ci,
-                    cont_broad=broad,
+                    energy_fi=energy_fi,
+                    v_f=v_f,
+                    temperature=temperature,
+                    species_mass=species_mass,
+                    box_length=cont_box_length,
                 )
     return cont_xsec
 
@@ -1430,6 +1150,7 @@ def _band_profile_binned_voigt_variable_width(
         gh_weights: npt.NDArray[np.float64],
         t_ref: float = 296,
         pressure_ref: float = 1,
+        numba_num_threads: int = _DEFAULT_NUM_THREADS,
 ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
     assert n_i.shape[0] == n_f.shape[0] == a_fi.shape[0] == g_f.shape[0] == g_i.shape[0] == energy_fi.shape[0] == \
            lifetimes.shape[0]
@@ -1437,9 +1158,6 @@ def _band_profile_binned_voigt_variable_width(
     assert gh_roots.shape[0] == gh_weights.shape[0]
 
     num_grid = wn_grid.shape[0]
-    _abs_xsec = np.zeros(num_grid, dtype=np.float64)
-    _ste_xsec = np.zeros(num_grid, dtype=np.float64)
-    _spe_xsec = np.zeros(num_grid, dtype=np.float64)
     num_trans = energy_fi.shape[0]
     cutoff = 25
 
@@ -1466,14 +1184,21 @@ def _band_profile_binned_voigt_variable_width(
     grid_min = wn_grid[0]
     grid_max = wn_grid[-1]
 
+    abs_xsec_buffer = np.zeros((numba_num_threads, num_grid), dtype=np.float64)
+    ste_xsec_buffer = np.zeros((numba_num_threads, num_grid), dtype=np.float64)
+    spe_xsec_buffer = np.zeros((numba_num_threads, num_grid), dtype=np.float64)
+
     for i in numba.prange(num_trans):
+        thread_id = numba.get_thread_id()
+
         energy_fi_i = energy_fi[i]
         abs_coef_i = abs_coef[i]
         ste_coef_i = ste_coef[i]
         spe_coef_i = spe_coef[i]
         gamma_inv_i = gamma_inv[i]
+        sigma_i = sigma[i]
 
-        gh_roots_sigma = gh_roots * sigma[i]
+        gh_roots_sigma = gh_roots * sigma_i
         start_sigma = grid_min - gh_roots_sigma
         end_sigma = grid_max - gh_roots_sigma
         b_corr = np.pi / (
@@ -1491,21 +1216,39 @@ def _band_profile_binned_voigt_variable_width(
         j_end = min(num_grid, j_end)
 
         for j in range(j_start, j_end):
-            # wn_shift = wn_grid[j] - energy_fi[i]
-            upper_width = bin_widths_upper[j]
-            lower_width = bin_widths_lower[j]
-            # if -upper_width - cutoff <= wn_shift <= lower_width + cutoff:
-            shift_sigma = wn_grid[j] - energy_fi[i] - gh_roots_sigma
+            upper_width_j = bin_widths_upper[j]
+            lower_width_j = bin_widths_lower[j]
+            inv_bin_width_j = inv_bin_widths[j]
+            wn_j = wn_grid[j]
+
+            shift_sigma = wn_j - energy_fi_i - gh_roots_sigma
             bin_term = np.sum(
                 gh_weights_b_corr
                 * (
-                        np.arctan((shift_sigma + upper_width) * gamma_inv_i)
-                        - np.arctan((shift_sigma - lower_width) * gamma_inv_i)
+                        np.arctan((shift_sigma + upper_width_j) * gamma_inv_i)
+                        - np.arctan((shift_sigma - lower_width_j) * gamma_inv_i)
                 )
-            ) * inv_bin_widths[j]
-            _abs_xsec[j] += abs_coef_i * bin_term
-            _ste_xsec[j] += ste_coef_i * bin_term
-            _spe_xsec[j] += spe_coef_i * bin_term
+            ) * inv_bin_width_j
+
+            abs_xsec_buffer[thread_id, j] += abs_coef_i * bin_term
+            ste_xsec_buffer[thread_id, j] += ste_coef_i * bin_term
+            spe_xsec_buffer[thread_id, j] += spe_coef_i * bin_term
+    # Accumulate buffers.
+    _abs_xsec = np.zeros(num_grid, dtype=np.float64)
+    _ste_xsec = np.zeros(num_grid, dtype=np.float64)
+    _spe_xsec = np.zeros(num_grid, dtype=np.float64)
+    for k in numba.prange(num_grid):
+        abs_xsec_point = 0.0
+        ste_xsec_point = 0.0
+        spe_xsec_point = 0.0
+        for t in range(numba_num_threads):
+            abs_xsec_point += abs_xsec_buffer[t, k]
+            ste_xsec_point += ste_xsec_buffer[t, k]
+            spe_xsec_point += spe_xsec_buffer[t, k]
+        _abs_xsec[k] = abs_xsec_point
+        _ste_xsec[k] = ste_xsec_point
+        _spe_xsec[k] = spe_xsec_point
+
     return _abs_xsec, _ste_xsec, _spe_xsec
 
 
@@ -1529,7 +1272,8 @@ def _band_profile_binned_voigt_fixed_width(
         gh_weights: npt.NDArray[np.float64],
         t_ref: float = 296,
         pressure_ref: float = 1,
-) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+        numba_num_threads: int = _DEFAULT_NUM_THREADS,
+) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
     assert n_i.shape[0] == n_f.shape[0] == a_fi.shape[0] == g_f.shape[0] == g_i.shape[0] == energy_fi.shape[0] == \
            lifetimes.shape[0]
     assert broad_n.shape[0] == broad_gamma.shape[0]
@@ -1537,8 +1281,6 @@ def _band_profile_binned_voigt_fixed_width(
 
     bin_width = 2.0 * half_bin_width
     num_grid = wn_grid.shape[0]
-    _abs_xsec = np.zeros(num_grid, dtype=np.float64)
-    _emi_xsec = np.zeros(num_grid, dtype=np.float64)
     num_trans = energy_fi.shape[0]
     cutoff = 25 + half_bin_width
 
@@ -1549,7 +1291,9 @@ def _band_profile_binned_voigt_fixed_width(
     bin_edges[-1] = wn_grid[-1] + (wn_grid[-1] - wn_grid[-2]) * 0.5
 
     abs_coef = a_fi * (n_i * g_f / g_i) / (const_8_pi_five_halves_c * bin_width * energy_fi * energy_fi)
-    emi_coef = n_f * a_fi * energy_fi * const_h_c_on_4_pi_five_halves / bin_width
+    ste_coef = a_fi * n_f / (const_8_pi_five_halves_c * bin_width  * energy_fi * energy_fi)
+    spe_coef = n_f * a_fi * energy_fi * const_h_c_on_4_pi_five_halves / bin_width
+
     sigma = energy_fi * const_sqrt_NA_kB_on_c * np.sqrt(temperature / species_mass)
     gamma_pressure = np.sum(broad_gamma * pressure * (t_ref / temperature) ** broad_n / pressure_ref)
     gamma_lifetime = 1 / (const_4_pi_c * lifetimes)
@@ -1559,13 +1303,21 @@ def _band_profile_binned_voigt_fixed_width(
     grid_min = wn_grid[0]
     grid_max = wn_grid[-1]
 
+    abs_xsec_buffer = np.zeros((numba_num_threads, num_grid), dtype=np.float64)
+    ste_xsec_buffer = np.zeros((numba_num_threads, num_grid), dtype=np.float64)
+    spe_xsec_buffer = np.zeros((numba_num_threads, num_grid), dtype=np.float64)
+
     for i in numba.prange(num_trans):
+        thread_id = numba.get_thread_id()
+
         energy_fi_i = energy_fi[i]
         abs_coef_i = abs_coef[i]
-        emi_coef_i = emi_coef[i]
+        ste_coef_i = ste_coef[i]
+        spe_coef_i = spe_coef[i]
         gamma_inv_i = gamma_inv[i]
+        sigma_i = sigma[i]
 
-        gh_roots_sigma = gh_roots * sigma[i]
+        gh_roots_sigma = gh_roots * sigma_i
         start_sigma = grid_min - gh_roots_sigma
         end_sigma = grid_max - gh_roots_sigma
         b_corr = np.pi / (
@@ -1583,8 +1335,8 @@ def _band_profile_binned_voigt_fixed_width(
         j_end = min(num_grid, j_end)
 
         for j in range(j_start, j_end):
-            # wn_shift = wn_grid[j] - energy_fi[i]
-            # if np.abs(wn_shift) <= cutoff:
+            wn_j = wn_grid[j]
+
             shift_sigma = wn_grid[j] - energy_fi_i - gh_roots_sigma
             bin_term = np.sum(
                 gh_weights_b_corr
@@ -1593,9 +1345,25 @@ def _band_profile_binned_voigt_fixed_width(
                         - np.arctan((shift_sigma - half_bin_width) * gamma_inv_i)
                 )
             )
-            _abs_xsec[j] += abs_coef_i * bin_term
-            _emi_xsec[j] += emi_coef_i * bin_term
-    return _abs_xsec, _emi_xsec
+            abs_xsec_buffer[thread_id, j] += abs_coef_i * bin_term
+            ste_xsec_buffer[thread_id, j] += ste_coef_i * bin_term
+            spe_xsec_buffer[thread_id, j] += spe_coef_i * bin_term
+    # Accumulate buffers.
+    _abs_xsec = np.zeros(num_grid, dtype=np.float64)
+    _ste_xsec = np.zeros(num_grid, dtype=np.float64)
+    _spe_xsec = np.zeros(num_grid, dtype=np.float64)
+    for k in numba.prange(num_grid):
+        abs_xsec_point = 0.0
+        ste_xsec_point = 0.0
+        spe_xsec_point = 0.0
+        for t in range(numba_num_threads):
+            abs_xsec_point += abs_xsec_buffer[t, k]
+            ste_xsec_point += ste_xsec_buffer[t, k]
+            spe_xsec_point += spe_xsec_buffer[t, k]
+        _abs_xsec[k] = abs_xsec_point
+        _ste_xsec[k] = ste_xsec_point
+        _spe_xsec[k] = spe_xsec_point
+    return _abs_xsec, _ste_xsec, _spe_xsec
 
 
 # ABSORPTION/EMISSION CROSS SECTION CALCULATIONS:
@@ -1710,6 +1478,7 @@ def _abs_emi_binned_voigt_variable_width(
         gh_weights: npt.NDArray[np.float64],
         t_ref: float = 296,
         pressure_ref: float = 1,
+        numba_num_threads: int = _DEFAULT_NUM_THREADS,
 ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
     assert n_i.shape[0] == n_f.shape[0] == a_fi.shape[0] == g_f.shape[0] == g_i.shape[0] == energy_fi.shape[0] == \
            lifetimes.shape[0]
@@ -1717,8 +1486,6 @@ def _abs_emi_binned_voigt_variable_width(
     assert gh_roots.shape[0] == gh_weights.shape[0]
 
     num_grid = wn_grid.shape[0]
-    _abs_xsec = np.zeros(num_grid, dtype=np.float64)
-    _emi_xsec = np.zeros(num_grid, dtype=np.float64)
     num_trans = energy_fi.shape[0]
     cutoff = 25
 
@@ -1743,13 +1510,19 @@ def _abs_emi_binned_voigt_variable_width(
     grid_min = wn_grid[0]
     grid_max = wn_grid[-1]
 
+    abs_xsec_buffer = np.zeros((numba_num_threads, num_grid), dtype=np.float64)
+    emi_xsec_buffer = np.zeros((numba_num_threads, num_grid), dtype=np.float64)
+
     for i in numba.prange(num_trans):
+        thread_id = numba.get_thread_id()
+
         energy_fi_i = energy_fi[i]
         abs_coef_i = abs_coef[i]
         emi_coef_i = emi_coef[i]
         gamma_inv_i = gamma_inv[i]
+        sigma_i = sigma[i]
 
-        gh_roots_sigma = gh_roots * sigma[i]
+        gh_roots_sigma = gh_roots * sigma_i
         start_sigma = grid_min - gh_roots_sigma
         end_sigma = grid_max - gh_roots_sigma
         b_corr = np.pi / (
@@ -1767,20 +1540,34 @@ def _abs_emi_binned_voigt_variable_width(
         j_end = min(num_grid, j_end)
 
         for j in range(j_start, j_end):
-            # wn_shift = wn_grid[j] - energy_fi[i]
-            upper_width = bin_widths_upper[j]
-            lower_width = bin_widths_lower[j]
-            # if -upper_width - cutoff <= wn_shift <= lower_width + cutoff:
-            shift_sigma = wn_grid[j] - energy_fi[i] - gh_roots_sigma
+            upper_width_j = bin_widths_upper[j]
+            lower_width_j = bin_widths_lower[j]
+            inv_bin_width_j = inv_bin_widths[j]
+            wn_j = wn_grid[j]
+
+            shift_sigma = wn_j - energy_fi_i - gh_roots_sigma
             bin_term = np.sum(
                 gh_weights_b_corr
                 * (
-                        np.arctan((shift_sigma + upper_width) * gamma_inv_i)
-                        - np.arctan((shift_sigma - lower_width) * gamma_inv_i)
+                        np.arctan((shift_sigma + upper_width_j) * gamma_inv_i)
+                        - np.arctan((shift_sigma - lower_width_j) * gamma_inv_i)
                 )
-            ) * inv_bin_widths[j]
-            _abs_xsec[j] += abs_coef_i * bin_term
-            _emi_xsec[j] += emi_coef_i * bin_term
+            ) * inv_bin_width_j
+
+            abs_xsec_buffer[thread_id, j] += abs_coef_i * bin_term
+            emi_xsec_buffer[thread_id, j] += emi_coef_i * bin_term
+    # Accumulate buffers.
+    _abs_xsec = np.zeros(num_grid, dtype=np.float64)
+    _emi_xsec = np.zeros(num_grid, dtype=np.float64)
+    for k in numba.prange(num_grid):
+        abs_xsec_point = 0.0
+        emi_xsec_point = 0.0
+        for t in range(numba_num_threads):
+            abs_xsec_point += abs_xsec_buffer[t, k]
+            emi_xsec_point += emi_xsec_buffer[t, k]
+        _abs_xsec[k] = abs_xsec_point
+        _emi_xsec[k] = emi_xsec_point
+
     return _abs_xsec, _emi_xsec
 
 
@@ -1804,6 +1591,7 @@ def _abs_emi_binned_voigt_fixed_width(
         gh_weights: npt.NDArray[np.float64],
         t_ref: float = 296,
         pressure_ref: float = 1,
+        numba_num_threads: int = _DEFAULT_NUM_THREADS,
 ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
     assert n_i.shape[0] == n_f.shape[0] == a_fi.shape[0] == g_f.shape[0] == g_i.shape[0] == energy_fi.shape[0] == \
            lifetimes.shape[0]
@@ -1811,11 +1599,7 @@ def _abs_emi_binned_voigt_fixed_width(
     assert gh_roots.shape[0] == gh_weights.shape[0]
 
     bin_width = 2.0 * half_bin_width
-
     num_grid = wn_grid.shape[0]
-
-    _abs_xsec = np.zeros(num_grid, dtype=np.float64)
-    _emi_xsec = np.zeros(num_grid, dtype=np.float64)
     num_trans = energy_fi.shape[0]
     cutoff = 25 + half_bin_width
 
@@ -1836,13 +1620,19 @@ def _abs_emi_binned_voigt_fixed_width(
     grid_min = wn_grid[0]
     grid_max = wn_grid[-1]
 
+    abs_xsec_buffer = np.zeros((numba_num_threads, num_grid), dtype=np.float64)
+    emi_xsec_buffer = np.zeros((numba_num_threads, num_grid), dtype=np.float64)
+
     for i in numba.prange(num_trans):
+        thread_id = numba.get_thread_id()
+
         energy_fi_i = energy_fi[i]
         abs_coef_i = abs_coef[i]
         emi_coef_i = emi_coef[i]
         gamma_inv_i = gamma_inv[i]
+        sigma_i = sigma[i]
 
-        gh_roots_sigma = gh_roots * sigma[i]
+        gh_roots_sigma = gh_roots * sigma_i
         start_sigma = grid_min - gh_roots_sigma
         end_sigma = grid_max - gh_roots_sigma
         b_corr = np.pi / (
@@ -1860,9 +1650,9 @@ def _abs_emi_binned_voigt_fixed_width(
         j_end = min(num_grid, j_end)
 
         for j in range(j_start, j_end):
-            # wn_shift = wn_grid[j] - energy_fi_i
-            # if np.abs(wn_shift) <= cutoff:
-            shift_sigma = wn_grid[j] - energy_fi_i - gh_roots_sigma
+            wn_j = wn_grid[j]
+
+            shift_sigma = wn_j - energy_fi_i - gh_roots_sigma
             bin_term = np.sum(
                 gh_weights_b_corr
                 * (
@@ -1870,8 +1660,20 @@ def _abs_emi_binned_voigt_fixed_width(
                         - np.arctan((shift_sigma - half_bin_width) * gamma_inv_i)
                 )
             )
-            _abs_xsec[j] += abs_coef_i * bin_term
-            _emi_xsec[j] += emi_coef_i * bin_term
+
+            abs_xsec_buffer[thread_id, j] += abs_coef_i * bin_term
+            emi_xsec_buffer[thread_id, j] += emi_coef_i * bin_term
+    # Accumulate buffers.
+    _abs_xsec = np.zeros(num_grid, dtype=np.float64)
+    _emi_xsec = np.zeros(num_grid, dtype=np.float64)
+    for k in numba.prange(num_grid):
+        abs_xsec_point = 0.0
+        emi_xsec_point = 0.0
+        for t in range(numba_num_threads):
+            abs_xsec_point += abs_xsec_buffer[t, k]
+            emi_xsec_point += emi_xsec_buffer[t, k]
+        _abs_xsec[k] = abs_xsec_point
+        _emi_xsec[k] = emi_xsec_point
     return _abs_xsec, _emi_xsec
 
 
@@ -1885,15 +1687,47 @@ def _continuum_binned_gauss_variable_width(
         g_f: npt.NDArray[np.float64],
         g_i: npt.NDArray[np.float64],
         energy_fi: npt.NDArray[np.float64],
-        cont_broad: npt.NDArray[np.float64],
+        v_f: npt.NDArray[np.float64],
+        temperature: float,
+        species_mass: float,
+        box_length: float,
+        erf_lut: npt.NDArray[np.float64] = global_erf_lut,
+        erf_arg_max: float = global_erf_arg_max,
+        numba_num_threads: int = _DEFAULT_NUM_THREADS,
 ) -> npt.NDArray[np.float64]:
+    """
+    Note that the area of a Gaussian within 5 * HWHM is equal to erf(5*sqrt(ln(2))). The reciprocal of this can be used
+    to recover the total intensity, though this value is 99.99999960685046% percent. Hence, this should only affect the
+    9th decimal place, and Einstein A coefficients are only provided to 5 significant figures.
+
+    Parameters
+    ----------
+    wn_grid
+    n_f
+    n_i
+    a_fi
+    g_f
+    g_i
+    energy_fi
+    v_f
+    temperature
+    species_mass
+    box_length
+    erf_lut
+    erf_arg_max
+    numba_num_threads
+
+    Returns
+    -------
+
+    """
     assert n_i.shape[0] == n_f.shape[0] == a_fi.shape[0] == g_f.shape[0] == g_i.shape[0] == energy_fi.shape[0] == \
-           cont_broad.shape[0]
+           v_f.shape[0]
 
     sqrtln2 = math.sqrt(math.log(2))
     num_grid = wn_grid.shape[0]
-    _abs_xsec = np.zeros(num_grid, dtype=np.float64)
     num_trans = energy_fi.shape[0]
+
     min_cutoff = 25.0
     max_cutoff = 3000.0
     cutoff_fwhm_multiple = 5.0
@@ -1911,15 +1745,22 @@ def _continuum_binned_gauss_variable_width(
     inv_bin_widths = 1.0 / (bin_widths_lower + bin_widths_upper)
 
     abs_coef = a_fi * ((n_i * g_f / g_i) - n_f) / (const_16_pi_c * energy_fi * energy_fi)
-    sqrtln2_on_alpha = sqrtln2 / cont_broad
+
+    alpha_doppler = energy_fi * const_sqrt_2_NA_kB_log2_on_c * np.sqrt(temperature / species_mass)
+    alpha_box = const_h_on_8_c * (2 * v_f + 1) / (species_mass * const_amu * box_length * box_length)
+    alpha_total = alpha_box + alpha_doppler
+    sqrtln2_on_alpha = sqrtln2 / alpha_total
+    cutoff = np.clip(alpha_total * cutoff_fwhm_multiple, a_min=min_cutoff, a_max=max_cutoff)
+
+    xsec_buffer = np.zeros((numba_num_threads, num_grid), dtype=np.float64)
 
     for i in numba.prange(num_trans):
+        thread_id = numba.get_thread_id()
+
         energy_fi_i = energy_fi[i]
         abs_coef_i = abs_coef[i]
         sqrtln2_on_alpha_i = sqrtln2_on_alpha[i]
-        cont_broad_i = cont_broad[i]
-        cutoff_i = cont_broad_i * cutoff_fwhm_multiple
-        cutoff_i = max(min_cutoff, min(cutoff_i, max_cutoff))
+        cutoff_i = cutoff[i]
 
         transition_min = energy_fi_i - cutoff_i
         transition_max = energy_fi_i + cutoff_i
@@ -1930,18 +1771,27 @@ def _continuum_binned_gauss_variable_width(
         j_end = min(num_grid, j_end)
 
         for j in range(j_start, j_end):
-            wn_shift = wn_grid[j] - energy_fi_i
+            wn_j = wn_grid[j]
+            upper_width_j = bin_widths_upper[j]
+            lower_width_j = bin_widths_lower[j]
+            inv_bin_width_j = inv_bin_widths[j]
 
-            upper_width = bin_widths_upper[j]
-            lower_width = bin_widths_lower[j]
-            # if -upper_width - cutoff <= wn_shift <= lower_width + cutoff:
-            _abs_xsec[j] += (
-                    abs_coef_i
-                    * (
-                            math.erf(sqrtln2_on_alpha_i * (wn_shift + upper_width))
-                            - math.erf(sqrtln2_on_alpha_i * (wn_shift - lower_width))
-                    ) * inv_bin_widths[j]
-            )
+            wn_shift = wn_j - energy_fi_i
+
+            erf_plus_arg = sqrtln2_on_alpha_i * (wn_shift + upper_width_j)
+            erf_minus_arg = sqrtln2_on_alpha_i * (wn_shift - lower_width_j)
+
+            erf_plus = get_erf_lut(erf_plus_arg, erf_lut, erf_arg_max)
+            erf_minus = get_erf_lut(erf_minus_arg, erf_lut, erf_arg_max)
+
+            xsec_buffer[thread_id, j] += abs_coef_i * (erf_plus - erf_minus) * inv_bin_width_j
+    # Accumulate buffers.
+    _abs_xsec = np.zeros(num_grid, dtype=np.float64)
+    for k in numba.prange(num_grid):
+        xsec_point = 0.0
+        for t in range(numba_num_threads):
+            xsec_point += xsec_buffer[t, k]
+        _abs_xsec[k] = xsec_point
     return _abs_xsec
 
 
@@ -1954,18 +1804,24 @@ def _continuum_binned_gauss_fixed_width(
         g_f: npt.NDArray[np.float64],
         g_i: npt.NDArray[np.float64],
         energy_fi: npt.NDArray[np.float64],
-        cont_broad: npt.NDArray[np.float64],
+        v_f: npt.NDArray[np.float64],
+        temperature: float,
+        species_mass: float,
+        box_length: float,
         half_bin_width: np.float64,
+        erf_lut: npt.NDArray[np.float64] = global_erf_lut,
+        erf_arg_max: float = global_erf_arg_max,
+        numba_num_threads: int = _DEFAULT_NUM_THREADS,
 ) -> npt.NDArray[np.float64]:
     assert n_i.shape[0] == n_f.shape[0] == a_fi.shape[0] == g_f.shape[0] == g_i.shape[0] == energy_fi.shape[0] == \
-           cont_broad.shape[0]
+           v_f.shape[0]
 
     twice_bin_width = 4.0 * half_bin_width
     sqrtln2 = math.sqrt(math.log(2))
+
     num_grid = wn_grid.shape[0]
-    _abs_xsec = np.zeros(wn_grid.shape, dtype=np.float64)
     num_trans = energy_fi.shape[0]
-    # cutoff = 1500 + half_bin_width
+
     min_cutoff = 25.0
     max_cutoff = 3000.0
     cutoff_fwhm_multiple = 5.0
@@ -1977,15 +1833,22 @@ def _continuum_binned_gauss_fixed_width(
     bin_edges[-1] = wn_grid[-1] + (wn_grid[-1] - wn_grid[-2]) * 0.5
 
     abs_coef = a_fi * ((n_i * g_f / g_i) - n_f) / (const_8_pi_c * twice_bin_width * energy_fi * energy_fi)
-    sqrtln2_on_alpha = sqrtln2 / cont_broad
+
+    alpha_doppler = energy_fi * const_sqrt_2_NA_kB_log2_on_c * np.sqrt(temperature / species_mass)
+    alpha_box = const_h_on_8_c * (2 * v_f + 1) / (species_mass * const_amu * box_length * box_length)
+    alpha_total = alpha_box + alpha_doppler
+    sqrtln2_on_alpha = sqrtln2 / alpha_total
+    cutoff = np.clip(alpha_total * cutoff_fwhm_multiple, a_min=min_cutoff, a_max=max_cutoff)
+
+    xsec_buffer = np.zeros((numba_num_threads, num_grid), dtype=np.float64)
 
     for i in numba.prange(num_trans):
+        thread_id = numba.get_thread_id()
+
         energy_fi_i = energy_fi[i]
         abs_coef_i = abs_coef[i]
         sqrtln2_on_alpha_i = sqrtln2_on_alpha[i]
-        cont_broad_i = cont_broad[i]
-        cutoff_i = cont_broad_i * cutoff_fwhm_multiple
-        cutoff_i = max(min_cutoff, min(cutoff_i, max_cutoff))
+        cutoff_i = cutoff[i]
 
         transition_min = energy_fi_i - cutoff_i
         transition_max = energy_fi_i + cutoff_i
@@ -1996,12 +1859,24 @@ def _continuum_binned_gauss_fixed_width(
         j_end = min(num_grid, j_end)
 
         for j in range(j_start, j_end):
-            wn_shift = wn_grid[j] - energy_fi_i
-            # if np.abs(wn_shift) <= cutoff:
-            _abs_xsec[j] += abs_coef_i * (
-                    math.erf(sqrtln2_on_alpha_i * (wn_shift + half_bin_width))
-                    - math.erf(sqrtln2_on_alpha_i * (wn_shift - half_bin_width))
-            )
+            wn_j = wn_grid[j]
+
+            wn_shift = wn_j - energy_fi_i
+
+            erf_plus_arg = sqrtln2_on_alpha_i * (wn_shift + half_bin_width)
+            erf_minus_arg = sqrtln2_on_alpha_i * (wn_shift - half_bin_width)
+
+            erf_plus = get_erf_lut(erf_plus_arg, erf_lut, erf_arg_max)
+            erf_minus = get_erf_lut(erf_minus_arg, erf_lut, erf_arg_max)
+
+            xsec_buffer[thread_id, j] += abs_coef_i * (erf_plus - erf_minus)
+    # Accumulate buffers.
+    _abs_xsec = np.zeros(num_grid, dtype=np.float64)
+    for k in numba.prange(num_grid):
+        xsec_point = 0.0
+        for t in range(numba_num_threads):
+            xsec_point += xsec_buffer[t, k]
+        _abs_xsec[k] = xsec_point
     return _abs_xsec
 
 
@@ -2641,9 +2516,27 @@ def incident_stellar_radiation(
 
 
 def incident_srf(
-        star_temperature: u.Quantity, star_logg: float, star_feh: float, wn_grid: u.Quantity,
-        planet_radius: u.Quantity, orbital_radius: u.Quantity, star_alpha: float = 0.0
+        star_temperature: float, star_logg: float, star_feh: float, wn_grid: u.Quantity, orbital_radius: u.Quantity,
+        star_radius: u.Quantity, star_alpha: float = 0.0
 ) -> u.Quantity:
+    """
+    Returns the substellar flux at the planet's surface.
+
+    Parameters
+    ----------
+    star_temperature
+    star_logg
+    star_feh
+    wn_grid
+    orbital_radius
+    star_radius
+    star_alpha
+
+    Returns
+    -------
+        Substellar flux [W /(m^2 cm^-1)].
+
+    """
     srf_wavelength, srf_flux = get_spectrum(
         teff=star_temperature,
         logg=star_logg,
@@ -2651,16 +2544,24 @@ def incident_srf(
         alpha=star_alpha,
         source="synphot",
     )
+    # srf_flux has units of erg / (Angstrom s cm^2)
     srf_wn = srf_wavelength.to(1 / u.cm, equivalencies=u.spectral())
-    srf_flux = srf_flux / (ac.c * srf_wn * srf_wn)
-    srf_flux = srf_flux.to(u.J / u.m ** 2, equivalencies=u.spectral())
+
+    # srf_flux_wn = srf_flux / (srf_wn**2)
+    # srf_flux_wn = srf_flux_wn.to(u.J / (u.s * u.m**2 * (1/u.cm)))
+
+    srf_flux_nu = srf_flux.to(
+        u.J / (u.s * u.m ** 2 * u.Hz),
+        equivalencies=u.spectral_density(srf_wavelength)
+    )
 
     sort_idx = np.argsort(srf_wn)
     srf_wn = srf_wn[sort_idx]
-    srf_flux = srf_flux[sort_idx]
+    srf_flux_nu = srf_flux_nu[sort_idx]
 
-    srf_flux_interp = np.interp(srf_wn, wn_grid, srf_flux) << srf_flux.unit
-    return srf_flux_interp * (planet_radius / orbital_radius) ** 2
+    srf_flux_interp = np.interp(wn_grid, srf_wn, srf_flux_nu, left=0, right=0) << srf_flux_nu.unit
+    incident_srf_flux = srf_flux_interp * (star_radius / orbital_radius) ** 2
+    return incident_srf_flux.to(srf_flux_nu.unit)
 
 
 @numba.njit()
@@ -2846,7 +2747,7 @@ def cdf_opacity_sampling(
         max_step: float = None,
         num_cdf_points: int = 1000000,
 ) -> u.Quantity:
-    temp_wn_grid = np.linspace(wn_start, wn_end, num_cdf_points)
+    temp_wn_grid = np.linspace(wn_start, wn_end, num_cdf_points, dtype=np.float64)
     ev_grid = calc_ev_grid(wn_grid=temp_wn_grid, temperature=np.atleast_1d(temperature_profile)[:, None]).sum(axis=0)
     ev_norm = ev_grid / simpson(ev_grid, x=temp_wn_grid)
 

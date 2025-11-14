@@ -3,6 +3,7 @@ import numpy.typing as npt
 from astropy import units as u
 from astropy import constants as ac
 import numpy as np
+
 from .chemistry import ChemicalProfile, SpeciesFormula
 from .atmos import (
     build_pressure_profiles,
@@ -10,7 +11,7 @@ from .atmos import (
     density_profile,
     solve_scaleheight,
 )
-from .xsec import XSecCollection, ExomolNLTEXsec, is_nlte_xsec
+from .xsec import XSecCollection
 from .nlte import blackbody
 from .config import log, output_dir
 
@@ -212,12 +213,112 @@ class ExoplanetEmission:
         negative_source_func_cap = - lte_source_func.max(axis=1)[:, None]
 
         effective_source_func = (xsecs.global_eta_matrix / (ac.c * effective_chi)).to(u.J / (u.sr * u.m ** 2),
-                                                                               equivalencies=u.spectral())
+                                                                                      equivalencies=u.spectral())
         # Limit the effects of stimulated emission to avoid exponential overflows.
         # combined_source_func[combined_source_func < negative_source_func_cap] = negative_source_func_cap
         effective_source_func = np.clip(effective_source_func, min=negative_source_func_cap)
 
         return effective_source_func, effective_chi, xsecs.global_eta_matrix
+
+    def compute_transmission(
+            self,
+            xsecs: XSecCollection,
+            star_radius: u.Quantity,
+            spectral_grid: t.Optional[u.Quantity] = None,
+            return_ratio: bool = False,
+    ) -> t.Tuple[u.Quantity, u.Quantity, u.Quantity]:
+        """
+        Compute the transmission spectrum of the atmosphere using the slant-geometry integral over wavenumber grid
+        :math:`\\tilde{\\nu}`.
+
+        The transmission spectrum quantifies the wavenumber-dependent loss of stellar flux during transit:
+
+        .. math::
+            \\delta(\\tilde{\\nu}) = \\left( \\frac{R_{\\mathrm{p,eff}}(\\tilde{\\nu})}{R_{star}} \\right)^{2,
+
+        where :math:`R_{\\mathrm{p,eff}}(\\tilde{\\nu})` is the effective radius of an opaque disk that would block the
+        same stellar flux as the semi-transparent atmosphere.
+
+        The effective radius follows from the optical-depth integral over impact parameters :math:`b`:
+
+        .. math::
+            R_{\\mathrm{p,eff}}^{2}(\\tilde{\\nu})
+            = b_{0}^{2} + \\sum_{k=0}^{n_{\\mathrm{layers}}-1} \\left[ 1 - e^{-\\tau(b_{k},\\tilde{\\nu})} \\right]
+                \\left( b_{k+1}^{2} - b_{k}^{2} \\right),
+
+        where :math:`b_{0}` is the reference planetary radius, :math:`b_{k}` are the impact-parameter (annulus) edges
+        and :math:`\\tau(b_{k},\\tilde{\\nu})` is the slant optical depth computed from
+
+        .. math::
+            \\tau(b, \\tilde{\\nu})
+             = \\sum_{j=1}^{n_{\\mathrm{layers}}} \\alpha_{j}(\\tilde{\\nu}) \\, \\Delta s_{j}(b),
+
+        where :math:`\\Delta s_{j}(b)` is the geometric path length through shell :math:`j` at impact parameter
+        :math:`b`.
+
+        Parameters
+        ----------
+        xsecs : XSecCollection
+            Cross-section database used to compute extinction coefficients.
+        star_radius : Quantity
+            Stellar radius :math:`R_{star}` [m].
+        spectral_grid : Quantity, optional
+            Wavenumber grid :math:`\\tilde{\\nu}` with shape ``(n_wn,)``. If omitted, defaults to
+            :func:``tiramisu.xsec.XSecCollection.unified_grid``.
+        return_ratio : bool, optional
+            If True, return :math:`R_{\\mathrm{p,eff}}/R_{star}` instead of the transit depth :math:`\\delta`.
+
+        Returns
+        -------
+        spectral_grid : Quantity, shape (n_wn, )
+            Wavenumber grid :math:`\\tilde{\\nu}`.
+        transit_depth : Quantity, shape (n_wn,)
+            Either :math:`\\delta(\\tilde{\\nu})` or :math:`R_{\\mathrm{p,eff}}/R_{star}` depending on ``return_ratio``.
+        Rp_eff : Quantity, shape (n_wn, )
+            Effective planetary radius :math:`R_{\\mathrm{p,eff}}(\\tilde{\\nu})` [m].
+        """
+        if spectral_grid is None:
+            spectral_grid = xsecs.unified_grid
+
+        _ = xsecs.compute_opacities_profile(
+            self.chemistry_profile,
+            self.density,
+            self.dz,
+            self.temperature_profile,
+            self.central_pressure,
+            spectral_grid,
+        )
+
+        # global_chi: (n_layers, n_wn) is mixing ratio weighted sum of absorption cross-sections [cm^2].
+        _, global_chi, _ = self.source_function(spectral_grid, xsecs)
+        
+        # Kappa is the mass extinction coefficient [m^2 / kg] and rho is mass density [kg/m^3].
+        # alpha_nu_r is kappa*rho = (sigma/mu)*rho, but our self.density is number density i.e. n=rho/mu.
+        # Avoid bringing mu back in and just get alpha_nu_r = sigma*n.
+        # Volume extinction alpha: (n_wn, n_layers) [1/m]
+        alpha_nu_r = (global_chi * self.density[:, None]).T.to(1 / u.m)
+
+        # Geometry: build shell edges
+        # self.altitude is ALWAYS stored at layer centers (length n_layers),
+        # so reconstruct layer-edge radii from dz:
+        dz = self.dz.to(u.m)  # (n_layers,)
+        cumulative = np.concatenate(([0.0], np.cumsum(dz.value))) * u.m
+        r_edges = (self.planet_radius + cumulative).to(u.m)  # (n_layers+1,)
+
+        # Impact parameter grid (same as shell edges)
+        b_edges = r_edges
+        b_mid = 0.5 * (b_edges[:-1] + b_edges[1:])  # (n_layers,)
+        tau_b_nu = slant_tau(alpha_nu_r, r_edges, b_mid)  # (n_layers, n_wn)
+
+        planet_radius_sq = effective_radius_squared(tau_b_nu, b_edges=b_edges)  # (n_wn,)
+        planet_radius_eff = np.sqrt(planet_radius_sq).to(u.m)
+
+        if return_ratio:
+            delta = (planet_radius_eff / star_radius).decompose()
+        else:
+            delta = ((planet_radius_eff / star_radius) ** 2).decompose()
+
+        return spectral_grid, delta, planet_radius_eff
 
 
 def formal_solve_general(
@@ -229,17 +330,109 @@ def formal_solve_general(
         surface_albedo: float = 0
 ) -> t.Tuple[u.Quantity, u.Quantity]:
     """
-    Calculates the upward and downward intensity at the interface between each layer.
-    Index 0 is the Bottom of the Atmosphere (BOA).
+    Solve the 1D plane–parallel radiative-transfer equation for a discretized atmosphere using the *formal solution* for
+    each direction cosine :math:`\\mu`.
 
-    :param dtau:                     Optical depth of each layer.
-    :param source_function:          Source function in each layer.
-    :param mu_values:                Array of mu cosines.
-    :param mu_weights:               Array of angular integration weights.
-    :param incident_radiation_field: Radiation field incident on the top of the atmosphere (J. m^2).
-    :param surface_albedo:           Albedo of the planet's surface, in the range [0, 1] [Not tested].
+    This routine computes **upward** and **downward** specific intensities at every layer interface, then integrates
+    over angle to obtain the hemispheric fluxes.
 
-    :return: Upwards and Downwards directed intensity at the interface of each layer.
+    ----------------------------------------------------------------------
+    RADIATIVE-TRANSFER EQUATION
+    ----------------------------------------------------------------------
+
+    For a ray of direction cosine :math:`\\mu`, the monochromatic radiative-transfer equation in optical depth
+    :math:`\\tau` is
+
+    .. math::
+        \\mu \\frac{\\mathrm{d} I(\\tau,\\mu)}{\\mathrm{d}\\tau} = I(\\tau,\\mu) - S(\\tau),
+
+    where :math:`S(\\tau)` is the source function.
+
+    The *formal solution* between two optical-depth points :math:`\\tau_{k}` and :math:`\\tau_{k+1}` is:
+
+    .. math::
+        I(\\tau_k,\\mu)
+        = I(\\tau_{k+1},\\mu) \\, e^{-\\Delta\\tau/\\lvert\\mu\\rvert}
+        + S_{k} \\,\\left(1 - e^{-\\Delta\\tau/\\lvert\\mu\\rvert}\\right),
+
+    where :math:`\\Delta\\tau = \\tau_{k+1} - \\tau_{k}`.
+
+    This expression is used for **downward** (TOA to BOA) rays with :math:`\\mu > 0` and **upward** (BOA to TOA) rays
+    with :math:`\\mu < 0`.
+
+    ----------------------------------------------------------------------
+    NUMERICAL DISCRETIZATION
+    ----------------------------------------------------------------------
+
+    The atmosphere is divided into :math:`n_{\\mathrm{layers}}` layers. For each wavenumber :math:`\\tilde{\\nu}` the
+    inputs have shapes:
+
+    * :math:`\\Delta\\tau`: ``(n_layers, n_wn)`` optical-depth increment per layer.
+    * ``source_function``: ``(n_layers, n_wn)`` source function at each point.
+    * ``mu_values``: ``(n_mu,)`` direction cosines.
+    * ``mu_weights``: ``(n_mu,)`` quadrature weights.
+
+    Intensities are stored at the **interfaces**, so the output arrays have dimension ``n_layers + 1``.
+
+    ----------------------------------------------------------------------
+    BOUNDARY CONDITIONS
+    ----------------------------------------------------------------------
+
+    * At the top of atmosphere (TOA):
+
+      .. math::
+         I^{-}_{n_{\\mathrm{layers}}}(\\mu>0) = I_{\\mathrm{incident}} \\text{(if given)}.
+
+    * At the bottom of the atmosphere (BOA):
+
+      If no surface reflection is treated explicitly, the upward intensity is set to the source function of the lowest
+      layer:
+
+      .. math::
+         I^{+}_{0}(\\mu<0) = S_{0}.
+
+    ----------------------------------------------------------------------
+    ANGULAR INTEGRATION
+    ----------------------------------------------------------------------
+
+    After computing intensities for each :math:`\\mu`, hemispheric fluxes are computed as:
+
+    .. math::
+        F^{\\pm}(\\tilde{\\nu})
+        = 2\\pi \\sum_{i=1}^{n_{\\mu}} I^{\\pm}_i(\\tilde{\\nu}) \\, w_{i},
+
+    where :math:`w_{i}` are the angular quadrature weights.
+
+    Parameters
+    ----------
+    dtau : Quantity, shape (n_layers, n_wn)
+        Optical-depth increment :math:`\\Delta\\tau_{j}(\\tilde{\\nu})` for each layer :math:`j` and wavenumber
+        :math:`\\tilde{\\nu}`.
+    source_function : Quantity, shape (n_layers, n_wn)
+        Source function :math:`S_{j}(\\tilde{\\nu})` per layer.
+    mu_values : ndarray, shape (n_mu,)
+        Direction cosines :math:`\\mu_{i}`.
+    mu_weights : ndarray, shape (n_mu,)
+        Angular quadrature weights :math:`w_{i}` corresponding to ``mu_values``.
+    incident_radiation_field : Quantity, shape (n_mu, n_wn), optional
+        Downward incident intensity at TOA, :math:`I^{-}(\\tau_{\\mathrm{top}})`; defaults to zero.
+    surface_albedo : float, optional
+        Surface albedo :math:`A \\in [0,1]`. If nonzero, reflection modifies the BOA upward intensity. (Current
+        implementation uses a simplified placeholder.)
+
+    Returns
+    -------
+    i_up : Quantity, shape (n_layers + 1, n_wn)
+        Hemispherically integrated *upward* flux:
+
+        .. math::
+            F^{+}(\\tilde{\\nu}) = 2\\pi \\sum_{i} I^{+}_{i}(\\tilde{\\nu}) w_{i}.
+
+    i_down : Quantity, shape (n_layers + 1, n_wn)
+        Hemispherically integrated *downward* flux:
+
+        .. math::
+            F^{-}(\\tilde{\\nu}) = 2\\pi \\sum_{i} I^{-}_{i}(\\tilde{\\nu}) w_{i}.
     """
     if surface_albedo < 0 or surface_albedo > 1:
         log.warning(f"Surface albedo {surface_albedo} is outside of [0, 1], clipping.")
@@ -293,3 +486,162 @@ def formal_solve_general(
     i_down = 2 * np.pi * u.sr * np.sum(i_down * mu_weights[:, None, None], axis=0)
 
     return i_up, i_down
+
+
+def chord_lengths_through_shells(b: float, r_edges: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    """
+    Compute the geometric path length of a slant/tangent ray through each atmospheric layer, assuming spherically
+    symmetric shells, for a given impact parameter :math:`b`.
+
+    A straight ray at impact parameter :math:`b` intersects each shell bounded by radii :math:`r_{\\mathrm{in}}` and
+    :math:`r_{\\mathrm{out}}` over a path length:
+
+    .. math::
+        \\Delta{}s_{j}(b) = 2 \\left[
+            \\sqrt{r_{\\mathrm{out}}^{2} - b^{2}}
+            - \\sqrt{max(r_{\\mathrm{in}}, b)^{2} - b^{2}}
+            \\right],
+
+    uch that only shells with :math:`r_{\\mathrm{out}} \\lt b` contribute (others are not intersected).
+
+    Parameters
+    ----------
+    b : float
+        Impact parameter (distance of the ray’s closest approach to the planet’s center) [m]. Corresponds to the tangent
+        altitude of a slant path through the atmosphere.
+    r_edges : ndarray, shape (n_layers + 1, )
+        Radii of the layer boundaries :math:`r_0, r_1, ..., r_{n}` defining :math:`n_{\\mathrm{layers}}` spherical
+        shells [m].
+
+    Returns
+    -------
+    ds : ndarray, shape (n_layers,)
+        Geometric path length through each shell [m]. This array represents :math:`\\Delta{}s_{j}(b)` for each layer
+        :math:`j` and is used in the slant optical depth integral:
+
+        .. math::
+            \\tau(b, \\tilde{\\nu}) = \\sum_{j=1}^{n_{\\mathrm{layers}}} \\alpha_j(\\tilde{\\nu}) \\, \\Delta s_j(b),
+
+        where :math:`\\alpha_j(\\tilde{\\nu})` is the volume extinction coefficient in layer :math:`j`.
+    """
+    r_in = r_edges[:-1]
+    r_out = r_edges[1:]
+    ds = np.zeros_like(r_in)
+    # Only shells with outer radius > b are intersected.
+    impact_mask = b < r_out
+    if not np.any(impact_mask):
+        return ds
+    rin_eff = np.maximum(r_in[impact_mask], b)
+    ds[impact_mask] = 2.0 * (np.sqrt(r_out[impact_mask] ** 2 - b ** 2) - np.sqrt(rin_eff ** 2 - b ** 2))
+    return ds
+
+
+def slant_tau(alpha_nu_r: u.Quantity, r_edges: u.Quantity, b_mid: u.Quantity) -> npt.NDArray[np.float64]:
+    """
+    Compute the *slant optical depth* :math:`\\tau(b, \\tilde{\\nu})` for a spherically symmetric atmosphere
+    discretized into shells.
+
+    For each wavenumber :math:`\\tilde{\\nu}` and impact parameter :math:`b`, the optical depth along the ray is:
+
+    .. math::
+
+        \\tau(b, \\tilde{\\nu}) = \\sum_{j=1}^{n_{\\mathrm{layers}}} \\alpha_j(\\tilde{\\nu}) \\, \\Delta s_j(b),
+
+    where:
+
+    * :math:`\\alpha_j(\\tilde{\\nu})`  
+      is the volume extinction coefficient in layer :math:`j` [1/m].
+
+    * :math:`\\Delta s_j(b)`  
+      is the geometric path length through shell :math:`j` at impact
+      parameter :math:`b`.
+
+    Parameters
+    ----------
+    alpha_nu_r : Quantity, shape (n_wn, n_layers)
+        Volume extinction coefficients :math:`\\alpha(\\tilde{\\nu}, j)` [1/m] for each wavenumber and layer.
+        First dimension indexes wavenumber points :math:`n_{\\mathrm{wn}}`, second dimension indexes atmospheric layers.
+    r_edges : Quantity, shape (n_layers + 1, )
+        Radii of shell boundaries :math:`r_k` [m].
+    b_mid : Quantity, shape (n_layers,)
+        Impact parameters :math:`b_k` [m], typically midpoints between successive shell radii.
+
+    Returns
+    -------
+    tau : ndarray, shape (n_layers, n_wn)
+        Slant optical depth :math:`\\tau(b_k, \\tilde{\\nu}_i)`: first dimension indexes impact parameters :math:`b_k`,
+        second dimension indexes wavenumber grid points :math:`\\tilde{\\nu}_i`. These values describe the total
+        extinction along each chord [1/m].
+    """
+    n_wn, n_layers = alpha_nu_r.shape
+    n_impacts = len(b_mid)
+    r_edges_m = r_edges.to(u.m)
+    b_mid_m = b_mid.to(u.m)
+    alpha_nu_r = alpha_nu_r.to(1 / u.m)
+
+    ds_mat = np.zeros((n_impacts, n_layers)) << r_edges_m.unit
+    for k, b in enumerate(b_mid_m):
+        ds_mat[k, :] = chord_lengths_through_shells(b, r_edges_m)
+
+
+    # alpha: (n_wn, n_layers), ds_mat: (n_impacts, n_layers) -> tau: (n_impacts,n_wn) [m * 1/m -> dimensionless]
+    tau = np.einsum('kn,ln->kl', ds_mat.value, alpha_nu_r.value)
+    return tau
+
+
+def effective_radius_squared(tau_b_nu: npt.NDArray[np.float64], b_edges: u.Quantity) -> u.Quantity:
+    """
+    Compute the *effective planetary radius squared* :math:`R_{\\mathrm{p,eff}}^2(\\tilde{\\nu})` from the slant optical
+    depth :math:`\\tau(b, \\tilde{\\nu})`.
+
+    The fraction of stellar light removed by one annulus at impact parameter :math:`b` is:
+
+    .. math::
+
+       1 - e^{-\\tau(b, \\tilde{\\nu})}.
+
+    The total occulted area of the atmosphere is then:
+
+    .. math::
+
+       A_{\\mathrm{atm}}(\\tilde{\\nu})
+       = 2 \\int_{b_0}^{b_{\\mathrm{top}}} \\left[1 - e^{-\\tau(b, \\tilde{\\nu})}\\right] b \\, db.
+
+    Discretizing using annulus edges :math:`b_k` gives:
+
+    .. math::
+
+       R_{\\mathrm{p,eff}}^2(\\tilde{\\nu})
+       = b_0^2
+         + \\sum_{k=0}^{n_{\\mathrm{layers}} - 1}
+             \\left[
+               1 - e^{-\\tau(b_k, \\tilde{\\nu})}
+             \\right]
+             \\left( b_{k+1}^2 - b_k^2 \\right),
+
+    where :math:`b_0` is the lower boundary reference radius, below which the atmosphere is taken to be opaque.
+
+    Parameters
+    ----------
+    tau_b_nu : ndarray, shape (n_layers, n_wn)
+       Slant optical depths :math:`\\tau(b_k, \\tilde{\\nu}_i)` for each impact parameter :math:`b_k` and wavenumber
+       :math:`\\tilde{\\nu}_i`.
+    b_edges : Quantity, shape (n_layers + 1, )
+       Radii of annulus edges :math:`b_k` [m].
+
+    Returns
+    -------
+    planet_radius_sq : Quantity, shape (n_wn,)
+       Effective planetary radius squared :math:`R_{\\mathrm{p,eff}}^2(\\tilde{\\nu})` [m^2] at each wavenumber. Transit
+       depth is then computed via:
+
+       .. math::
+
+           \\delta(\\tilde{\\nu}) = \\left( \\frac{R_{\\mathrm{p,eff}}(\\tilde{\\nu})}{R_\\star} \\right)^2.
+    """
+    b_sq = (b_edges ** 2).to(u.m ** 2)
+    dA = b_sq[1:] - b_sq[:-1]  # (n_layers, )
+    occultation = 1.0 - np.exp(-tau_b_nu)  # (n_layers, n_wn)
+    # Einstein summation is dimensionless by b_sq is m^2 so dimension is carried through.
+    planet_radius_sq = b_sq[0] + np.einsum('k,kl->l', dA, occultation)  # (n_wn, )
+    return planet_radius_sq.to(u.m ** 2)
