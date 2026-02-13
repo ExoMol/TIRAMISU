@@ -12,7 +12,7 @@ from .atmos import (
     solve_scaleheight,
 )
 from .xsec import XSecCollection
-from .nlte import blackbody
+from .nlte import blackbody, formal_solve_general
 from .config import log, output_dir
 
 
@@ -151,8 +151,9 @@ class ExoplanetEmission:
             xsecs: XSecCollection,
             spectral_grid: t.Optional[u.Quantity] = None,
             output_intensity: bool = False,
-            incident_radiation_field: u.Quantity = None
-    ) -> t.Tuple[u.Quantity, u.Quantity, u.Quantity, t.Dict[SpeciesFormula, u.Quantity]]:
+            incident_radiation_field: u.Quantity = None,
+            approximate_t_ex: bool = False,
+    ) -> t.Tuple[u.Quantity, u.Quantity, u.Quantity, npt.NDArray[np.float64], t.Dict[SpeciesFormula, u.Quantity]]:
 
         if spectral_grid is None:
             spectral_grid = xsecs.unified_grid
@@ -161,19 +162,25 @@ class ExoplanetEmission:
 
         self.mu_tau, self.mu_weights = emission_quadratures(4)
         opacities = xsecs.compute_opacities_profile(
-            self.chemistry_profile,
-            self.density,
-            self.dz,
-            self.temperature_profile,
-            self.central_pressure,
-            spectral_grid,
+            chemical_profile=self.chemistry_profile,
+            density_profile=self.density,
+            dz_profile=self.dz,
+            temperature=self.temperature_profile,
+            pressure=self.central_pressure,
+            spectral_grid=spectral_grid,
+            approximate_t_ex=approximate_t_ex,
         )
         source_func, global_chi, global_eta = self.source_function(spectral_grid, xsecs)
+        np.save(
+            fr"/mnt/c/PhD/NLTE/Models/KELT-20b/approximation/ohx1e0_source.npy",
+            source_func.value
+        )
 
         mu_values, mu_weights = np.polynomial.legendre.leggauss(50)
         mu_values, mu_weights = (mu_values + 1) * 0.5, mu_weights / 2
         res = global_chi * self.density[:, None] * self.dz[:, None]
         dtau = res.decompose().value
+        # tau = dtau[::-1].cumsum(axis=0)[::-1]
         i_up, i_down = formal_solve_general(
             dtau=dtau,
             source_function=source_func,
@@ -201,7 +208,7 @@ class ExoplanetEmission:
             )
 
         # return spectral_grid, emission, emission_tau, opacities
-        return spectral_grid, i_up, i_down, opacities
+        return spectral_grid, i_up, i_down, dtau, opacities
 
     def source_function(
             self, spectral_grid: u.Quantity, xsecs: XSecCollection,
@@ -226,6 +233,7 @@ class ExoplanetEmission:
             star_radius: u.Quantity,
             spectral_grid: t.Optional[u.Quantity] = None,
             return_ratio: bool = False,
+            approximate_t_ex: bool = False,
     ) -> t.Tuple[u.Quantity, u.Quantity, u.Quantity]:
         """
         Compute the transmission spectrum of the atmosphere using the slant-geometry integral over wavenumber grid
@@ -281,12 +289,13 @@ class ExoplanetEmission:
             spectral_grid = xsecs.unified_grid
 
         _ = xsecs.compute_opacities_profile(
-            self.chemistry_profile,
-            self.density,
-            self.dz,
-            self.temperature_profile,
-            self.central_pressure,
-            spectral_grid,
+            chemical_profile=self.chemistry_profile,
+            density_profile=self.density,
+            dz_profile=self.dz,
+            temperature=self.temperature_profile,
+            pressure=self.central_pressure,
+            spectral_grid=spectral_grid,
+            approximate_t_ex=approximate_t_ex,
         )
 
         # global_chi: (n_layers, n_wn) is mixing ratio weighted sum of absorption cross-sections [cm^2].
@@ -319,173 +328,6 @@ class ExoplanetEmission:
             delta = ((planet_radius_eff / star_radius) ** 2).decompose()
 
         return spectral_grid, delta, planet_radius_eff
-
-
-def formal_solve_general(
-        dtau: u.Quantity,
-        source_function: u.Quantity,
-        mu_values: npt.NDArray[np.float64],
-        mu_weights: npt.NDArray[np.float64],
-        incident_radiation_field: u.Quantity = None,
-        surface_albedo: float = 0
-) -> t.Tuple[u.Quantity, u.Quantity]:
-    """
-    Solve the 1D plane–parallel radiative-transfer equation for a discretized atmosphere using the *formal solution* for
-    each direction cosine :math:`\\mu`.
-
-    This routine computes **upward** and **downward** specific intensities at every layer interface, then integrates
-    over angle to obtain the hemispheric fluxes.
-
-    ----------------------------------------------------------------------
-    RADIATIVE-TRANSFER EQUATION
-    ----------------------------------------------------------------------
-
-    For a ray of direction cosine :math:`\\mu`, the monochromatic radiative-transfer equation in optical depth
-    :math:`\\tau` is
-
-    .. math::
-        \\mu \\frac{\\mathrm{d} I(\\tau,\\mu)}{\\mathrm{d}\\tau} = I(\\tau,\\mu) - S(\\tau),
-
-    where :math:`S(\\tau)` is the source function.
-
-    The *formal solution* between two optical-depth points :math:`\\tau_{k}` and :math:`\\tau_{k+1}` is:
-
-    .. math::
-        I(\\tau_k,\\mu)
-        = I(\\tau_{k+1},\\mu) \\, e^{-\\Delta\\tau/\\lvert\\mu\\rvert}
-        + S_{k} \\,\\left(1 - e^{-\\Delta\\tau/\\lvert\\mu\\rvert}\\right),
-
-    where :math:`\\Delta\\tau = \\tau_{k+1} - \\tau_{k}`.
-
-    This expression is used for **downward** (TOA to BOA) rays with :math:`\\mu > 0` and **upward** (BOA to TOA) rays
-    with :math:`\\mu < 0`.
-
-    ----------------------------------------------------------------------
-    NUMERICAL DISCRETIZATION
-    ----------------------------------------------------------------------
-
-    The atmosphere is divided into :math:`n_{\\mathrm{layers}}` layers. For each wavenumber :math:`\\tilde{\\nu}` the
-    inputs have shapes:
-
-    * :math:`\\Delta\\tau`: ``(n_layers, n_wn)`` optical-depth increment per layer.
-    * ``source_function``: ``(n_layers, n_wn)`` source function at each point.
-    * ``mu_values``: ``(n_mu,)`` direction cosines.
-    * ``mu_weights``: ``(n_mu,)`` quadrature weights.
-
-    Intensities are stored at the **interfaces**, so the output arrays have dimension ``n_layers + 1``.
-
-    ----------------------------------------------------------------------
-    BOUNDARY CONDITIONS
-    ----------------------------------------------------------------------
-
-    * At the top of atmosphere (TOA):
-
-      .. math::
-         I^{-}_{n_{\\mathrm{layers}}}(\\mu>0) = I_{\\mathrm{incident}} \\text{(if given)}.
-
-    * At the bottom of the atmosphere (BOA):
-
-      If no surface reflection is treated explicitly, the upward intensity is set to the source function of the lowest
-      layer:
-
-      .. math::
-         I^{+}_{0}(\\mu<0) = S_{0}.
-
-    ----------------------------------------------------------------------
-    ANGULAR INTEGRATION
-    ----------------------------------------------------------------------
-
-    After computing intensities for each :math:`\\mu`, hemispheric fluxes are computed as:
-
-    .. math::
-        F^{\\pm}(\\tilde{\\nu})
-        = 2\\pi \\sum_{i=1}^{n_{\\mu}} I^{\\pm}_i(\\tilde{\\nu}) \\, w_{i},
-
-    where :math:`w_{i}` are the angular quadrature weights.
-
-    Parameters
-    ----------
-    dtau : Quantity, shape (n_layers, n_wn)
-        Optical-depth increment :math:`\\Delta\\tau_{j}(\\tilde{\\nu})` for each layer :math:`j` and wavenumber
-        :math:`\\tilde{\\nu}`.
-    source_function : Quantity, shape (n_layers, n_wn)
-        Source function :math:`S_{j}(\\tilde{\\nu})` per layer.
-    mu_values : ndarray, shape (n_mu,)
-        Direction cosines :math:`\\mu_{i}`.
-    mu_weights : ndarray, shape (n_mu,)
-        Angular quadrature weights :math:`w_{i}` corresponding to ``mu_values``.
-    incident_radiation_field : Quantity, shape (n_mu, n_wn), optional
-        Downward incident intensity at TOA, :math:`I^{-}(\\tau_{\\mathrm{top}})`; defaults to zero.
-    surface_albedo : float, optional
-        Surface albedo :math:`A \\in [0,1]`. If nonzero, reflection modifies the BOA upward intensity. (Current
-        implementation uses a simplified placeholder.)
-
-    Returns
-    -------
-    i_up : Quantity, shape (n_layers + 1, n_wn)
-        Hemispherically integrated *upward* flux:
-
-        .. math::
-            F^{+}(\\tilde{\\nu}) = 2\\pi \\sum_{i} I^{+}_{i}(\\tilde{\\nu}) w_{i}.
-
-    i_down : Quantity, shape (n_layers + 1, n_wn)
-        Hemispherically integrated *downward* flux:
-
-        .. math::
-            F^{-}(\\tilde{\\nu}) = 2\\pi \\sum_{i} I^{-}_{i}(\\tilde{\\nu}) w_{i}.
-    """
-    if surface_albedo < 0 or surface_albedo > 1:
-        log.warning(f"Surface albedo {surface_albedo} is outside of [0, 1], clipping.")
-        surface_albedo = np.clip(surface_albedo, 0, 1)
-
-    n_layers, n_wavelengths = dtau.shape
-
-    # Compute intensity at interfaces.
-    i_up = np.zeros((len(mu_values), n_layers + 1, n_wavelengths)) * source_function.unit
-    i_down = np.zeros((len(mu_values), n_layers + 1, n_wavelengths)) * source_function.unit
-
-    # Upper boundary condition at the top (level n_layers) is zero, unless incident radiation field!
-    if incident_radiation_field is not None:
-        i_down[:, n_layers, :] = incident_radiation_field
-    else:
-        i_down[:, n_layers, :] = 0.0 * source_function.unit
-
-    # Integrate from TOA (k=n_layers-1) down to BOA (k=0)
-    for k in range(n_layers - 1, -1, -1):
-        delta_tau_mu = dtau[k, :] / np.abs(mu_values[:, None])
-        exp_term = np.exp(-delta_tau_mu)
-        source_contribution = source_function[k, :] * (1 - exp_term)
-
-        # Intensity at the top interface of each layer
-        i_down[:, k, :] = i_down[:, k + 1, :] * exp_term + source_contribution
-
-    # Include an albedo for terrestrial planets?
-    # downward_flux = 2 * np.pi * (i_down[:, 0, :] * mu_values[:, None] * mu_weights[mu_weights > 0, None]).sum(axis=0)
-    # Reflected intensity is diffuse (same in all directions)
-    # reflected_intensity = surface_albedo * downward_flux / np.pi
-
-    # bb = blackbody(...)
-    # thermal_emission = bb(dtau.shape[1] * u.nm) # Example wavelength
-    # thermal_emission = source_function[-1] * surface_emissivity # Placeholder
-    # surface_emission = thermal_emission + reflected_intensity
-    surface_emission = source_function[0, :]  # USE THIS IN PROD!
-
-    # Lower boundary source function (black body) is surface upwards emission.
-    i_up[:, 0, :] = surface_emission
-
-    # Integrate from BOA (k=0) to TOA (k=n_layers-1)
-    for k in range(n_layers):
-        delta_tau_mu = dtau[k, :] / mu_values[:, None]
-        exp_term = np.exp(-delta_tau_mu)
-        source_contribution = source_function[None, k, :] * (1 - exp_term)
-
-        # Intensity at the top of the layer (level k+1)
-        i_up[:, k + 1, :] = i_up[:, k, :] * exp_term + source_contribution
-
-    i_up = 2 * np.pi * u.sr * np.sum(i_up * mu_weights[:, None, None], axis=0)
-    i_down = 2 * np.pi * u.sr * np.sum(i_down * mu_weights[:, None, None], axis=0)
-
-    return i_up, i_down
 
 
 def chord_lengths_through_shells(b: float, r_edges: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:

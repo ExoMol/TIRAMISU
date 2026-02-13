@@ -1,7 +1,6 @@
 import pathlib
 
 import astropy.units as u
-import matplotlib.pyplot as plt
 import numpy as np
 import time
 import pandas as pd
@@ -77,10 +76,19 @@ if __name__ == "__main__":
 
     temperature_profile = profiles["T"].to_numpy()[::-1] << u.K
 
-    # spectral_grid = cdf_opacity_sampling(
-    #     wn_start=100, wn_end=30000, temperature_profile=temperature_profile, num_points=10000, max_step=50
-    # )
-    spectral_grid = np.linspace(100, 30000, 2991) << 1 / u.cm
+    spectral_grid = cdf_opacity_sampling(
+        wn_start=100, wn_end=10000, temperature_profile=temperature_profile, num_points=10000, max_step=50
+    )
+
+    # # HD 209458 b
+    # planet_mass = 0.682 << u.Mjup
+    # planet_radius = 1.37 << u.Rjup
+
+    # WASP-39b
+    # planet_mass = 0.28 << u.Mjup
+    # planet_radius = 1.332 << u.Rjup
+    # star_temperature = 5485 << u.K
+    # orbital_radius = 0.0486 << u.AU
 
     # KELT-20 b
     planet_mass = 3.372 << u.Mjup
@@ -126,8 +134,10 @@ if __name__ == "__main__":
         central_pressure=central_pressure,
         pressure_levels=pressure_levels,
     )
-    n_lte_layers = 40
+    n_lte_layers = 20
     xsecs = xsec.XSecCollection(
+        # planet_radius=planet_radius,
+        # chem_profile=chemistry_profile,
         n_lte_layers=n_lte_layers,
         incident_radiation_field=incident_radiation_field,
         debug=True,
@@ -140,8 +150,7 @@ if __name__ == "__main__":
     )
 
     for x in hdf5_xsecs:
-        if x.species in chemistry_profile.species:
-            xsecs.add_replace_xsec_data(x)
+        xsecs.add_replace_xsec_data(x)
 
     # NLTE Cross-sections:
     # mass_oh = 15.99491461957 + 1.00782503223  # O + H
@@ -150,19 +159,39 @@ if __name__ == "__main__":
     )
     nlte_xsec = xsec.ExomolNLTEXsec(
         species="OH",
+        species_mass=mass_oh,
         states_file=Path(r"/mnt/c/PhD/OH/ExoMol/16O-1H__MYTHOS.noB4.states"),
         trans_files=Path(r"/mnt/c/PhD/OH/ExoMol/16O-1H__MYTHOS.trunc.trans"),
         agg_col_nums=[9, 10],
+        planet_radius=planet_radius,
+        chem_profile=chemistry_profile,
         broadening_params=broadening_params,  # (gamma, n) for H, He
+        # source_func_threshold=1e-50,
         n_lte_layers=n_lte_layers,
+        # lte_grid_file=Path(r"/mnt/c/PhD/OH/Opacities/16O-1H__MYTHOS.R15000_0.125-100000mu.xsec.TauREx.h5"),
         lte_grid_file=Path(r"/mnt/c/PhD/OH/Opacities/16O-1H__MYTHOS_cont.R15000_0.125-100000mu.xsec.TauREx.h5"),
         cont_states_file=Path(r"/mnt/c/PhD/OH/ExoMol/XABC11_Unbound_States_Trans/16O-1H__MYTHOS.states.cont"),
         cont_trans_files=Path(r"/mnt/c/PhD/OH/ExoMol/XABC11_Unbound_States_Trans/16O-1H__MYTHOS.trans.cont"),
-        cont_box_length=6.5E-8,
-        cont_broad_col_num=10,
         dissociation_products=("O", "H"),
+        incident_radiation_field=incident_radiation_field,
         debug=True,
+        sor=True,
     )
+    # mass_tio = 47.94794197900 + 15.99491461957  # Ti + O
+    # # broadening_params = xsec.weight_broadening_parameters(broadening_dict={"H": (0.089, 0.5), "He": (0.015, 0.5)},
+    # #                                                       chemistry_profile=chemistry_profile)
+    # nlte_xsec = xsec.ExomolNLTEXsec(
+    #     species="TiO",
+    #     species_mass=mass_tio,
+    #     states_file=Path(r"/mnt/c/PhD/TiO/ExoMol/48Ti-16O__Toto.states"),
+    #     trans_files=Path(r"/mnt/c/PhD/TiO/ExoMol/48Ti-16O__Toto.trans"),
+    #     agg_col_nums=[9, 10],
+    #     chem_profile=chemistry_profile,
+    #     # broadening_params=broadening_params,
+    #     n_lte_layers=95,
+    #     lte_grid_file=Path(r"/mnt/c/PhD/TiO/Opacities/48Ti-16O__Toto.R15000_0.125-100000mu.xsec.TauREx.h5"),
+    #     incident_radiation_field=incident_radiation_field,
+    # )
     xsecs.add_replace_xsec_data(nlte_xsec)
 
     start = time.perf_counter()
@@ -172,80 +201,9 @@ if __name__ == "__main__":
     #     wn_grid=spectral_grid, star_temperature=star_temperature, orbital_radius=orbital_radius, planet_radius=planet_radius
     # )
     # This now contains the loop!
-    spectral_grid, i_up, i_down, dtau, opacities = emission.compute_emission(
-        xsecs,
-        spectral_grid=spectral_grid,
-        output_intensity=True,
-        incident_radiation_field=incident_radiation_field,
-        approximate_t_ex=True,
+    spectral_grid, emission_flux, emission_tau, emission_xsecs = emission.compute_emission(
+        xsecs, spectral_grid=spectral_grid, output_intensity=True, incident_radiation_field=incident_radiation_field
     )
-    import matplotlib.colors as colors
-
-    plt.figure(figsize=(8, 4), dpi=300)
-    plt.imshow(
-        xsecs.global_chi_matrix.value, interpolation=None, origin="lower", aspect=62.5,
-        norm=colors.LogNorm(
-            vmin=xsecs.global_chi_matrix.value[xsecs.global_chi_matrix.value > 0].min(),
-            vmax=xsecs.global_chi_matrix.value.max()
-        ),
-    )
-    plt.colorbar(label=f"Chi ({xsecs.global_chi_matrix.unit:latex})")
-    plt.show()
-
-    plt.figure(figsize=(8, 4), dpi=300)
-    plt.imshow(
-        xsecs.global_eta_matrix.value, interpolation=None, origin="lower", aspect=62.5,
-        norm=colors.LogNorm(
-            vmin=xsecs.global_eta_matrix.value[xsecs.global_eta_matrix.value > 0].min(),
-            vmax=xsecs.global_eta_matrix.value.max()
-        ),
-    )
-    plt.colorbar(label=f"Eta ({xsecs.global_eta_matrix.unit:latex})")
-    plt.show()
-
-    plt.figure(figsize=(8, 4), dpi=300)
-    plt.imshow(
-        dtau, interpolation=None, origin="lower", aspect=62.5,
-        norm=colors.LogNorm(vmin=dtau[dtau > 0].min(), vmax=1),
-    )
-    plt.colorbar(label="Tau")
-    plt.show()
-
-    np.save(
-        fr"/mnt/c/PhD/NLTE/Models/KELT-20b/approximation/ohx1e{int(np.log10(oh_scale_factor))}_OH_vmr.npy",
-        oh_vmr
-    )
-    np.save(
-        fr"/mnt/c/PhD/NLTE/Models/KELT-20b/approximation/ohx1e{int(np.log10(oh_scale_factor))}_chi.npy",
-        xsecs.global_chi_matrix.value
-    )
-    np.save(
-        fr"/mnt/c/PhD/NLTE/Models/KELT-20b/approximation/ohx1e{int(np.log10(oh_scale_factor))}_eta.npy",
-        xsecs.global_eta_matrix.value
-    )
-    np.save(
-        fr"/mnt/c/PhD/NLTE/Models/KELT-20b/approximation/ohx1e{int(np.log10(oh_scale_factor))}_dtau.npy",
-        dtau
-    )
-    np.save(
-        fr"/mnt/c/PhD/NLTE/Models/KELT-20b/approximation/ohx1e{int(np.log10(oh_scale_factor))}_wn_grid.npy",
-        spectral_grid.value
-    )
-    np.save(
-        fr"/mnt/c/PhD/NLTE/Models/KELT-20b/approximation/ohx1e{int(np.log10(oh_scale_factor))}_nd.npy",
-        emission.density.to(1 / u.m**3).value
-    )
-    np.save(
-        fr"/mnt/c/PhD/NLTE/Models/KELT-20b/approximation/ohx1e{int(np.log10(oh_scale_factor))}_dz.npy",
-        emission.dz.to(u.m).value
-    )
-    print(incident_radiation_field.unit)
-    np.save(
-        fr"/mnt/c/PhD/NLTE/Models/KELT-20b/approximation/ohx1e{int(np.log10(oh_scale_factor))}_isrf.npy",
-        incident_radiation_field.value
-    )
-    exit()
-
     # TODO: Update below to ensure re-computing output on high-res grid works fine.
     # Result gives the spectral grid requested, the emission flux, the optical depth and the cross-sections used.
     high_res_grid = create_r_wn_grid(low=spectral_grid[0].value, high=spectral_grid[-1].value, resolving_power=15000)

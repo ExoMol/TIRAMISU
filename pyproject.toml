@@ -12,6 +12,9 @@ dependencies = [
     "tqdm>4.66.4",
     "numba>=0.61.0",
     "matplotlib>=3.10.1",
+    "polars>=1.37.1",
+    "phoenix4all>=0.0.4",
+    "dask>=2026.1.1",
 ]
 
 [dependency-groups]

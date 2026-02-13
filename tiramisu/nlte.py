@@ -140,11 +140,12 @@ def get_erf_lut(erf_arg: float, erf_lut: npt.NDArray[np.float64], erf_arg_max: f
 
 
 def _sum_profiles(group: pl.DataFrame) -> pl.DataFrame:
-    summed_profiles = np.stack(group["profile"].to_numpy(), axis=0).sum(axis=0)
+    profile_label = group.columns[-1]
+    summed_profiles = np.stack(group[profile_label].to_numpy(), axis=0).sum(axis=0)
     return pl.DataFrame({
         "id_agg_f": [group["id_agg_f"][0]],
         "id_agg_i": [group["id_agg_i"][0]],
-        "profile": [summed_profiles],
+        profile_label: [summed_profiles],
     })
 
 
@@ -157,6 +158,7 @@ def _build_xsec(
         pop_matrix: npt.NDArray[np.float64],
         wn_grid_len: int,
         is_abs: bool,
+        numba_num_threads: int = _DEFAULT_NUM_THREADS,
 ) -> npt.NDArray[np.float64]:
     """
     For use only by :class:`tiramisu.nlte.CompactProfile` instances.
@@ -185,10 +187,9 @@ def _build_xsec(
     """
     n_profiles = start_idxs.shape[0]
 
-    n_threads = numba.get_num_threads()
     # Allocate per-thread accumulation buffer
     # Note: This allocation is performed inside the njit function; it is ok and reused only for the scope of this call.
-    buffers = np.zeros((n_threads, wn_grid_len), dtype=np.float64)
+    buffers = np.zeros((numba_num_threads, wn_grid_len), dtype=np.float64)
 
     # Accumulate profile in buffers[thread_id,:] per thread.
     for i in numba.prange(n_profiles):
@@ -213,7 +214,7 @@ def _build_xsec(
     xsec_out = np.zeros(wn_grid_len, dtype=np.float64)
     for k in numba.prange(wn_grid_len):
         xsec_point = 0.0
-        for t in range(n_threads):
+        for t in range(numba_num_threads):
             xsec_point += buffers[t, k]
         xsec_out[k] = xsec_point
 
@@ -221,6 +222,8 @@ def _build_xsec(
 
 
 class CompactProfile:
+    __slots__ = ["temporary_profiles", "profiles", "offsets", "start_idxs", "key_idx_map", "key_lookup"]
+
     def __init__(self):
         self.temporary_profiles: pl.DataFrame | None = None
         self.profiles: npt.NDArray[np.float64] | None = None
@@ -354,6 +357,7 @@ class ProfileStore:
     Store :class:`tiramisu.nlte.CompactProfile` objects representing the species' absorption, stimulated emission and
     spontaneous emission profiles. Used for bound-bound transitions (including quasi-bound).
     """
+    __slots__ = ["n_layers", "abs_profiles", "ste_profiles", "spe_profiles"]
 
     def __init__(self, n_layers: int):
         self.n_layers = n_layers
@@ -415,6 +419,8 @@ class ProfileStore:
 
 
 class ContinuumProfileStore:
+    __slots__ = ["n_layers", "abs_profiles"]
+
     def __init__(self, n_layers: int):
         self.n_layers = n_layers
         # Storage for final profiles.
@@ -450,8 +456,13 @@ class ContinuumProfileStore:
             # self.spe_profiles[layer_idx].finalise()
 
     def get_profile(self, layer_idx: int, key: int, profile_type: str) -> t.Tuple[npt.NDArray, int]:
+        if type(key) is int:
+            get_key = (-1, key)
+        else:
+            get_key = key
         if profile_type == "abs":
-            return self.abs_profiles[layer_idx].get_profile(key)
+            # Continuum profiles are stored with an arbitrary index for the upper continuum state (-1).
+            return self.abs_profiles[layer_idx].get_profile(get_key)
         else:
             raise RuntimeError(f"ContinuumProfileStore profile type {profile_type} not implemented.")
 
@@ -598,166 +609,6 @@ def calc_band_profile(
         "ste_profile": [_ste_xsec],
         "spe_profile": [_spe_xsec],
     })
-
-
-# @numba.njit(parallel=True, cache=True, error_model="numpy")
-# def _continuum_band_profile_variable_width(
-#         wn_grid: npt.NDArray[np.float64],
-#         n_frac_f: npt.NDArray[np.float64],
-#         n_frac_i: npt.NDArray[np.float64],
-#         a_fi: npt.NDArray[np.float64],
-#         g_f: npt.NDArray[np.float64],
-#         g_i: npt.NDArray[np.float64],
-#         energy_fi: npt.NDArray[np.float64],
-#         cont_broad: npt.NDArray[np.float64],
-# ) -> npt.NDArray[np.float64]:
-#     assert n_frac_f.shape[0] == n_frac_i.shape[0] == a_fi.shape[0] == g_f.shape[0] == g_i.shape[0] == energy_fi.shape[
-#         0] == \
-#            cont_broad.shape[0]
-#     sqrtln2 = math.sqrt(math.log(2))
-#     num_grid = wn_grid.shape[0]
-#     _abs_xsec = np.zeros(num_grid, dtype=np.float64)
-#     num_trans = energy_fi.shape[0]
-#     # cutoff = 1500
-#     min_cutoff = 25.0
-#     max_cutoff = 3000.0
-#     cutoff_fwhm_multiple = 5.0
-#
-#     # bin_widths = np.zeros(num_grid + 1)
-#     # bin_widths[1:-1] = (wn_grid[:-1] + wn_grid[1:]) / 2.0 - wn_grid[:-1]
-#     bin_edges = np.empty(num_grid + 1, dtype=np.float64)
-#     bin_edges[0] = wn_grid[0] - (wn_grid[1] - wn_grid[0]) * 0.5
-#     for j in range(1, num_grid):
-#         bin_edges[j] = (wn_grid[j - 1] + wn_grid[j]) * 0.5
-#     bin_edges[-1] = wn_grid[-1] + (wn_grid[-1] - wn_grid[-2]) * 0.5
-#
-#     bin_widths_lower = wn_grid - bin_edges[:-1]
-#     bin_widths_upper = bin_edges[1:] - wn_grid
-#     inv_bin_widths = 1.0 / (bin_widths_lower + bin_widths_upper)
-#
-#     abs_coef = a_fi * ((n_frac_i * g_f / g_i) - n_frac_f) / (const_16_pi_c * energy_fi * energy_fi)
-#     sqrtln2_on_alpha = sqrtln2 / cont_broad
-#
-#     for i in numba.prange(num_trans):
-#         energy_fi_i = energy_fi[i]
-#         abs_coef_i = abs_coef[i]
-#         sqrtln2_on_alpha_i = sqrtln2_on_alpha[i]
-#         cont_broad_i = cont_broad[i]
-#         cutoff_i = cont_broad_i * cutoff_fwhm_multiple
-#         cutoff_i = max(min_cutoff, min(cutoff_i, max_cutoff))
-#
-#         transition_min = energy_fi_i - cutoff_i
-#         transition_max = energy_fi_i + cutoff_i
-#
-#         j_start = binary_search_right(bin_edges, transition_min) - 1
-#         j_start = max(0, j_start)
-#         j_end = binary_search_left(bin_edges, transition_max, start=j_start)
-#         j_end = min(num_grid, j_end)
-#
-#         for j in range(j_start, j_end):
-#             wn_shift = wn_grid[j] - energy_fi_i
-#             # upper_width = bin_widths[j + 1]
-#             # lower_width = bin_widths[j]
-#             upper_width = bin_widths_upper[j]
-#             lower_width = bin_widths_lower[j]
-#             # if min(abs(wn_shift - lower_width), abs(wn_shift + upper_width)) <= cutoff:
-#             _abs_xsec[j] += (
-#                     abs_coef_i
-#                     * (
-#                             math.erf(sqrtln2_on_alpha_i * (wn_shift + upper_width))
-#                             - math.erf(sqrtln2_on_alpha_i * (wn_shift - lower_width))
-#                     ) * inv_bin_widths[j]
-#             )
-#     return _abs_xsec
-
-
-# @numba.njit(parallel=True, cache=True, error_model="numpy")
-# def _continuum_band_profile_fixed_width(
-#         wn_grid: npt.NDArray[np.float64],
-#         n_frac_f: npt.NDArray[np.float64],
-#         n_frac_i: npt.NDArray[np.float64],
-#         a_fi: npt.NDArray[np.float64],
-#         g_f: npt.NDArray[np.float64],
-#         g_i: npt.NDArray[np.float64],
-#         energy_fi: npt.NDArray[np.float64],
-#         v_f: npt.NDArray[np.float64],
-#         temperature: float,
-#         species_mass: float,
-#         box_length: float,
-#         # cont_broad: npt.NDArray[np.float64],
-#         erf_lut: npt.NDArray[np.float64],
-#         erf_arg_max: float,
-#         half_bin_width: float,
-#         numba_num_threads: int = _DEFAULT_NUM_THREADS,
-# ) -> npt.NDArray[np.float64]:
-#     assert (n_frac_f.shape[0] == n_frac_i.shape[0] == a_fi.shape[0] == g_f.shape[0] == g_i.shape[0] ==
-#             energy_fi.shape[0] == v_f.shape[0])
-#     twice_bin_width = 4.0 * half_bin_width
-#     sqrtln2 = math.sqrt(math.log(2))
-#
-#     num_grid = wn_grid.shape[0]
-#     num_trans = energy_fi.shape[0]
-#
-#     min_cutoff = 25.0
-#     max_cutoff = 3000.0
-#     cutoff_fwhm_multiple = 5.0
-#
-#     bin_edges = np.empty(num_grid + 1, dtype=np.float64)
-#     bin_edges[0] = wn_grid[0] - (wn_grid[1] - wn_grid[0]) * 0.5
-#     for j in range(1, num_grid):
-#         bin_edges[j] = (wn_grid[j - 1] + wn_grid[j]) * 0.5
-#     bin_edges[-1] = wn_grid[-1] + (wn_grid[-1] - wn_grid[-2]) * 0.5
-#
-#     abs_coef = a_fi * ((n_frac_i * g_f / g_i) - n_frac_f) / (const_8_pi_c * twice_bin_width * energy_fi * energy_fi)
-#
-#     alpha_doppler = energy_fi * const_sqrt_2_NA_kB_log2_on_c * np.sqrt(temperature / species_mass)
-#     alpha_box = const_h_on_8_c * (2 * v_f + 1) / (species_mass * const_amu * box_length * box_length)
-#     alpha_total = alpha_box + alpha_doppler
-#     sqrtln2_on_alpha = sqrtln2 / alpha_total
-#
-#     cutoff = np.clip(alpha_total * cutoff_fwhm_multiple, a_min=min_cutoff, a_max=max_cutoff)
-#
-#     xsec_buffer = np.zeros((numba_num_threads, num_grid), dtype=np.float64)
-#
-#     for i in numba.prange(num_trans):
-#         thread_id = numba.get_thread_id()
-#
-#         energy_fi_i = energy_fi[i]
-#         abs_coef_i = abs_coef[i]
-#         sqrtln2_on_alpha_i = sqrtln2_on_alpha[i]
-#         cutoff_i = cutoff[i]
-#
-#         transition_min = energy_fi_i - cutoff_i
-#         transition_max = energy_fi_i + cutoff_i
-#
-#         j_start = binary_search_right(bin_edges, transition_min) - 1
-#         j_start = max(0, j_start)
-#         j_end = binary_search_left(bin_edges, transition_max, start=j_start)
-#         j_end = min(num_grid, j_end)
-#
-#         for j in range(j_start, j_end):
-#             wn_shift = wn_grid[j] - energy_fi_i
-#
-#             erf_plus_arg = sqrtln2_on_alpha_i * (wn_shift + half_bin_width)
-#             erf_minus_arg = sqrtln2_on_alpha_i * (wn_shift - half_bin_width)
-#
-#             erf_plus = get_erf_lut(erf_plus_arg, erf_lut, erf_arg_max)
-#             erf_minus = get_erf_lut(erf_minus_arg, erf_lut, erf_arg_max)
-#
-#             xsec_buffer[thread_id, j] += abs_coef_i * (erf_plus - erf_minus)
-#
-#             # _abs_xsec[j] += abs_coef_i * (
-#             #         math.erf(sqrtln2_on_alpha_i * (wn_shift + half_bin_width))
-#             #         - math.erf(sqrtln2_on_alpha_i * (wn_shift - half_bin_width))
-#             # )
-#     # Accumulate buffers.
-#     _abs_xsec = np.zeros(num_grid, dtype=np.float64)
-#     for k in numba.prange(num_grid):
-#         xsec_point = 0.0
-#         for t in range(numba_num_threads):
-#             xsec_point += xsec_buffer[t, k]
-#         _abs_xsec[k] = xsec_point
-#     return _abs_xsec
 
 
 def abs_emi_xsec(
@@ -1291,7 +1142,7 @@ def _band_profile_binned_voigt_fixed_width(
     bin_edges[-1] = wn_grid[-1] + (wn_grid[-1] - wn_grid[-2]) * 0.5
 
     abs_coef = a_fi * (n_i * g_f / g_i) / (const_8_pi_five_halves_c * bin_width * energy_fi * energy_fi)
-    ste_coef = a_fi * n_f / (const_8_pi_five_halves_c * bin_width  * energy_fi * energy_fi)
+    ste_coef = a_fi * n_f / (const_8_pi_five_halves_c * bin_width * energy_fi * energy_fi)
     spe_coef = n_f * a_fi * energy_fi * const_h_c_on_4_pi_five_halves / bin_width
 
     sigma = energy_fi * const_sqrt_NA_kB_on_c * np.sqrt(temperature / species_mass)
@@ -2047,8 +1898,10 @@ def _compute_control_points_outward(
                     control_points[i, 0, j, k] = 0.5 * (control_0 + control_1)
 
                 # Clamp to non-negative if gamma > 0; sign of gamma*C must be +.
-                if coefficients[i, 3, j, k] > 0 > control_points[i, 0, j, k]:  # TODO: Check gamma index offset.
+                if coefficients[i, 3, j, k] > 0 > control_points[i, 0, j, k]:
+                    # TODO: Check gamma index offset.
                     control_points[i, 0, j, k] = 0.0
+    # End.
 
 
 @numba.njit(parallel=True, cache=True, error_model="numpy")
@@ -2118,9 +1971,10 @@ def _compute_control_points_inward(
                     control_points[i, 1, j, k] = 0.5 * (control_0 + control_1)
 
                 # Clamp to non-negative if gamma > 0; sign of gamma*C must be +.
-                if i > 0 > control_points[i, 1, j, k] and coefficients[
-                    i, 3, j, k] > 0:  # TODO: Check gamma index offset.
+                if i > 0 > control_points[i, 1, j, k] and coefficients[i, 3, j, k] > 0:
+                    # TODO: Check gamma index offset.
                     control_points[i, 1, j, k] = 0
+    # End.
 
 
 # @numba.njit(parallel=True, cache=True, error_model="numpy")
@@ -2258,6 +2112,7 @@ def update_layer_coefficients(
 
 
 ############# END NEW
+# DEPRECATED BELOW:
 @numba.njit(parallel=True, cache=True, error_model="numpy")
 def bezier_coefficients(
         tau_mu_matrix: npt.NDArray[np.float64],
@@ -2303,7 +2158,7 @@ def bezier_coefficients(
 
     denom_delta_tau_sq = np.where(delta_tau_sq == 0, 1, delta_tau_sq)
 
-    # TODO: Change indices on delta_tau_matrix based on direction!
+    # Change indices on delta_tau_matrix based on direction! - Old comment.
     coefficients[:, 1, :, :] = np.where(
         delta_tau_limit_mask,
         # (coefficients[:, 0, :, :] / 3) - (delta_tau_sq / 12) + (delta_tau_cube / 60),  # Explicit Taylor
@@ -2560,14 +2415,18 @@ def incident_srf(
     srf_flux_nu = srf_flux_nu[sort_idx]
 
     srf_flux_interp = np.interp(wn_grid, srf_wn, srf_flux_nu, left=0, right=0) << srf_flux_nu.unit
-    incident_srf_flux = srf_flux_interp * (star_radius / orbital_radius) ** 2
-    return incident_srf_flux.to(srf_flux_nu.unit)
+    # This is F_nu [W/(Hz*m^2)]
+    srf_flux_orbit = srf_flux_interp * (star_radius / orbital_radius) ** 2
+    theta = np.arcsin((star_radius / orbital_radius).decompose().value)
+    omega_star = 2 * np.pi * (1 - np.cos(theta)) * u.sr
+    srf_specific_intensity = (srf_flux_orbit / omega_star).to(u.W / (u.Hz * u.m ** 2 * u.sr))
+    return srf_specific_intensity
 
 
 @numba.njit()
 def calc_einstein_b_fi(a_fi: npt.NDArray[np.float64], energy_fi: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
     """
-    Here the Einstein B coefficient is given in :math:`\text{cm}^3 / (\text{J·s·m})`.
+    Here the Einstein B coefficient is given in :math:`\text{m}^2 / (\text{J·s})`.
 
     .. math::
         B_{fi}=\\frac{A_{fi}}{2hc\\tilde{\\nu}^{3}_{fi}}
@@ -2634,54 +2493,6 @@ def calc_ev_grid(wn_grid: npt.NDArray[np.float64], temperature: npt.NDArray[np.f
     return (const_2_pi_h_c_sq_on_sigma_sba * wn_grid ** 3) / (
             temperature ** 4 * (np.exp(const_h_c_on_kB * wn_grid / temperature) - 1)
     )
-
-
-# def cdf_opacity_sampling(
-#         wn_start: float,
-#         wn_end: float,
-#         temperature_profile: npt.NDArray[np.float64],
-#         num_points: int,
-#         max_step: float = None,
-#         num_cdf_points: int = 1000000,
-# ) -> u.Quantity:
-#     temp_wn_grid = np.linspace(wn_start, wn_end, num_cdf_points)
-#     ev_grid = calc_ev_grid(wn_grid=temp_wn_grid, temperature=np.atleast_1d(temperature_profile)[:, None]).sum(axis=0)
-#     ev_norm = ev_grid / simpson(ev_grid, x=temp_wn_grid)
-#
-#     ev_cdf = cumulative_simpson(ev_norm, x=temp_wn_grid, initial=0)
-#
-#     # sample_idxs = np.searchsorted(ev_cdf, np.linspace(0, 1, num_points))
-#     sample_idxs = np.array(
-#         [
-#             np.argmin(abs(ev_cdf - point)) if point <= ev_cdf[-1] else len(ev_cdf) - 1
-#             for point in np.linspace(0, 1, num_points)
-#         ]
-#     )
-#     sample_idxs = np.unique(sample_idxs)
-#     # Both methods allow for the same wn point to be the closest to multiple values on the CDF, so remove duplicates.
-#     # The argmin approach should be better when using a small number of points but is marginally slower.
-#
-#     if sample_idxs[-1] == len(ev_cdf):
-#         sample_idxs[-1] -= 1
-#     if max_step:
-#         max_idx_step = int(np.ceil(max_step * num_cdf_points / (wn_end - wn_start))) - 1
-#         idx_diffs = np.diff(sample_idxs)
-#         idxs_diffs_over_max = np.nonzero(idx_diffs > max_idx_step)[0]
-#         idxs_diffs_over_max_chunks = np.split(idxs_diffs_over_max, np.where(np.diff(idxs_diffs_over_max) != 1)[0] + 1)
-#         chunk_idx = 0
-#         while chunk_idx < len(idxs_diffs_over_max_chunks):
-#             chunk = idxs_diffs_over_max_chunks[chunk_idx]
-#             end_idx = chunk[-1] + 1 if chunk[-1] + 1 < len(sample_idxs) else chunk[-1]
-#             n_new_points = int(np.ceil((sample_idxs[end_idx] - sample_idxs[chunk[0]]) / max_idx_step)) + 1
-#             insert_vals = np.linspace(sample_idxs[chunk[0]], sample_idxs[end_idx], n_new_points, dtype=int)
-#             sample_idxs = np.concatenate((sample_idxs[: chunk[0]], insert_vals, sample_idxs[chunk[-1] + 2:]))
-#             idxs_diffs_over_max_chunks = list(
-#                 idx_chunk + n_new_points - len(chunk) - 1 for idx_chunk in idxs_diffs_over_max_chunks
-#             )
-#             chunk_idx += 1
-#
-#     sampled_grid = temp_wn_grid[sample_idxs]
-#     return sampled_grid << u.k
 
 
 @numba.njit(cache=True, error_model="numpy", inline="always")
@@ -2758,7 +2569,177 @@ def cdf_opacity_sampling(
     return temp_wn_grid[sample_idxs] / u.cm
 
 
+def formal_solve_general(
+        dtau: u.Quantity,
+        source_function: u.Quantity,
+        mu_values: npt.NDArray[np.float64],
+        mu_weights: npt.NDArray[np.float64],
+        incident_radiation_field: u.Quantity = None,
+        surface_albedo: float = 0
+) -> t.Tuple[u.Quantity, u.Quantity]:
+    """
+    Solve the 1D plane–parallel radiative-transfer equation for a discretized atmosphere using the *formal solution* for
+    each direction cosine :math:`\\mu`.
+
+    This routine computes **upward** and **downward** specific intensities at every layer interface, then integrates
+    over angle to obtain the hemispheric fluxes.
+
+    ----------------------------------------------------------------------
+    RADIATIVE-TRANSFER EQUATION
+    ----------------------------------------------------------------------
+
+    For a ray of direction cosine :math:`\\mu`, the monochromatic radiative-transfer equation in optical depth
+    :math:`\\tau` is
+
+    .. math::
+        \\mu \\frac{\\mathrm{d} I(\\tau,\\mu)}{\\mathrm{d}\\tau} = I(\\tau,\\mu) - S(\\tau),
+
+    where :math:`S(\\tau)` is the source function.
+
+    The *formal solution* between two optical-depth points :math:`\\tau_{k}` and :math:`\\tau_{k+1}` is:
+
+    .. math::
+        I(\\tau_k,\\mu)
+        = I(\\tau_{k+1},\\mu) \\, e^{-\\Delta\\tau/\\lvert\\mu\\rvert}
+        + S_{k} \\,\\left(1 - e^{-\\Delta\\tau/\\lvert\\mu\\rvert}\\right),
+
+    where :math:`\\Delta\\tau = \\tau_{k+1} - \\tau_{k}`.
+
+    This expression is used for **downward** (TOA to BOA) rays with :math:`\\mu > 0` and **upward** (BOA to TOA) rays
+    with :math:`\\mu < 0`.
+
+    ----------------------------------------------------------------------
+    NUMERICAL DISCRETIZATION
+    ----------------------------------------------------------------------
+
+    The atmosphere is divided into :math:`n_{\\mathrm{layers}}` layers. For each wavenumber :math:`\\tilde{\\nu}` the
+    inputs have shapes:
+
+    * :math:`\\Delta\\tau`: ``(n_layers, n_wn)`` optical-depth increment per layer.
+    * ``source_function``: ``(n_layers, n_wn)`` source function at each point.
+    * ``mu_values``: ``(n_mu,)`` direction cosines.
+    * ``mu_weights``: ``(n_mu,)`` quadrature weights.
+
+    Intensities are stored at the **interfaces**, so the output arrays have dimension ``n_layers + 1``.
+
+    ----------------------------------------------------------------------
+    BOUNDARY CONDITIONS
+    ----------------------------------------------------------------------
+
+    * At the top of atmosphere (TOA):
+
+      .. math::
+         I^{-}_{n_{\\mathrm{layers}}}(\\mu>0) = I_{\\mathrm{incident}} \\text{(if given)}.
+
+    * At the bottom of the atmosphere (BOA):
+
+      If no surface reflection is treated explicitly, the upward intensity is set to the source function of the lowest
+      layer:
+
+      .. math::
+         I^{+}_{0}(\\mu<0) = S_{0}.
+
+    ----------------------------------------------------------------------
+    ANGULAR INTEGRATION
+    ----------------------------------------------------------------------
+
+    After computing intensities for each :math:`\\mu`, hemispheric fluxes are computed as:
+
+    .. math::
+        F^{\\pm}(\\tilde{\\nu})
+        = 2\\pi \\sum_{i=1}^{n_{\\mu}} I^{\\pm}_i(\\tilde{\\nu}) \\, w_{i},
+
+    where :math:`w_{i}` are the angular quadrature weights.
+
+    Parameters
+    ----------
+    dtau : Quantity, shape (n_layers, n_wn)
+        Optical-depth increment :math:`\\Delta\\tau_{j}(\\tilde{\\nu})` for each layer :math:`j` and wavenumber
+        :math:`\\tilde{\\nu}`.
+    source_function : Quantity, shape (n_layers, n_wn)
+        Source function :math:`S_{j}(\\tilde{\\nu})` per layer.
+    mu_values : ndarray, shape (n_mu,)
+        Direction cosines :math:`\\mu_{i}`.
+    mu_weights : ndarray, shape (n_mu,)
+        Angular quadrature weights :math:`w_{i}` corresponding to ``mu_values``.
+    incident_radiation_field : Quantity, shape (n_mu, n_wn), optional
+        Downward incident intensity at TOA, :math:`I^{-}(\\tau_{\\mathrm{top}})`; defaults to zero.
+    surface_albedo : float, optional
+        Surface albedo :math:`A \\in [0,1]`. If nonzero, reflection modifies the BOA upward intensity. (Current
+        implementation uses a simplified placeholder.)
+
+    Returns
+    -------
+    i_up : Quantity, shape (n_layers + 1, n_wn)
+        Hemispherically integrated *upward* flux:
+
+        .. math::
+            F^{+}(\\tilde{\\nu}) = 2\\pi \\sum_{i} I^{+}_{i}(\\tilde{\\nu}) w_{i}.
+
+    i_down : Quantity, shape (n_layers + 1, n_wn)
+        Hemispherically integrated *downward* flux:
+
+        .. math::
+            F^{-}(\\tilde{\\nu}) = 2\\pi \\sum_{i} I^{-}_{i}(\\tilde{\\nu}) w_{i}.
+    """
+    if surface_albedo < 0 or surface_albedo > 1:
+        log.warning(f"Surface albedo {surface_albedo} is outside of [0, 1], clipping.")
+        surface_albedo = np.clip(surface_albedo, 0, 1)
+
+    n_layers, n_wavelengths = dtau.shape
+
+    # Compute intensity at interfaces.
+    i_up = np.zeros((len(mu_values), n_layers + 1, n_wavelengths)) * source_function.unit
+    i_down = np.zeros((len(mu_values), n_layers + 1, n_wavelengths)) * source_function.unit
+
+    # Upper boundary condition at the top (level n_layers) is zero, unless incident radiation field!
+    if incident_radiation_field is not None:
+        i_down[:, n_layers, :] = incident_radiation_field
+    else:
+        i_down[:, n_layers, :] = 0.0 * source_function.unit
+
+    # Integrate from TOA (k=n_layers-1) down to BOA (k=0)
+    for k in range(n_layers - 1, -1, -1):
+        delta_tau_mu = dtau[k, :] / np.abs(mu_values[:, None])
+        exp_term = np.exp(-delta_tau_mu)
+        source_contribution = source_function[k, :] * (1 - exp_term)
+
+        # Intensity at the top interface of each layer
+        i_down[:, k, :] = i_down[:, k + 1, :] * exp_term + source_contribution
+
+    # Include an albedo for terrestrial planets?
+    # downward_flux = 2 * np.pi * (i_down[:, 0, :] * mu_values[:, None] * mu_weights[mu_weights > 0, None]).sum(axis=0)
+    # Reflected intensity is diffuse (same in all directions)
+    # reflected_intensity = surface_albedo * downward_flux / np.pi
+
+    # bb = blackbody(...)
+    # thermal_emission = bb(dtau.shape[1] * u.nm) # Wavelength version?
+    # thermal_emission = source_function[-1] * surface_emissivity # Placeholder for scaling?
+    # surface_emission = thermal_emission + reflected_intensity
+    surface_emission = source_function[0, :]  # USE THIS IN PROD!
+
+    # Lower boundary source function (black body) is surface upwards emission.
+    i_up[:, 0, :] = surface_emission
+
+    # Integrate from BOA (k=0) to TOA (k=n_layers-1)
+    for k in range(n_layers):
+        delta_tau_mu = dtau[k, :] / mu_values[:, None]
+        exp_term = np.exp(-delta_tau_mu)
+        source_contribution = source_function[None, k, :] * (1 - exp_term)
+
+        # Intensity at the top of the layer (level k+1)
+        i_up[:, k + 1, :] = i_up[:, k, :] * exp_term + source_contribution
+
+    i_up = 2 * np.pi * u.sr * np.sum(i_up * mu_weights[:, None, None], axis=0)
+    i_down = 2 * np.pi * u.sr * np.sum(i_down * mu_weights[:, None, None], axis=0)
+
+    return i_up, i_down
+
+
 class NLTEWorkflow(abc.ABC):
+    # In theory NLTEProcessor can implement a generic NLTEWorkflow field that calls the workflow method. The current 
+    # implementation hard-cords the Gauss-Seidel workflow, but it may be useful to be able to switch between that and
+    # MALI without having to restructure the whole main workflow.
     @abc.abstractmethod
     def workflow(self) -> t.Any:
         pass
@@ -2767,4 +2748,12 @@ class NLTEWorkflow(abc.ABC):
 class GaussSeidelWorkflow(NLTEWorkflow):
 
     def workflow(self):
+        # Implement current workflow from compute_opacities_profile().
+        pass
+
+
+class MALIWorkflow(NLTEWorkflow):
+
+    def workflow(self):
+        # Implement MALI layer step through, intensity and Lambda calculations.
         pass
