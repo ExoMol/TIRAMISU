@@ -22,6 +22,7 @@ file_formatter = logging.Formatter("%(asctime)s [%(threadName)-12.12s] [%(leveln
 file_handler.setFormatter(file_formatter)
 log.addHandler(file_handler)
 
+# TODO: Should probably wrap this in a main check so it doesn't get spammed in ProcessPool instances.
 log.info(f"Writing outputs to {output_dir}.")
 
 _DEFAULT_NUM_THREADS = 20

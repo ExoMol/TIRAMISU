@@ -1,4 +1,5 @@
 import abc
+import functools
 import pathlib
 import typing as t
 import numpy.typing as npt
@@ -152,9 +153,9 @@ def _sum_profiles(group: pl.DataFrame) -> pl.DataFrame:
 @numba.njit(parallel=True, cache=True, error_model="numpy")
 def _build_xsec(
         profiles: npt.NDArray[np.float64],
-        offsets: npt.NDArray[int],
-        start_idxs: npt.NDArray[int],
-        key_idx_array: npt.NDArray[int],
+        offsets: npt.NDArray[np.int64],
+        start_idxs: npt.NDArray[np.int64],
+        key_idx_array: npt.NDArray[np.int64],
         pop_matrix: npt.NDArray[np.float64],
         wn_grid_len: int,
         is_abs: bool,
@@ -221,15 +222,91 @@ def _build_xsec(
     return xsec_out
 
 
+@numba.njit(cache=True, error_model="numpy")
+def _rebuild_ox_profile(
+        upper_state_id: int,
+        key_idx_map: npt.NDArray[np.int64],
+        profiles: npt.NDArray[np.float64],
+        offsets: npt.NDArray[np.int64],
+        start_idxs: npt.NDArray[np.int64],
+        num_grid: int
+) -> npt.NDArray[np.float64]:
+    """
+    Rebuild the full spontaneous emission profile from upper state o_idx to any lower state.
+
+    Parameters
+    ----------
+    upper_state_id
+    key_idx_map
+    profiles
+    offsets
+    start_idxs
+    num_grid
+
+    Returns
+    -------
+
+    """
+    full_profile = np.zeros(num_grid, dtype=np.float64)
+
+    num_profiles = key_idx_map.shape[0]
+    for idx in range(num_profiles):
+        if key_idx_map[idx, 0] == upper_state_id:
+            offset_start = offsets[idx]
+            offset_end = offsets[idx + 1]
+            wn_start = start_idxs[idx]
+
+            profile_len = offset_end - offset_start
+            wn_end = min(wn_start + profile_len, num_grid)
+
+            # Add contribution
+            for j in range(wn_end - wn_start):
+                full_profile[wn_start + j] += profiles[offset_start + j]
+
+    return full_profile
+
+
+@numba.njit(parallel=True, cache=True, error_model="numpy")
+def _compute_all_cross_terms_vectorized(
+        emission_profiles: npt.NDArray[np.float64],
+        pop_matrix: npt.NDArray[np.float64],
+        chem_factor: float,
+) -> npt.NDArray[np.float64]:
+    """
+
+    Parameters
+    ----------
+    emission_profiles
+    pop_matrix
+    chem_factor
+
+    Returns
+    -------
+
+    """
+    n_agg_states, num_grid = emission_profiles.shape
+    result = np.zeros((n_agg_states, num_grid), dtype=np.float64)
+
+    for o_idx in numba.prange(n_agg_states):
+        if pop_matrix[o_idx] != 0.0:
+            pop_chem_factor = pop_matrix[o_idx] * chem_factor
+            for wn_idx in range(num_grid):
+                result[o_idx, wn_idx] = (
+                        emission_profiles[o_idx, wn_idx] * pop_chem_factor
+                )
+
+    return result
+
+
 class CompactProfile:
     __slots__ = ["temporary_profiles", "profiles", "offsets", "start_idxs", "key_idx_map", "key_lookup"]
 
     def __init__(self):
         self.temporary_profiles: pl.DataFrame | None = None
         self.profiles: npt.NDArray[np.float64] | None = None
-        self.offsets: npt.NDArray[int] | None = None
-        self.start_idxs: npt.NDArray[int] | None = None
-        self.key_idx_map: npt.NDArray[int] | None = None
+        self.offsets: npt.NDArray[np.int64] | None = None
+        self.start_idxs: npt.NDArray[np.int64] | None = None
+        self.key_idx_map: npt.NDArray[np.int64] | None = None
         self.key_lookup: t.Dict[t.Tuple[int, int] | int, int] = {}
 
     def add_batch(self, batch: pl.DataFrame) -> None:
@@ -351,6 +428,18 @@ class CompactProfile:
             profiles, offsets, start_idxs, key_idx_map, pop_matrix, wn_grid.shape[0], is_abs
         )
 
+    def get_emission_from_upper(
+            self, upper_state_id: int, num_grid: int
+    ) -> npt.NDArray[np.float64]:
+        return _rebuild_ox_profile(
+            upper_state_id=upper_state_id,
+            key_idx_map=self.key_idx_map,
+            profiles=self.profiles,
+            offsets=self.offsets,
+            start_idxs=self.start_idxs,
+            num_grid=num_grid,
+        )
+
 
 class ProfileStore:
     """
@@ -399,6 +488,7 @@ class ProfileStore:
             self.spe_profiles[layer_idx].get_profile(key),
         )
 
+    @functools.lru_cache(maxsize=1000)
     def get_profile(self, layer_idx: int, key: t.Tuple[int, int], profile_type: str) -> t.Tuple[npt.NDArray, int]:
         if profile_type == "abs":
             return self.abs_profiles[layer_idx].get_profile(key)
@@ -416,6 +506,31 @@ class ProfileStore:
         ste_profile = self.ste_profiles[layer_idx].build_xsec(pop_matrix=pop_matrix, wn_grid=wn_grid, is_abs=False)
         spe_profile = self.spe_profiles[layer_idx].build_xsec(pop_matrix=pop_matrix, wn_grid=wn_grid, is_abs=False)
         return abs_profile - ste_profile, spe_profile
+
+    def precompute_all_emission_profiles(
+            self, layer_idx: int, n_agg_states: int, num_grid: int
+    ) -> npt.NDArray[np.float64]:
+        """
+        Precompute total spontaneous emission profiles for all states.
+
+        Parameters
+        ----------
+        layer_idx
+        n_agg_states
+        num_grid
+
+        Returns
+        -------
+
+        """
+        all_profiles = np.zeros((n_agg_states, num_grid), dtype=np.float64)
+
+        for o_idx in range(n_agg_states):
+            all_profiles[o_idx] = self.spe_profiles[layer_idx].get_emission_from_upper(
+                upper_state_id=o_idx, num_grid=num_grid,
+            )
+
+        return all_profiles
 
 
 class ContinuumProfileStore:
@@ -455,6 +570,7 @@ class ContinuumProfileStore:
             # self.ste_profiles[layer_idx].finalise()
             # self.spe_profiles[layer_idx].finalise()
 
+    @functools.lru_cache(maxsize=1000)
     def get_profile(self, layer_idx: int, key: int, profile_type: str) -> t.Tuple[npt.NDArray, int]:
         if type(key) is int:
             get_key = (-1, key)
@@ -1978,10 +2094,10 @@ def _compute_control_points_inward(
 
 
 # @numba.njit(parallel=True, cache=True, error_model="numpy")
-def bezier_coefficients_new(
+def bezier_coefficients(
         tau_mu_matrix: npt.NDArray[np.float64],
         source_function_matrix: u.Quantity,
-) -> t.Tuple[npt.NDArray[np.float64], u.Quantity]:
+) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
     """
     Computes the Bézier coefficients and control points used for interpolation.
 
@@ -2036,10 +2152,20 @@ def bezier_coefficients_new(
     )
 
     # Compute control points
-    _compute_control_points_outward(tau_mu_matrix, source_func_mu, control_points, coefficients)
-    _compute_control_points_inward(tau_mu_matrix, source_func_mu, control_points, coefficients)
+    _compute_control_points_outward(
+        tau_mu_matrix=tau_mu_matrix,
+        source_func_mu=source_func_mu,
+        control_points=control_points,
+        coefficients=coefficients
+    )
+    _compute_control_points_inward(
+        tau_mu_matrix=tau_mu_matrix,
+        source_func_mu=source_func_mu,
+        control_points=control_points,
+        coefficients=coefficients
+    )
 
-    return coefficients, control_points * source_function_matrix.unit
+    return coefficients, control_points
 
 
 @numba.njit(parallel=True, cache=True, error_model="numpy")
@@ -2101,12 +2227,12 @@ def update_layer_coefficients(
     i_high = min(max_update_idx + 1, n_layers - 1)
 
     _compute_control_points_outward(
-        tau_mu_matrix, source_func_mu, coefficients, control_points,
-        start=i_low, end=i_high
+        tau_mu_matrix=tau_mu_matrix, source_func_mu=source_func_mu, control_points=control_points,
+        coefficients=coefficients, start=i_low, end=i_high,
     )
     _compute_control_points_inward(
-        tau_mu_matrix, source_func_mu, coefficients, control_points,
-        start=i_low, end=i_high
+        tau_mu_matrix=tau_mu_matrix, source_func_mu=source_func_mu, control_points=control_points,
+        coefficients=coefficients, start=i_low, end=i_high,
     )
     # Done.
 
@@ -2114,7 +2240,7 @@ def update_layer_coefficients(
 ############# END NEW
 # DEPRECATED BELOW:
 @numba.njit(parallel=True, cache=True, error_model="numpy")
-def bezier_coefficients(
+def bezier_coefficients_old(
         tau_mu_matrix: npt.NDArray[np.float64],
         source_function_matrix: npt.NDArray[np.float64],
 ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
@@ -2757,3 +2883,76 @@ class MALIWorkflow(NLTEWorkflow):
     def workflow(self):
         # Implement MALI layer step through, intensity and Lambda calculations.
         pass
+
+
+@numba.njit(cache=True, error_model="numpy")
+def simpson_integral_numba(y_data: npt.NDArray[np.float64], x_data: npt.NDArray[np.float64]) -> float:
+    """
+    Fast Simpson's rule integration using numba.
+    Assumes evenly or unevenly spaced x values.
+    """
+    n_points = len(y_data)
+    if n_points < 2:
+        return 0.0
+
+    if n_points == 2:
+        # Trapezoidal for 2 points
+        return 0.5 * (y_data[0] + y_data[1]) * (x_data[1] - x_data[0])
+
+    # Simpson's 1/3 rule
+    h = x_data[1:] - x_data[:-1]
+    result = 0.0
+
+    for i in range(0, n_points - 2, 2):
+        # Simpson's rule for each pair of intervals
+        h0 = h[i]
+        h1 = h[i + 1]
+
+        if abs(h0 - h1) < 1e-10:  # Uniform spacing
+            result += (h0 / 3.0) * (y_data[i] + 4 * y_data[i + 1] + y_data[i + 2])
+        else:  # Non-uniform spacing
+            alpha = (2 * h0 ** 2 + 2 * h0 * h1 - h1 ** 2) / (6 * h0)
+            beta = (h0 ** 2 + h0 * h1) / (3 * h1)
+            result += alpha * y_data[i] + beta * y_data[i + 1] + (h0 + h1 - alpha - beta) * y_data[i + 2]
+
+    # Handle last interval if odd number of points (use trapezoidal)
+    if n_points % 2 == 0:
+        result += 0.5 * (y_data[n_points - 2] + y_data[n_points - 1]) * h[n_points - 2]
+
+    return result
+
+
+@numba.njit(parallel=True, cache=True, error_model="numpy")
+def simpson_integral_2d(
+        y_data: npt.NDArray[np.float64],
+        x_data: npt.NDArray[np.float64],
+) -> npt.NDArray[np.float64]:
+    """
+    Vectorized Simpson integration over axis 1.
+    Each row is integrated independently.
+    """
+    num_rows, num_grid = y_data.shape
+    result = np.zeros(num_rows, dtype=np.float64)
+
+    if num_grid < 2:
+        return result
+
+    for row in numba.prange(num_rows):
+        result[row] = simpson_integral_numba(y_data[row], x_data)
+
+    return result
+
+
+def simpson_quantity(y_data: u.Quantity, x_data: u.Quantity) -> u.Quantity:
+    """Simpson integration preserving units."""
+    result = simpson_integral_numba(y_data.value, x_data.value)
+    return result * (y_data.unit * x_data.unit)
+
+
+def simpson_quantity_2d(
+    y_data: u.Quantity,
+    x_data: u.Quantity,
+) -> u.Quantity:
+    """Vectorized Simpson integration preserving units."""
+    result = simpson_integral_2d(y_data.value, x_data.value)
+    return result << (y_data.unit * x_data.unit)

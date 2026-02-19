@@ -28,21 +28,22 @@ from .nlte import (
     abs_emi_xsec,
     calc_band_profile,
     blackbody,
-    bezier_coefficients,
+    bezier_coefficients_old,
     continuum_xsec,
     effective_source_tau_mu,
     ProfileStore,
     calc_cont_band_profile,
     ContinuumProfileStore,
-    bezier_coefficients_new,
+    bezier_coefficients,
     update_layer_coefficients,
-    formal_solve_general,
+    formal_solve_general, simpson_quantity, _compute_all_cross_terms_vectorized, simpson_quantity_2d,
 )
 from .config import log, output_dir, _DEFAULT_NUM_THREADS
 
 # Units
 einstein_a_unit = 1 / u.s
 einstein_b_unit = (u.m ** 2) / (u.J * u.s)
+source_func_unit = u.J / (u.sr * u.m ** 2)
 
 
 def rebin_spectrum(
@@ -693,6 +694,7 @@ class NLTEProcessor:
             spectral_grid=wn_grid, temperature=temperature_profile
         )
         self.mol_eta_matrix = lte_source_func_matrix * self.mol_chi_matrix * ac.c
+        # TODO: Implement debug_pop_matrix here!
 
     def approximate_t_ex(self, i_mean: u.Quantity, density_profile: u.Quantity, temperature_profile: u.Quantity,
                          wn_grid: u.Quantity, ) -> u.Quantity:
@@ -732,7 +734,7 @@ class NLTEProcessor:
         ac_h_c_on_kB = ac.h * ac.c.cgs / ac.k_B
 
         c_if = c_fi * np.exp(-(ac_h_c_on_kB * energy_dif_approx) / temperature_profile)
-        log.debug(f"C_if = {c_if}, C_fi = {c_fi}, V_if = {v_if_rate}, V_fi = {v_fi_rate}, A_fi = {a_fi_approx}")
+        # log.debug(f"C_if = {c_if}, C_fi = {c_fi}, V_if = {v_if_rate}, V_fi = {v_fi_rate}, A_fi = {a_fi_approx}")
         n_ratio = (c_if + v_if_rate) / (c_fi + a_fi_approx + v_fi_rate)
         t_ex_profile = (ac_h_c_on_kB * energy_dif_approx / np.log(1 / n_ratio)).to(u.K)
 
@@ -801,6 +803,70 @@ class NLTEProcessor:
         log.info(f"{self.species}: Approximate T_ex pops. = {t_ex_pop_grid[0]}")
         return t_ex_profile
 
+    def precompute_all_cross_terms(
+            self,
+            layer_idx: int,
+            nlte_layer_idx: int,
+            chem_profile: ChemicalProfile,
+            num_grid: int,
+    ) -> npt.NDArray[np.float64]:
+        """
+        Pre-compute a_ox_cross for ALL o_idx values.
+
+        This is called ONCE per build_y_matrix call, avoiding recomputation
+        in the nested loops.
+
+        Returns:
+            dict mapping o_idx -> a_ox_cross array
+        """
+        emission_profiles = self.profile_store.precompute_all_emission_profiles(
+            layer_idx=nlte_layer_idx,
+            n_agg_states=self.n_agg_states,
+            num_grid=num_grid,
+        )
+
+        chem_factor = chem_profile[self.species][layer_idx] * u.erg * u.cm / (u.s * u.sr * ac.c.cgs)
+
+        a_ox_cross_cache = _compute_all_cross_terms_vectorized(
+            emission_profiles=emission_profiles,
+            pop_matrix=self.pop_matrix[-1, layer_idx, :],
+            chem_factor=chem_factor,
+        )
+
+        # a_ox_cross_cache = {}
+        #
+        # for o_idx in range(self.n_agg_states):
+        #     o_pop = self.pop_matrix[-1, layer_idx, o_idx]
+        #
+        #     if o_pop == 0:
+        #         a_ox_cross_cache[o_idx] = np.zeros(num_grid) << u.erg / u.sr
+        #         continue
+        #
+        #     # Compute a_ox_cross for this o_idx
+        #     a_ox_cross = np.zeros(num_grid) << u.erg / u.sr
+        #
+        #     # Get all transitions FROM state o_idx
+        #     for ox_trans in self.rates_grid.filter(pl.col("id_agg_f") == o_idx).iter_rows(named=False):
+        #         ox_emi_profile, ox_emi_start_idx = self.profile_store.get_profile(
+        #             layer_idx=nlte_layer_idx,
+        #             key=(ox_trans[0], ox_trans[1]),
+        #             profile_type="spe"
+        #         )
+        #         ox_emi_profile = ox_emi_profile * o_pop
+        #
+        #         ox_emi_end_idx = ox_emi_start_idx + len(ox_emi_profile)
+        #         a_ox_cross[ox_emi_start_idx:ox_emi_end_idx] += (
+        #                 ox_emi_profile
+        #                 * u.erg
+        #                 * u.cm
+        #                 * chem_profile[self.species][layer_idx]
+        #                 / (u.s * u.sr * ac.c.cgs)
+        #         )
+        #
+        #     a_ox_cross_cache[o_idx] = a_ox_cross
+
+        return a_ox_cross_cache << chem_factor.unit
+
     def build_y_matrix(
             self,
             layer_idx: int,
@@ -818,23 +884,42 @@ class NLTEProcessor:
         """
         Build statistical equilibrium matrix.
         """
+        num_grid = wn_grid.shape[0]
         species_eta = chem_profile[self.species][layer_idx] * self.mol_eta_matrix[layer_idx] / ac.c
         global_chi = global_chi_matrix[layer_idx]  # / density_profile[layer_idx]
-        psi_approx_eta = np.zeros(lambda_layer_grid.shape[0]) << global_source_func_matrix.unit
-        psi_approx_eta[global_chi != 0] = (
-                lambda_layer_grid[global_chi != 0] * species_eta[global_chi != 0] / global_chi[global_chi != 0]
+        chi_mask = global_chi != 0
+        psi_approx_eta = np.zeros(num_grid) << global_source_func_matrix.unit
+        psi_approx_eta[chi_mask] = (
+                lambda_layer_grid[chi_mask] * species_eta[chi_mask] / global_chi[chi_mask]
         )
         psi_approx_eta = np.clip(abs(psi_approx_eta), 0, i_layer_grid)
         i_prec: u.Quantity = (i_layer_grid - psi_approx_eta) * 4 * np.pi * u.sr
 
         y_matrix = np.zeros((self.n_agg_states, self.n_agg_states), dtype=np.float64) << (1 / u.s)
-        rhs_matrix = np.zeros(self.n_agg_states, dtype=np.float64)
+        rhs_matrix = np.zeros(self.n_agg_states, dtype=np.float64) << (1 / u.s)
+        rates_start = time.perf_counter()
+
+        psi_approx_cross = np.empty([])
+        if full_prec:
+            a_ox_cross_cache = self.precompute_all_cross_terms(
+                layer_idx=layer_idx,
+                nlte_layer_idx=nlte_layer_idx,
+                chem_profile=chem_profile,
+                num_grid=num_grid,
+            )
+            psi_approx_cross = np.zeros((self.n_agg_states, num_grid),
+                                        dtype=np.float64) << a_ox_cross_cache.unit / global_chi.unit
+            shielded_lambda = np.clip(lambda_layer_grid, 0, 1)
+            psi_approx_cross[:, chi_mask] = (
+                    shielded_lambda[chi_mask] * a_ox_cross_cache[:, chi_mask] / global_chi[chi_mask]
+            ).to(u.J / (u.m ** 2 * u.sr), equivalencies=u.spectral())
+
         for trans_row in self.rates_grid.iter_rows(named=False):
             # 0 = id_agg_f, 1 = id_agg_i, 2 = A_fi, 3 = B_fi, 4 = B_if.
             a_fi = trans_row[2] * einstein_a_unit
             b_fi = trans_row[3] * einstein_b_unit
             b_if = trans_row[4] * einstein_b_unit
-            log.info(f"[L{layer_idx}] Trans: {trans_row}.")
+            # log.info(f"[L{layer_idx}] Trans: {trans_row}.")
 
             if trans_row[0] > self.id_agg_cutoff and trans_row[1] > self.id_agg_cutoff:
                 # Short-circuit for bands between states above cutoff; these pops are fixed.
@@ -857,16 +942,22 @@ class NLTEProcessor:
             abs_end_idx = abs_start_idx + len(abs_profile)
             ste_end_idx = ste_start_idx + len(ste_profile)
 
+            # abs_profile_norm = abs_profile / (
+            #         simpson(abs_profile, x=wn_grid[abs_start_idx:abs_end_idx]) * abs_profile.unit * wn_grid.unit
+            # )
             abs_profile_norm = abs_profile / (
-                    simpson(abs_profile, x=wn_grid[abs_start_idx:abs_end_idx]) * abs_profile.unit * wn_grid.unit
+                simpson_quantity(y_data=abs_profile, x_data=wn_grid[abs_start_idx:abs_end_idx])
             )
+            # ste_profile_norm = ste_profile / (
+            #         simpson(ste_profile, x=wn_grid[ste_start_idx:ste_end_idx]) * ste_profile.unit * wn_grid.unit
+            # )
             ste_profile_norm = ste_profile / (
-                    simpson(ste_profile, x=wn_grid[ste_start_idx:ste_end_idx]) * ste_profile.unit * wn_grid.unit
+                simpson_quantity(y_data=ste_profile, x_data=wn_grid[ste_start_idx:ste_end_idx])
             )
 
             u_fi = a_fi
             u_fi = u_fi.decompose()
-            log.debug(f"[L{layer_idx}] U_{trans_row[0], trans_row[1]} = {u_fi}")
+            # log.debug(f"[L{layer_idx}] U_{trans_row[0], trans_row[1]} = {u_fi}")
 
             # stim_emi_profile = (
             #         emi_profile.profile
@@ -880,7 +971,7 @@ class NLTEProcessor:
             # )
 
             # Cross terms:
-            chi_if = np.zeros(lambda_layer_grid.shape[0]) << (abs_profile_norm.unit * b_if.unit)
+            chi_if = np.zeros(num_grid) << (abs_profile_norm.unit * b_if.unit)
             chi_if[abs_start_idx: abs_end_idx] += (
                     self.pop_matrix[-1, layer_idx, trans_row[1]]
                     * abs_profile_norm
@@ -894,85 +985,125 @@ class NLTEProcessor:
             chi_if *= chem_profile[self.species][layer_idx]
             chi_if = np.where(chi_if < 0, 0, chi_if)
             if full_prec:
-                for o_idx in np.arange(0, self.n_agg_states):
-                    a_ox_cross = np.zeros(lambda_layer_grid.shape[0]) << u.erg / u.sr
-                    for ox_trans in self.rates_grid.filter(pl.col("id_agg_f") == o_idx).iter_rows(named=False):
-                        # ox_emi_profile = self.emi_profile_grid[nlte_layer_idx].get((ox_trans[0], ox_trans[1]))
-                        ox_emi_profile, ox_emi_start_idx = self.profile_store.get_profile(
-                            layer_idx=nlte_layer_idx, key=(ox_trans[0], ox_trans[1]), profile_type="spe"
-                        )
-                        o_pop = self.pop_matrix[-1, layer_idx, ox_trans[0]]
-                        if o_pop == 0:
-                            continue
-                        ox_emi_profile = ox_emi_profile * o_pop
+                psi_approx_cross_if = np.abs(chi_if[None, :] * psi_approx_cross) * 4 * np.pi * u.sr
+                psi_integrals = simpson_quantity_2d(y_data=psi_approx_cross_if, x_data=wn_grid).decompose()
 
-                        ox_emi_end_idx = ox_emi_start_idx + len(ox_emi_profile)
-                        a_ox_cross[ox_emi_start_idx: ox_emi_end_idx] += (
-                                ox_emi_profile  # Absolute value, not normalised.
-                                * u.erg
-                                * u.cm
-                                * chem_profile[self.species][layer_idx]
-                                / (u.s * u.sr * ac.c.cgs)
-                        )
-                    if np.all(a_ox_cross == 0):
-                        continue
+                o_pops = self.pop_matrix[-1, layer_idx, :]
 
-                    psi_approx_cross = np.zeros(lambda_layer_grid.shape[0]) << a_ox_cross.unit / global_chi.unit
-                    shielded_lambda = np.clip(lambda_layer_grid, 0, 1)
-                    psi_approx_cross[global_chi != 0] = (
-                            shielded_lambda[global_chi != 0]
-                            * a_ox_cross[global_chi != 0]
-                            / global_chi[global_chi != 0]
-                    ).to(u.J / (u.m ** 2 * u.sr), equivalencies=u.spectral())
+                below_cutoff = np.arange(self.n_agg_states) <= self.id_agg_cutoff
+                nonzero_integral_mask = psi_integrals.value != 0
+                nonzero_pop_mask = o_pops != 0
 
-                    psi_approx_cross = abs(chi_if * psi_approx_cross) * 4 * np.pi * u.sr
-                    psi_approx_cross = (
-                            simpson(psi_approx_cross, x=wn_grid) << (psi_approx_cross.unit * wn_grid.unit)
-                    ).decompose()
-                    if trans_row[1] <= self.id_agg_cutoff:
-                        y_matrix[trans_row[1], o_idx] -= psi_approx_cross
-                    if trans_row[0] <= self.id_agg_cutoff:
-                        y_matrix[trans_row[0], o_idx] += psi_approx_cross
-                    log.debug(
-                        (
-                            f"[L{layer_idx}] Chi_{trans_row[0], trans_row[1]}"
-                            f"Psi*[Sum_(j<{o_idx}) A_({o_idx}, j)] = {-psi_approx_cross}"
-                        )
-                    )
-                    log.debug(
-                        (
-                            f"[L{layer_idx}] Chi_{trans_row[1], trans_row[0]}"
-                            f"Psi*[Sum_(j<{o_idx}) A_({o_idx}, j)] = {psi_approx_cross}"
-                        )
-                    )
+                # If below cutoff, update Y-row elements where integrals aare non-zero.
+                below_mask = below_cutoff & nonzero_integral_mask
+                # If above cutoff, update Y-row elements with sum of where integrals and fixed pop factor are non-zero.
+                above_mask = ~below_cutoff & nonzero_integral_mask & nonzero_pop_mask
+
+                if trans_row[1] <= self.id_agg_cutoff:
+                    rhs_matrix[trans_row[1]] += np.sum(psi_integrals[above_mask] * o_pops[above_mask])
+                    y_matrix[trans_row[1], below_mask] -= psi_integrals[below_mask]
+
+                if trans_row[0] <= self.id_agg_cutoff:
+                    rhs_matrix[trans_row[0]] -= np.sum(psi_integrals[above_mask] * o_pops[above_mask])
+                    y_matrix[trans_row[0], below_mask] += psi_integrals[below_mask]
+                # for o_idx in np.arange(0, self.n_agg_states, dtype=int):
+                #     o_pop = self.pop_matrix[-1, layer_idx, o_idx]
+                #     if o_pop == 0:
+                #         continue
+                #     # a_ox_cross = np.zeros(lambda_layer_grid.shape[0]) << u.erg / u.sr
+                #     # for ox_trans in self.rates_grid.filter(pl.col("id_agg_f") == o_idx).iter_rows(named=False):
+                #     #     ox_emi_profile, ox_emi_start_idx = self.profile_store.get_profile(
+                #     #         layer_idx=nlte_layer_idx, key=(ox_trans[0], ox_trans[1]), profile_type="spe"
+                #     #     )
+                #     #     ox_emi_profile = ox_emi_profile * o_pop
+                #     #
+                #     #     ox_emi_end_idx = ox_emi_start_idx + len(ox_emi_profile)
+                #     #     a_ox_cross[ox_emi_start_idx: ox_emi_end_idx] += (
+                #     #             ox_emi_profile  # Absolute value, not normalised.
+                #     #             * u.erg
+                #     #             * u.cm
+                #     #             * chem_profile[self.species][layer_idx]
+                #     #             / (u.s * u.sr * ac.c.cgs)
+                #     #     )
+                #     a_ox_cross = a_ox_cross_cache[o_idx]
+                #
+                #     if np.all(a_ox_cross == 0):
+                #         # Why would this ever happen?
+                #         continue
+                #
+                #     psi_approx_cross = np.zeros(num_grid) << a_ox_cross.unit / global_chi.unit
+                #     shielded_lambda = np.clip(lambda_layer_grid, 0, 1)
+                #     psi_approx_cross[global_chi != 0] = (
+                #             shielded_lambda[global_chi != 0]
+                #             * a_ox_cross[global_chi != 0]
+                #             / global_chi[global_chi != 0]
+                #     ).to(u.J / (u.m ** 2 * u.sr), equivalencies=u.spectral())
+                #
+                #     psi_approx_cross = abs(chi_if * psi_approx_cross) * 4 * np.pi * u.sr
+                #     # psi_approx_cross = (
+                #     #         simpson(psi_approx_cross, x=wn_grid) << (psi_approx_cross.unit * wn_grid.unit)
+                #     # ).decompose()
+                #     psi_approx_cross = simpson_quantity(y_data=psi_approx_cross, x_data=wn_grid).decompose()
+                #
+                #     if trans_row[1] <= self.id_agg_cutoff:
+                #         if o_idx > self.id_agg_cutoff:
+                #             rhs_matrix[trans_row[1]] += psi_approx_cross * o_pop
+                #         else:
+                #             y_matrix[trans_row[1], o_idx] -= psi_approx_cross
+                #     if trans_row[0] <= self.id_agg_cutoff:
+                #         if o_idx > self.id_agg_cutoff:
+                #             rhs_matrix[trans_row[0]] -= psi_approx_cross * o_pop
+                #         else:
+                #             y_matrix[trans_row[0], o_idx] += psi_approx_cross
+                #     # log.debug(
+                #     #     (
+                #     #         f"[L{layer_idx}] Chi_{trans_row[0], trans_row[1]}"
+                #     #         f"Psi*[Sum_(j<{o_idx}) A_({o_idx}, j)] = {-psi_approx_cross}"
+                #     #     )
+                #     # )
+                #     # log.debug(
+                #     #     (
+                #     #         f"[L{layer_idx}] Chi_{trans_row[1], trans_row[0]}"
+                #     #         f"Psi*[Sum_(j<{o_idx}) A_({o_idx}, j)] = {psi_approx_cross}"
+                #     #     )
+                #     # )
             else:
-                self_prec = np.zeros(lambda_layer_grid.shape[0])
+                self_prec = np.zeros(lambda_layer_grid.shape[0]) << u.cm
                 self_prec[global_chi != 0] = (
                         lambda_layer_grid[global_chi != 0]
                         * chi_if[global_chi != 0]
-                        * chem_profile[self.species][layer_idx]
+                        # * chem_profile[self.species][layer_idx]  # baked in to chi_if already.
                         * ac.h
                         / global_chi[global_chi != 0].to(u.m ** 2, equivalencies=u.spectral())
                 )
-                self_prec = simpson(self_prec, x=wn_grid) << (self_prec.unit * wn_grid.unit)
+                # self_prec = simpson(self_prec, x=wn_grid) << (self_prec.unit * wn_grid.unit)
+                self_prec = simpson_quantity(y_data=self_prec, x_data=wn_grid)
                 u_fi *= 1 - self_prec
             # End cross.
 
-            v_fi_prec = ste_profile_norm * i_prec[ste_start_idx: ste_end_idx]
-            v_fi_prec = (
-                                simpson(v_fi_prec, x=wn_grid[ste_start_idx: ste_end_idx]) << (
-                                v_fi_prec.unit * wn_grid.unit)
-                        ) * b_fi
+            # v_fi_prec = ste_profile_norm * i_prec[ste_start_idx: ste_end_idx]
+            # v_fi_prec = (
+            #                     simpson(v_fi_prec, x=wn_grid[ste_start_idx: ste_end_idx]) << (
+            #                     v_fi_prec.unit * wn_grid.unit)
+            #             ) * b_fi
+            v_fi_prec = simpson_quantity(
+                y_data=ste_profile_norm * i_prec[ste_start_idx: ste_end_idx],
+                x_data=wn_grid[ste_start_idx: ste_end_idx]
+            ) * b_fi
             v_fi_prec = v_fi_prec.decompose()
-            log.debug(f"[L{layer_idx}] V_{trans_row[0], trans_row[1]}_prec = {v_fi_prec}")
+            # log.debug(f"[L{layer_idx}] V_{trans_row[0], trans_row[1]}_prec = {v_fi_prec}")
 
-            v_if_prec = abs_profile_norm * i_prec[abs_start_idx: abs_end_idx]
-            v_if_prec = (
-                                simpson(v_if_prec, x=wn_grid[abs_start_idx: abs_end_idx]) << (
-                                v_if_prec.unit * wn_grid.unit)
-                        ) * b_if
+            # v_if_prec = abs_profile_norm * i_prec[abs_start_idx: abs_end_idx]
+            # v_if_prec = (
+            #                     simpson(v_if_prec, x=wn_grid[abs_start_idx: abs_end_idx]) << (
+            #                     v_if_prec.unit * wn_grid.unit)
+            #             ) * b_if
+            v_if_prec = simpson_quantity(
+                y_data=abs_profile_norm * i_prec[abs_start_idx: abs_end_idx],
+                x_data=wn_grid[abs_start_idx: abs_end_idx]
+            ) * b_if
             v_if_prec = v_if_prec.decompose()
-            log.debug(f"[L{layer_idx}] V_{trans_row[1], trans_row[0]}_prec = {v_if_prec}")
+            # log.debug(f"[L{layer_idx}] V_{trans_row[1], trans_row[0]}_prec = {v_if_prec}")
 
             # y_matrix[trans_row[0], trans_row[1]] += v_if_prec
             # y_matrix[trans_row[1], trans_row[0]] += u_fi + v_fi_prec
@@ -985,23 +1116,27 @@ class NLTEProcessor:
                 y_matrix[trans_row[1], trans_row[1]] -= v_if_prec
             elif trans_row[0] > self.id_agg_cutoff:
                 # ID_u above cutoff.
-                rhs_matrix[trans_row[1]] -= u_fi + v_fi_prec  # Move fixed y_matrix[trans_row[1], trans_row[0]] to RHS.
+                # Move fixed y_matrix[trans_row[1], trans_row[0]] to RHS, include fixed trans_row[0] pop.
+                rhs_matrix[trans_row[1]] -= (u_fi + v_fi_prec) * self.pop_matrix[-1, layer_idx, trans_row[0]]
                 y_matrix[trans_row[1], trans_row[1]] -= v_if_prec
             else:
                 # ID_l above cutoff.
-                rhs_matrix[trans_row[0]] -= v_if_prec  # Move fixed y_matrix[trans_row[0], trans_row[1]] to RHS.
+                # Move fixed y_matrix[trans_row[0], trans_row[1]] to RHS, include fixed trans_row[1] pop.
+                rhs_matrix[trans_row[0]] -= v_if_prec * self.pop_matrix[-1, layer_idx, trans_row[1]]
                 y_matrix[trans_row[0], trans_row[0]] -= u_fi + v_fi_prec
 
         if self.cont_rates is not None:
-            log.info(f"Cont rates = {self.cont_rates}")
-            log.info(
-                f"Cont profile store keys = {self.cont_profile_store.get_keys(layer_idx=nlte_layer_idx, profile_type="abs")}")
+            # log.info(f"Cont rates = {self.cont_rates}")
+            # log.info((
+            #     f"Cont profile store keys = "
+            #     f"{self.cont_profile_store.get_keys(layer_idx=nlte_layer_idx, profile_type="abs")}"
+            # ))
             for cont_trans_row in self.cont_rates.iter_rows(named=False):
                 a_ci = cont_trans_row[1] * einstein_a_unit
                 # b_ci = cont_trans_row[2] * einstein_b_unit
                 b_ic = cont_trans_row[3] * einstein_b_unit
 
-                log.info(f"{self.species}: Cont. profile for state {cont_trans_row[0]}..")
+                # log.info(f"{self.species}: Cont. profile for state {cont_trans_row[0]}.")
                 # if cont_trans_row[0] in self.cont_profile_grid[nlte_layer_idx]:
                 cont_abs_profile, cont_abs_start_idx = self.cont_profile_store.get_profile(
                     layer_idx=nlte_layer_idx, key=cont_trans_row[0], profile_type="abs"
@@ -1011,72 +1146,104 @@ class NLTEProcessor:
                 # cont_abs_end_idx = cont_abs_profile.start_idx + len(cont_abs_profile.profile)
                 cont_abs_end_idx = cont_abs_start_idx + len(cont_abs_profile)
 
+                # cont_abs_profile_norm = cont_abs_profile / (
+                #         simpson(cont_abs_profile,
+                #                 x=wn_grid[cont_abs_start_idx:cont_abs_end_idx]) * cont_abs_profile.unit * wn_grid.unit
+                # )
                 cont_abs_profile_norm = cont_abs_profile / (
-                        simpson(cont_abs_profile,
-                                x=wn_grid[cont_abs_start_idx:cont_abs_end_idx]) * cont_abs_profile.unit * wn_grid.unit
+                    simpson_quantity(y_data=cont_abs_profile, x_data=wn_grid[cont_abs_start_idx:cont_abs_end_idx])
                 )
 
                 # Cross terms:
-                chi_ci = np.zeros(lambda_layer_grid.shape[0]) << (cont_abs_profile_norm.unit * b_ic.unit)
-                chi_ci[cont_abs_start_idx: cont_abs_end_idx] += (
+                chi_ic = np.zeros(num_grid) << (cont_abs_profile_norm.unit * b_ic.unit)
+                chi_ic[cont_abs_start_idx: cont_abs_end_idx] += (
                         self.pop_matrix[-1, layer_idx, cont_trans_row[0]]
                         * cont_abs_profile_norm
                         * b_ic
                         * chem_profile[self.species][layer_idx]
                 )
-                chi_ci = np.where(chi_ci < 0, 0, chi_ci)
+                chi_ic = np.where(chi_ic < 0, 0, chi_ic)
                 if full_prec:
-                    for o_idx in np.arange(0, self.n_agg_states):
-                        a_ox_cross = np.zeros(lambda_layer_grid.shape[0]) << u.erg / u.sr
-                        for ox_trans in self.rates_grid.filter(pl.col("id_agg_f") == o_idx).iter_rows(named=False):
-                            ox_emi_profile, ox_emi_start_idx = self.profile_store.get_profile(
-                                layer_idx=nlte_layer_idx, key=(ox_trans[0], ox_trans[1]), profile_type="spe"
-                            )
-                            o_pop = self.pop_matrix[-1, layer_idx, ox_trans[0]]
-                            if o_pop == 0:
-                                continue
-                            ox_emi_profile = ox_emi_profile * o_pop
+                    psi_approx_cross_ic = np.abs(chi_ic[None, :] * psi_approx_cross) * 4 * np.pi * u.sr
+                    psi_integrals = simpson_quantity_2d(y_data=psi_approx_cross_ic, x_data=wn_grid).decompose()
 
-                            ox_emi_end_idx = ox_emi_start_idx + len(ox_emi_profile)
-                            a_ox_cross[ox_emi_start_idx: ox_emi_end_idx] += (
-                                    ox_emi_profile  # Absolute value, not normalised.
-                                    * u.erg
-                                    * u.cm
-                                    * chem_profile[self.species][layer_idx]
-                                    / (u.s * u.sr * ac.c.cgs)
-                            )
-                        if np.all(a_ox_cross == 0):
-                            continue
-                        psi_approx_cross = (
-                                np.zeros(lambda_layer_grid.shape[0]) << a_ox_cross.unit / global_chi.unit
-                        )
-                        shielded_lambda = np.clip(lambda_layer_grid, 0, 1)
-                        psi_approx_cross[global_chi != 0] = (
-                                shielded_lambda[global_chi != 0]
-                                * a_ox_cross[global_chi != 0]
-                                / global_chi[global_chi != 0]
-                        ).to(u.J / (u.m ** 2 * u.sr), equivalencies=u.spectral())
-                        psi_approx_cross = abs(chi_ci * psi_approx_cross) * 4 * np.pi * u.sr
+                    o_pops = self.pop_matrix[-1, layer_idx, :]
 
-                        psi_approx_cross = (
-                                simpson(psi_approx_cross, x=wn_grid) << (psi_approx_cross.unit * wn_grid.unit)
-                        ).decompose()
-                        log.debug(
-                            (
-                                f"[L{layer_idx}] Adding "
-                                f"Chi_({cont_trans_row[0]}, c)Psi*[Sum_(j<{o_idx}) A_({o_idx}, j)] ="
-                                f" {-psi_approx_cross}"
-                            )
-                        )
-                        y_matrix[cont_trans_row[0], o_idx] -= psi_approx_cross
+                    below_cutoff = np.arange(self.n_agg_states) <= self.id_agg_cutoff
+                    nonzero_integral_mask = psi_integrals.value != 0
+                    nonzero_pop_mask = o_pops != 0
+
+                    # If below cutoff, update Y-row elements where integrals aare non-zero.
+                    below_mask = below_cutoff & nonzero_integral_mask
+                    # If above cutoff, update Y-row elements with sum of where integrals and fixed pop factor are non-zero.
+                    above_mask = ~below_cutoff & nonzero_integral_mask & nonzero_pop_mask
+
+                    if cont_trans_row[0] <= self.id_agg_cutoff:
+                        rhs_matrix[cont_trans_row[0]] -= np.sum(psi_integrals[above_mask] * o_pops[above_mask])
+                        y_matrix[cont_trans_row[0], below_mask] += psi_integrals[below_mask]
+
+                    # for o_idx in np.arange(0, self.n_agg_states, dtype=int):
+                    #     o_pop = self.pop_matrix[-1, layer_idx, o_idx]
+                    #     if o_pop == 0:
+                    #         continue
+                    #     # a_ox_cross = np.zeros(lambda_layer_grid.shape[0]) << u.erg / u.sr
+                    #     # for ox_trans in self.rates_grid.filter(pl.col("id_agg_f") == o_idx).iter_rows(named=False):
+                    #     #     ox_emi_profile, ox_emi_start_idx = self.profile_store.get_profile(
+                    #     #         layer_idx=nlte_layer_idx, key=(ox_trans[0], ox_trans[1]), profile_type="spe"
+                    #     #     )
+                    #     #     ox_emi_profile = ox_emi_profile * o_pop
+                    #     #
+                    #     #     ox_emi_end_idx = ox_emi_start_idx + len(ox_emi_profile)
+                    #     #     a_ox_cross[ox_emi_start_idx: ox_emi_end_idx] += (
+                    #     #             ox_emi_profile  # Absolute value, not normalised.
+                    #     #             * u.erg
+                    #     #             * u.cm
+                    #     #             * chem_profile[self.species][layer_idx]
+                    #     #             / (u.s * u.sr * ac.c.cgs)
+                    #     #     )
+                    #     a_ox_cross = a_ox_cross_cache[o_idx]
+                    #
+                    #     if np.all(a_ox_cross == 0):
+                    #         continue
+                    #
+                    #     psi_approx_cross = (
+                    #             np.zeros(num_grid) << a_ox_cross.unit / global_chi.unit
+                    #     )
+                    #     shielded_lambda = np.clip(lambda_layer_grid, 0, 1)
+                    #     psi_approx_cross[global_chi != 0] = (
+                    #             shielded_lambda[global_chi != 0]
+                    #             * a_ox_cross[global_chi != 0]
+                    #             / global_chi[global_chi != 0]
+                    #     ).to(u.J / (u.m ** 2 * u.sr), equivalencies=u.spectral())
+                    #     psi_approx_cross = abs(chi_ic * psi_approx_cross) * 4 * np.pi * u.sr
+                    #
+                    #     # psi_approx_cross = (
+                    #     #         simpson(psi_approx_cross, x=wn_grid) << (psi_approx_cross.unit * wn_grid.unit)
+                    #     # ).decompose()
+                    #     psi_approx_cross = simpson_quantity(y_data=psi_approx_cross, x_data=wn_grid).decompose()
+                    #     # log.debug(
+                    #     #     (
+                    #     #         f"[L{layer_idx}] Adding "
+                    #     #         f"Chi_({cont_trans_row[0]}, c)Psi*[Sum_(j<{o_idx}) A_({o_idx}, j)] ="
+                    #     #         f" {-psi_approx_cross}"
+                    #     #     )
+                    #     # )
+                    #     if o_idx > self.id_agg_cutoff:
+                    #         rhs_matrix[cont_trans_row[0]] += psi_approx_cross * o_pop
+                    #     else:
+                    #         y_matrix[cont_trans_row[0], o_idx] -= psi_approx_cross
                 # End cross.
-                v_ic_prec = cont_abs_profile_norm * i_prec[cont_abs_start_idx: cont_abs_end_idx]
-                v_ic_prec = (
-                                    simpson(v_ic_prec, x=wn_grid[cont_abs_start_idx: cont_abs_end_idx])
-                                    << (v_ic_prec.unit * wn_grid.unit)
-                            ) * b_ic
+                # v_ic_prec = cont_abs_profile_norm * i_prec[cont_abs_start_idx: cont_abs_end_idx]
+                # v_ic_prec = (
+                #                     simpson(v_ic_prec, x=wn_grid[cont_abs_start_idx: cont_abs_end_idx])
+                #                     << (v_ic_prec.unit * wn_grid.unit)
+                #             ) * b_ic
+                v_ic_prec = simpson_quantity(
+                    y_data=cont_abs_profile_norm * i_prec[cont_abs_start_idx: cont_abs_end_idx],
+                    x_data=wn_grid[cont_abs_start_idx: cont_abs_end_idx]
+                ) * b_ic
                 v_ic_prec = v_ic_prec.decompose()
-                log.debug(f"[L{layer_idx}] V_ic_prec = {v_ic_prec}")
+                # log.debug(f"[L{layer_idx}] V_ic_prec = {v_ic_prec}")
 
                 limiting_species_num_dens = min(
                     (
@@ -1109,8 +1276,8 @@ class NLTEProcessor:
             chem_profile=chem_profile,
             density_profile=density_profile,
         )
-
-        return y_matrix.value, rhs_matrix
+        log.info(f"Y matrix construction duration = {time.perf_counter() - rates_start}")
+        return y_matrix.value, rhs_matrix.value
 
     def add_col_chem_rates(
             self,
@@ -1159,7 +1326,7 @@ class NLTEProcessor:
                         .row(0)
                     )
                 # TODO: Add check that state is within energy bounds!?
-                # log.debbug(f"Upper = {upper_id}, type ={type(upper_id)}")
+                # log.debug(f"Upper = {upper_id}, type ={type(upper_id)}")
                 # log.debug(f"Lower = {lower_id}, type ={type(lower_id)}")
                 depend_num_dens = (
                         chem_profile[SpeciesFormula(mol_depend)][layer_idx] * density_profile[layer_idx]
@@ -1528,6 +1695,7 @@ class NLTEProcessor:
             f"(before row-normalisation) = {np.linalg.cond(y_matrix_reduced)}"
         ))
         norm_factors = abs(y_matrix_reduced).sum(axis=1)[:, None]
+        y_no_norm = y_matrix_reduced.copy()
         y_matrix_reduced /= norm_factors
         check_rows = np.array([
             np.all(y_matrix_reduced[idx, :] > 0) or np.all(y_matrix_reduced[idx, :] < 0)
@@ -1544,13 +1712,25 @@ class NLTEProcessor:
         nlte_pop_frac = self.states.select(
             pl.col(f"n_nlte_L{layer_idx}").filter(pl.col("id_agg") <= self.id_agg_cutoff).sum()
         ).item()
-        rhs_rect = rhs_matrix[y_reduced_idx_map] / norm_factors
+        rhs_rect = rhs_matrix[y_reduced_idx_map] / norm_factors[:, 0]
         rhs_rect = np.append(rhs_rect, nlte_pop_frac)
         # rhs_rect = np.zeros(y_rect.shape[0])
         # rhs_rect[-1] = 1
 
         nppinv_pops = np.linalg.pinv(y_rect) @ rhs_rect
-        nppinv_pops /= nppinv_pops.sum()
+        # nppinv_pops /= nppinv_pops.sum()  # No longer normalised to 1.
+
+        log.info(f"DEBUG: pops = {nppinv_pops}")
+        log.info(f"Test = {y_rect[3, :] @ nppinv_pops}, {rhs_rect[3]}")
+
+        # TESTING
+        rhs_no_norm = rhs_matrix[y_reduced_idx_map].copy()
+        log.info(f"Y rect cond. = {np.linalg.cond(y_rect)}")
+        log.info(f"Y no norm cond. = {np.linalg.cond(y_no_norm)}")
+        pops_no_norm = np.linalg.pinv(y_no_norm) @ rhs_no_norm
+        log.info(f"Pops no norm = {pops_no_norm}")
+        log.info(f"Orig residuals = {np.sqrt(np.mean((np.dot(y_rect, nppinv_pops) - rhs_rect) ** 2))}")
+        log.info(f"No norm residuals = {np.sqrt(np.mean((np.dot(y_no_norm, pops_no_norm) - rhs_no_norm) ** 2))}")
 
         if np.any(nppinv_pops < 0):
             log.error((
@@ -1558,8 +1738,8 @@ class NLTEProcessor:
                 f"Falling back to least squares...\nNegatives = {nppinv_pops}"
             ))
             lsq_res = least_squares(
-                # lambda x: np.dot(y_rect, x) - rhs_rect,
-                lambda x: np.log(np.dot(y_rect, x)) - np.log(rhs_rect),
+                lambda x: np.dot(y_rect, x) - rhs_rect,
+                # lambda x: np.log(np.dot(y_rect, x)) - np.log(rhs_rect),
                 np.zeros(y_rect.shape[1]),
                 bounds=(0.0, 1.0),
                 method="trf",
@@ -1653,7 +1833,7 @@ class NLTEProcessor:
             .otherwise(pl.col(n_lte_col) * pl.col(n_agg_nlte_col) / pl.col(n_agg_lte_col))
             .alias(n_nlte_col)
         )
-        log_col_names = ["id", "energy", "g", "tau"] + self.agg_col_names + [n_agg_nlte_col, n_nlte_col]
+        log_col_names = ["id", "energy", "g", "tau"] + self.agg_col_names + [n_agg_lte_col, n_agg_nlte_col, n_nlte_col]
         log.info((
             f"[L{layer_idx}] NLTE States = \n{self.states.select(log_col_names)}\n"
             f"[L{layer_idx}] Sum of LTE populations = {self.states[n_lte_col].sum()}.\n"
@@ -2434,9 +2614,8 @@ class XSecCollection(dict):
                         (output_opacities[species] / chemical_profile[species][:, None]).value
                     )
         # Units for Emission/Absorption require extra 1/c factor for conversion (ExoCross convention).
-        source_func_units = u.J / (u.sr * u.m ** 2)
         zero_chi_mask = self.global_chi_matrix == 0
-        self.global_source_func_matrix: u.Quantity = np.zeros(self.global_eta_matrix.shape) * source_func_units
+        self.global_source_func_matrix: u.Quantity = np.zeros(self.global_eta_matrix.shape) * source_func_unit
         self.global_source_func_matrix[~zero_chi_mask] = (
                 self.global_eta_matrix[~zero_chi_mask] / (ac.c * self.global_chi_matrix[~zero_chi_mask])
         )
@@ -2466,6 +2645,8 @@ class XSecCollection(dict):
                 if is_nlte_xsec(xsec_data):
                     log.info(f"[I{self.n_iter}] Approximating T_ex for {species}.")
                     processor = xsec_data.get_nlte_processor()
+                    if processor.debug_pop_matrix is not None:
+                        continue
                     t_ex_profile = processor.approximate_t_ex(
                         i_mean=i_mean,
                         density_profile=density_profile,
@@ -2494,6 +2675,7 @@ class XSecCollection(dict):
 
         # -------------------------- Iterative solution --------------------------
         while not self.is_converged:
+            self.n_iter += 1
             # res = self.global_chi_matrix * dz_profile[:, None]
             # dtau = res.decompose().value
             # tau = dtau[::-1].cumsum(axis=0)[::-1]
@@ -2507,25 +2689,27 @@ class XSecCollection(dict):
                 mu_values=mu_values,
                 negative_absorption_factor=self.negative_absorption_factor,
             )
+            # start_time = time.perf_counter()
+            # bezier_coefs_old, control_points_old = bezier_coefficients_old(
+            #     tau_mu_matrix=effective_tau_mu,
+            #     source_function_matrix=effective_source_func_matrix.value,
+            #     # tau_mu_matrix=tau_mu,
+            #     # source_function_matrix=self.global_source_func_matrix.value,
+            # )
+            # control_points_old: u.Quantity = control_points_old << source_func_unit
+            # log.info(f"Coefficient duration (old) = {time.perf_counter() - start_time}")
             start_time = time.perf_counter()
-            bezier_coefs_old, control_points_old = bezier_coefficients(
-                tau_mu_matrix=effective_tau_mu,
-                source_function_matrix=effective_source_func_matrix.value,
-                # tau_mu_matrix=tau_mu,
-                # source_function_matrix=self.global_source_func_matrix.value,
-            )
-            control_points_old: u.Quantity = control_points_old << self.global_source_func_matrix.unit
-            log.info(f"Coefficient duration (old) = {time.perf_counter() - start_time}")
-            start_time = time.perf_counter()
-            bezier_coefs, control_points = bezier_coefficients_new(
+            bezier_coefs, control_points = bezier_coefficients(
                 tau_mu_matrix=effective_tau_mu,
                 source_function_matrix=effective_source_func_matrix,
             )
             log.info(f"Coefficient duration (new) = {time.perf_counter() - start_time}")
-            log.info(
-                f"Coefs equal? {np.all(bezier_coefs_old == bezier_coefs)} {np.allclose(bezier_coefs_old, bezier_coefs, atol=1e-7)}")
-            log.info(
-                f"Control equal? {np.all(control_points_old == control_points)} {np.allclose(control_points_old, control_points, atol=1e-7)}")
+            # log.info(
+            #     f"Coefs equal? {np.all(bezier_coefs_old == bezier_coefs)} {np.allclose(bezier_coefs_old, bezier_coefs, atol=1e-7)}"
+            # )
+            # log.info(
+            #     f"Control equal? {np.all(control_points_old == control_points)} {np.allclose(control_points_old, control_points, atol=1e-7)}"
+            # )
 
             # USEFUL BEZIER IDENTITIES
             alpha_plus_gamma = bezier_coefs[:, 1] + bezier_coefs[:, 3]
@@ -2553,7 +2737,7 @@ class XSecCollection(dict):
                         i_in_matrix[layer_idx + 1] * bezier_coefs[layer_idx + 1, 0] +
                         bezier_coefs[layer_idx + 1, 1] * effective_source_func_matrix[layer_idx, None, :] +
                         bezier_coefs[layer_idx + 1, 2] * effective_source_func_matrix[layer_idx + 1, None, :] +
-                        bezier_coefs[layer_idx + 1, 3] * control_points[layer_idx, 1]
+                        bezier_coefs[layer_idx + 1, 3] * control_points[layer_idx, 1] * source_func_unit
                 )
 
                 # Inwards Lambda operator calculation.
@@ -2636,7 +2820,7 @@ class XSecCollection(dict):
                 #             "in",
                 #         )
             # ------------------------------ OUTWARD PASS ------------------------------
-            i_out_matrix: u.Quantity = np.zeros_like(effective_tau_mu) << self.global_source_func_matrix.unit
+            i_out_matrix: u.Quantity = np.zeros_like(effective_tau_mu) << source_func_unit
             lambda_out_matrix = np.zeros_like(effective_tau_mu)
 
             for layer_idx in range(n_layers):
@@ -2648,7 +2832,7 @@ class XSecCollection(dict):
                             i_out_matrix[layer_idx - 1] * bezier_coefs[layer_idx, 0] +
                             bezier_coefs[layer_idx, 1] * effective_source_func_matrix[layer_idx, None, :] +
                             bezier_coefs[layer_idx, 2] * effective_source_func_matrix[layer_idx - 1, None, :] +
-                            bezier_coefs[layer_idx, 3] * control_points[layer_idx, 0]
+                            bezier_coefs[layer_idx, 3] * control_points[layer_idx, 0] * source_func_unit
                     )
                     # Outward Lambda operator calculation.
                     if self.do_tridiag and layer_idx < n_layers - 1:
@@ -2665,7 +2849,7 @@ class XSecCollection(dict):
                                 i_in_matrix[layer_idx + 1] * bezier_coefs[layer_idx + 1, 0] +
                                 bezier_coefs[layer_idx + 1, 1] * effective_source_func_matrix[layer_idx, None, :] +
                                 bezier_coefs[layer_idx + 1, 2] * effective_source_func_matrix[layer_idx + 1, None, :] +
-                                bezier_coefs[layer_idx + 1, 3] * control_points[layer_idx, 1]
+                                bezier_coefs[layer_idx + 1, 3] * control_points[layer_idx, 1] * source_func_unit
                         )
 
                         if self.do_tridiag and layer_idx > 0:
@@ -2871,7 +3055,7 @@ class XSecCollection(dict):
                             self.global_eta_matrix[layer_idx]
                             # * density_profile[layer_idx]  # No longer baking density into global Chi!
                             / (ac.c * self.global_chi_matrix[layer_idx])
-                    ).to(u.J / (u.sr * u.m ** 2), equivalencies=u.spectral())
+                    ).to(source_func_unit, equivalencies=u.spectral())
 
                     effective_source_func_matrix, effective_tau_mu = effective_source_tau_mu(
                         global_source_func_matrix=self.global_source_func_matrix,
@@ -2882,28 +3066,27 @@ class XSecCollection(dict):
                         mu_values=mu_values,
                         negative_absorption_factor=self.negative_absorption_factor,
                     )
-                    start_time = time.perf_counter()
-                    bezier_coefs_old, control_points_old = bezier_coefficients(
-                        tau_mu_matrix=effective_tau_mu,
-                        source_function_matrix=effective_source_func_matrix.value,
-                    )
-                    control_points_old = control_points_old << self.global_source_func_matrix.unit
-                    log.info(f"[L{layer_idx}] (OLD) Coefficient (post) duration = {time.perf_counter() - start_time}")
-
-                    log.info(f"Test control points before = {control_points_old[layer_idx]}")
-                    check_old_control_points = control_points[layer_idx].copy()
+                    # start_time = time.perf_counter()
+                    # bezier_coefs_old, control_points_old = bezier_coefficients_old(
+                    #     tau_mu_matrix=effective_tau_mu,
+                    #     source_function_matrix=effective_source_func_matrix.value,
+                    # )
+                    # control_points_old = control_points_old << source_func_unit
+                    # log.info(f"[L{layer_idx}] (OLD) Coefficient (post) duration = {time.perf_counter() - start_time}")
+                    # log.info(f"Test control points before = {control_points_old[layer_idx, 0]}")
+                    # check_old_control_points = control_points[layer_idx - 1: layer_idx + 2, 0].copy()
+                    # log.info(f"Test control points before = {check_old_control_points}")
                     start_time = time.perf_counter()
                     update_layer_coefficients(
                         layer_idx=layer_idx,
                         tau_mu_matrix=effective_tau_mu,
                         source_function_matrix=effective_source_func_matrix.value,
                         coefficients=bezier_coefs,
-                        control_points=control_points.value
+                        control_points=control_points
                     )
-                    # TODO: Check that in-place updates work for Quantities; control_points changed?
-                    log.info(f"TEST control points after = {control_points[layer_idx]}")
-                    log.info(f"TEST Still the same? {np.all(control_points[layer_idx] == check_old_control_points)}")
-                    control_points = control_points << self.global_source_func_matrix.unit
+                    # log.info(f"TEST control points after = {control_points[layer_idx - 1: layer_idx + 2, 0]}")
+                    # log.info(f"TEST Still the same? {np.all(control_points[layer_idx - 1: layer_idx + 2, 0] == check_old_control_points)}")
+                    # control_points = control_points << source_func_unit
                     if layer_idx > 0:
                         one_plus_exp_neg_delta_tau[layer_idx] = 1 + bezier_coefs[layer_idx, 0]
                         alpha_plus_gamma[layer_idx] = bezier_coefs[layer_idx, 1] + bezier_coefs[layer_idx, 3]
@@ -2919,7 +3102,7 @@ class XSecCollection(dict):
                                 i_out_matrix[layer_idx - 1] * bezier_coefs[layer_idx, 0] +
                                 bezier_coefs[layer_idx, 1] * effective_source_func_matrix[layer_idx, None, :] +
                                 bezier_coefs[layer_idx, 2] * effective_source_func_matrix[layer_idx - 1, None, :] +
-                                bezier_coefs[layer_idx, 3] * control_points[layer_idx, 0]
+                                bezier_coefs[layer_idx, 3] * control_points[layer_idx, 0] * source_func_unit
                         )
                         if self.do_tridiag and layer_idx < n_layers - 1:
                             lambda_out_matrix[layer_idx] = (
@@ -3002,7 +3185,8 @@ class XSecCollection(dict):
         log.info(f"[I{self.n_iter}] Convergence achieved!")
 
         # TODO: Default resolving power grid?
-        high_res_grid = create_r_wn_grid(low=spectral_grid[0], high=spectral_grid[-1], resolving_power=15000)
+        high_res_grid = create_r_wn_grid(low=spectral_grid[0].value, high=spectral_grid[-1].value,
+                                         resolving_power=15000)
         for species in active_species:
             xsec_data = self[species]
             if is_nlte_xsec(xsec_data):

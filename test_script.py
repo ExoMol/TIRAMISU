@@ -77,10 +77,10 @@ if __name__ == "__main__":
 
     temperature_profile = profiles["T"].to_numpy()[::-1] << u.K
 
-    # spectral_grid = cdf_opacity_sampling(
-    #     wn_start=100, wn_end=30000, temperature_profile=temperature_profile, num_points=10000, max_step=50
-    # )
-    spectral_grid = np.linspace(100, 30000, 2991) << 1 / u.cm
+    spectral_grid = cdf_opacity_sampling(
+        wn_start=100, wn_end=30000, temperature_profile=temperature_profile, num_points=10000, max_step=50
+    )
+    # spectral_grid = np.linspace(100, 30000, 2991) << 1 / u.cm
 
     # KELT-20 b
     planet_mass = 3.372 << u.Mjup
