@@ -271,3 +271,53 @@ def get_molecular_mass(formula: str) -> float:
         else:
             total_mass += get_mass(part) * count
     return total_mass
+
+
+def get_number_of_atoms(formula: str) -> int:
+    """
+    Calculates the number of atoms in an input molecule chemical formula (e.g. 'H2O', 'TiO2').
+    Supports isotopic notation like '13CO2' or mixed (e.g., '12C16O').
+
+    Parameters
+    ----------
+    formula:
+        Input molecule formula.
+
+    Returns
+    -------
+        Number of atoms.
+
+    """
+    if re.search(r'\d+[A-Z][a-z]?\d+[A-Z]', formula):
+        raise ValueError(
+            f"Ambiguous formula '{formula}'. Use delimiters like '12C-2H' or '13C-16O' to clarify isotopes."
+        )
+
+    def parse_segment(segment: str) -> float:
+        """Parse a simple segment without parentheses and sum isotope masses."""
+        atoms = 0
+        pattern = r'(\d*[A-Z][a-z]?)(\d*)'  # isotope prefix or normal element with count
+        tokens = re.findall(pattern, segment)
+        for (symbol, count_str) in tokens:
+            atoms += int(count_str) if count_str else 1
+        return atoms
+
+    atom_count = 0
+
+    # --- Handle parentheses recursively ---
+    while '(' in formula:
+        match = re.search(r"\(([^\(\)]+)\)(\d*)", formula)
+        if not match:
+            break
+        inner, multiplier_str = match.groups()
+        multiplier = int(multiplier_str) if multiplier_str else 1
+        atom_count += parse_segment(inner) * multiplier
+        # Replace this group with a pseudo-element marker that carries numeric value
+        formula = formula[:match.start()] + formula[match.end():]
+
+    # --- Parse remaining parts ---
+    parts = re.findall(r"(\d*[A-Z][a-z]?|\d*\.\d+X)(\d*)", formula)
+    for (part, count_str) in parts:
+        atom_count += int(count_str) if count_str else 1
+    return atom_count
+

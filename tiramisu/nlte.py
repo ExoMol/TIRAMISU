@@ -730,6 +730,7 @@ def calc_band_profile(
 def abs_emi_xsec(
         states: pl.DataFrame,
         trans_files: t.List[pathlib.Path],
+        layer_idx: int,
         temperature: u.Quantity,
         pressure: u.Quantity,
         species_mass: float,
@@ -748,16 +749,18 @@ def abs_emi_xsec(
     wn_min = wn_grid[0]
     wn_max = wn_grid[-1]
 
+    n_nlte_col = f"n_nlte_L{layer_idx}"
+
     pl_states_i = states.select(
         pl.col("id"),
         pl.col("energy").alias("energy_i"),
-        pl.col("n_nlte").alias("n_nlte_i"),
+        pl.col(n_nlte_col).alias("n_nlte_i"),
         pl.col("g").alias("g_i"),
     )
     pl_states_f = states.select(
         pl.col("id"),
         pl.col("energy").alias("energy_f"),
-        pl.col("n_nlte").alias("n_nlte_f"),
+        pl.col(n_nlte_col).alias("n_nlte_f"),
         pl.col("g").alias("g_f"),
         pl.col("tau").alias("tau_f"),
     )
@@ -888,18 +891,18 @@ def continuum_xsec(
     wn_min = wn_grid[0]
     wn_max = wn_grid[-1]
 
-    n_col = f"n_nlte_L{layer_idx}"
+    n_nlte_col = f"n_nlte_L{layer_idx}"
 
     pl_states_i = continuum_states.select(
         pl.col("id"),
         pl.col("energy").alias("energy_i"),
-        pl.col(n_col).alias("n_nlte_i"),
+        pl.col(n_nlte_col).alias("n_nlte_i"),
         pl.col("g").alias("g_i"),
     )
     pl_states_f = continuum_states.select(
         pl.col("id"),
         pl.col("energy").alias("energy_f"),
-        pl.col(n_col).alias("n_nlte_f"),
+        pl.col(n_nlte_col).alias("n_nlte_f"),
         pl.col("g").alias("g_f"),
         pl.col("v").alias("v_f"),
     )
