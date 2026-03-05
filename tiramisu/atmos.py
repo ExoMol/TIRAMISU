@@ -137,6 +137,84 @@ def scaleheight(
     return const.k_B * temperature / (mu * gravity_function(height))
 
 
+# def solve_scaleheight(
+#         temperature: u.Quantity,
+#         pressure_levels: u.Quantity,
+#         mu_profile: u.Quantity,
+#         gravity_function: t.Callable[[u.Quantity], u.Quantity],
+# ) -> t.Tuple[u.Quantity, u.Quantity, u.Quantity, u.Quantity]:
+#     """
+#     Solve for altitude, scale height, gravity, and layer thickness across a discretized atmosphere.
+#
+#     Pressure levels :math:`P_{k}` (k = 0..n) are provided, and altitude is reconstructed hydrostatically via:
+#
+#     .. math::
+#         \\Delta z_{k} = - H_{k-1} \\, \\ln\\left( \\frac{P_{k}}{P_{k-1}} \\right),
+#
+#     with cumulative altitude:
+#
+#     .. math::
+#         z_{k} = z_{k-1} + \\Delta z_{k}.
+#
+#     Scale height and gravity at each level follow:
+#
+#     .. math::
+#         H_{k} = \\frac{k_{\\mathrm{B}} T_{k}}{\\mu_{k} g(z_{k})},
+#         \\qquad g_{k} = g(z_{k}).
+#
+#     Returned arrays correspond to layer **centers**.
+#
+#     Parameters
+#     ----------
+#     temperature : Quantity, shape (n_layers,)
+#         Layer-center temperatures :math:`T_{j}` [K].
+#     pressure_levels : Quantity, shape (n_layers + 1,)
+#         Pressure at layer boundaries :math:`P_{k}` [Pa].
+#     mu_profile : Quantity, shape (n_layers,)
+#         Mean molecular mass per layer :math:`\\mu_{j}` [kg].
+#     gravity_function : Callable
+#         Function :math:`g(h)`.
+#
+#     Returns
+#     -------
+#     altitude : Quantity, shape (n_layers,)
+#         Altitude of layer centers :math:`z_{j}` [m].
+#     scale_height : Quantity, shape (n_layers + 1,)
+#         Scale height evaluated at pressure levels.
+#     gravity : Quantity, shape (n_layers,)
+#         Gravitational acceleration at layer centers.
+#     dz : Quantity, shape (n_layers,)
+#         Layer thickness :math:`\\Delta z_{j}` [m].
+#     """
+#
+#     temperature = np.atleast_1d(temperature)
+#     pressure_levels = np.atleast_1d(pressure_levels)
+#     mu_profile = np.atleast_1d(mu_profile)
+#
+#     surface_scale_height = scaleheight(0 * u.m, temperature[0], mu_profile[0], gravity_function)
+#     surface_gravity = gravity_function(0 * u.m)
+#     nlevels = pressure_levels.shape[0]
+#
+#     altitude: u.Quantity = np.zeros_like(pressure_levels.value) << surface_scale_height.unit
+#     scale_height: u.Quantity = np.zeros_like(pressure_levels.value) << surface_scale_height.unit
+#     dz: u.Quantity = np.zeros_like(pressure_levels.value) << surface_scale_height.unit
+#     gravity: u.Quantity = np.zeros_like(pressure_levels.value) << surface_gravity.unit
+#
+#     scale_height[0] = surface_scale_height
+#     gravity[0] = surface_gravity
+#
+#     pressure_diff = np.log(pressure_levels[1:] / pressure_levels[:-1])
+#
+#     for i in range(1, nlevels):
+#         dz[i] = -scale_height[i - 1] * pressure_diff[i - 1]
+#         altitude[i] = altitude[i - 1] + dz[i]
+#         gravity[i] = gravity_function(altitude[i])
+#         if i < nlevels - 1:
+#             scale_height[i] = scaleheight(altitude[i], temperature[i], mu_profile[i], gravity_function)
+#
+#     return altitude[:-1], scale_height, gravity[:-1], dz[:-1]
+
+
 def solve_scaleheight(
         temperature: u.Quantity,
         pressure_levels: u.Quantity,
@@ -144,74 +222,105 @@ def solve_scaleheight(
         gravity_function: t.Callable[[u.Quantity], u.Quantity],
 ) -> t.Tuple[u.Quantity, u.Quantity, u.Quantity, u.Quantity]:
     """
-    Solve for altitude, scale height, gravity, and layer thickness across a discretized atmosphere.
+    Solve hydrostatic structure for a discretized atmosphere using a midpoint (second-order / RK2) integration scheme.
 
-    Pressure levels :math:`P_{k}` (k = 0..n) are provided, and altitude is reconstructed hydrostatically via:
-
-    .. math::
-        \\Delta z_{k} = - H_{k-1} \\, \\ln\\left( \\frac{P_{k}}{P_{k-1}} \\right),
-
-    with cumulative altitude:
+    Pressure levels :math:`P_k` (k = 0..n) are defined at layer interfaces.
+    Altitude is reconstructed by integrating
 
     .. math::
-        z_{k} = z_{k-1} + \\Delta z_{k}.
+        \\frac{dz}{d\\ln P} = -H(z),
 
-    Scale height and gravity at each level follow:
+    where the scale height is
 
     .. math::
-        H_{k} = \\frac{k_{\\mathrm{B}} T_{k}}{\\mu_{k} g(z_{k})},
-        \\qquad g_{k} = g(z_{k}).
+        H(z) = \\frac{k_{\\mathrm{B}} T_j}{\\mu_j g(z)}.
 
-    Returned arrays correspond to layer **centers**.
+    For each layer j (bounded by interfaces k=j and k=j+1):
+
+    1. A predictor step estimates the layer thickness using gravity
+       at the lower interface:
+
+       .. math::
+           \\Delta z_j^{(0)} = -H(z_j) \\, \\Delta\\ln P_j
+
+    2. Gravity and scale height are evaluated at the predicted midpoint:
+
+       .. math::
+           z_{j,\\mathrm{mid}} = z_j + \\tfrac{1}{2} \\Delta z_j^{(0)}
+
+    3. A corrected (midpoint) step gives the final thickness:
+
+       .. math::
+           \\Delta z_j = -H(z_{j,\\mathrm{mid}}) \\, \\Delta\\ln P_j
+
+    Interface altitudes are then accumulated via:
+
+    .. math::
+        z_{j+1} = z_j + \\Delta z_j.
+
+    This scheme is second-order accurate in :math:`\\Delta\\ln P`
+    and accounts for variation of gravity with altitude within each layer.
 
     Parameters
     ----------
     temperature : Quantity, shape (n_layers,)
-        Layer-center temperatures :math:`T_{j}` [K].
+        Layer-center temperatures :math:`T_j` [K].
     pressure_levels : Quantity, shape (n_layers + 1,)
-        Pressure at layer boundaries :math:`P_{k}` [Pa].
+        Pressure at layer boundaries :math:`P_k` [Pa].
     mu_profile : Quantity, shape (n_layers,)
-        Mean molecular mass per layer :math:`\\mu_{j}` [kg].
+        Mean molecular mass per layer :math:`\\mu_j` [kg].
     gravity_function : Callable
-        Function :math:`g(h)`.
+        Function returning :math:`g(z)`.
 
     Returns
     -------
-    altitude : Quantity, shape (n_layers,)
-        Altitude of layer centers :math:`z_{j}` [m].
-    scale_height : Quantity, shape (n_layers + 1,)
-        Scale height evaluated at pressure levels.
+    altitude : Quantity, shape (n_layers + 1,)
+        Altitude at layer interfaces :math:`z_k` [m].
+    scale_height : Quantity, shape (n_layers,)
+        Scale height evaluated at layer midpoints.
     gravity : Quantity, shape (n_layers,)
-        Gravitational acceleration at layer centers.
+        Gravitational acceleration evaluated at layer midpoints.
     dz : Quantity, shape (n_layers,)
-        Layer thickness :math:`\\Delta z_{j}` [m].
+        Layer thickness :math:`\\Delta z_j` [m].
     """
 
     temperature = np.atleast_1d(temperature)
     pressure_levels = np.atleast_1d(pressure_levels)
     mu_profile = np.atleast_1d(mu_profile)
 
-    surface_scale_height = scaleheight(0 * u.m, temperature[0], mu_profile[0], gravity_function)
-    surface_gravity = gravity_function(0 * u.m)
-    nlevels = pressure_levels.shape[0]
+    n_layers = temperature.shape[0]
+    assert pressure_levels.shape[0] == n_layers + 1
 
-    altitude = np.zeros_like(pressure_levels.value) << surface_scale_height.unit
+    # Log pressure differences per layer
+    dlnP = np.log(pressure_levels[1:] / pressure_levels[:-1])
 
-    scale_height = np.zeros_like(pressure_levels.value) << surface_scale_height.unit
+    # Allocate arrays
+    altitude = np.zeros(n_layers + 1) * u.m
+    dz = np.zeros(n_layers) * u.m
+    scale_height = np.zeros(n_layers) * u.m
+    gravity = np.zeros(n_layers) * (u.m / u.s**2)
 
-    dz = np.zeros_like(pressure_levels.value) << surface_scale_height.unit
+    # Initial boundary condition
+    # altitude[0] = 0.0 * u.m
 
-    gravity = np.zeros_like(pressure_levels.value) << surface_gravity.unit
-    scale_height[0] = surface_scale_height
-    gravity[0] = surface_gravity
+    for j in range(n_layers):
+        # --- Predictor step (use lower boundary gravity) ---
+        g_lower = gravity_function(altitude[j])
+        H_lower = const.k_B * temperature[j] / (mu_profile[j] * g_lower)
+        dz_predict = -H_lower * dlnP[j]
 
-    pressure_diff = np.log(pressure_levels[1:] / pressure_levels[:-1])
+        # --- Midpoint quantities ---
+        z_mid = altitude[j] + 0.5 * dz_predict
+        g_mid = gravity_function(z_mid)
+        H_mid = const.k_B * temperature[j] / (mu_profile[j] * g_mid)
 
-    for i in range(1, nlevels):
-        dz[i] = -scale_height[i - 1] * pressure_diff[i - 1]
-        altitude[i] = altitude[i - 1] + dz[i]
-        gravity[i] = gravity_function(altitude[i])
-        if i < nlevels - 1:
-            scale_height[i] = scaleheight(altitude[i], temperature[i], mu_profile[i], gravity_function)
+        # --- Corrected step ---
+        dz[j] = -H_mid * dlnP[j]
+        altitude[j + 1] = altitude[j] + dz[j]
 
-    return altitude[:-1], scale_height, gravity[:-1], dz[:-1]
+        scale_height[j] = H_mid
+        gravity[j] = g_mid
+
+    altitude_centers = altitude[:-1] + 0.5 * dz
+
+    return altitude, scale_height, gravity, dz

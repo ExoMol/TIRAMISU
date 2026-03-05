@@ -1,3 +1,4 @@
+import logging
 import typing as t
 import numpy.typing as npt
 from astropy import units as u
@@ -13,7 +14,9 @@ from .atmos import (
 )
 from .xsec import XSecCollection
 from .nlte import blackbody, formal_solve_general
-from .config import log, output_dir
+from .config import output_dir
+
+log = logging.getLogger(__name__)
 
 
 def emission_quadratures(
@@ -162,7 +165,7 @@ class ExoplanetEmission:
 
         self.mu_tau, self.mu_weights = emission_quadratures(4)
         opacities = xsecs.compute_opacities_profile(
-            chemical_profile=self.chemistry_profile,
+            chem_profile=self.chemistry_profile,
             density_profile=self.density,
             dz_profile=self.dz,
             temperature=self.temperature_profile,
@@ -289,7 +292,7 @@ class ExoplanetEmission:
             spectral_grid = xsecs.unified_grid
 
         _ = xsecs.compute_opacities_profile(
-            chemical_profile=self.chemistry_profile,
+            chem_profile=self.chemistry_profile,
             density_profile=self.density,
             dz_profile=self.dz,
             temperature=self.temperature_profile,

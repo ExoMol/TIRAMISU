@@ -1,3 +1,4 @@
+import logging
 import abc
 import functools
 import pathlib
@@ -18,7 +19,10 @@ from astropy import constants as ac
 from scipy.integrate import simpson, cumulative_simpson
 from scipy.special import roots_hermite, erf
 
-from .config import log, _DEFAULT_CHUNK_SIZE, _N_GH_QUAD_POINTS, _INTENSITY_CUTOFF, _DEFAULT_NUM_THREADS
+from .config import _N_GH_QUAD_POINTS, _INTENSITY_CUTOFF, _DEFAULT_NUM_THREADS
+from .numerics import simpson_normalise_2d
+
+log = logging.getLogger(__name__)
 
 # Constants with units:
 ac_h_on_8_c = ac.h.cgs / (8 * ac.c.cgs)
@@ -222,54 +226,111 @@ def _build_xsec(
     return xsec_out
 
 
-@numba.njit(cache=True, error_model="numpy")
-def _rebuild_ox_profile(
-        upper_state_id: int,
+# @numba.njit(cache=True, error_model="numpy")
+# def _rebuild_ox_profile(
+#         upper_state_id: int,
+#         key_idx_map: npt.NDArray[np.int64],
+#         profiles: npt.NDArray[np.float64],
+#         offsets: npt.NDArray[np.int64],
+#         start_idxs: npt.NDArray[np.int64],
+#         num_grid: int
+# ) -> npt.NDArray[np.float64]:
+#     """
+#     Rebuild the full spontaneous emission profile from upper state o_idx to any lower state.
+#
+#     Parameters
+#     ----------
+#     upper_state_id
+#     key_idx_map
+#     profiles
+#     offsets
+#     start_idxs
+#     num_grid
+#
+#     Returns
+#     -------
+#
+#     """
+#     full_profile = np.zeros(num_grid, dtype=np.float64)
+#
+#     num_profiles = key_idx_map.shape[0]
+#     for idx in range(num_profiles):
+#         if key_idx_map[idx, 0] == upper_state_id:
+#             offset_start = offsets[idx]
+#             offset_end = offsets[idx + 1]
+#             wn_start = start_idxs[idx]
+#
+#             profile_len = offset_end - offset_start
+#             wn_end = min(wn_start + profile_len, num_grid)
+#
+#             # Add contribution
+#             for j in range(wn_end - wn_start):
+#                 full_profile[wn_start + j] += profiles[offset_start + j]
+#
+#     return full_profile
+
+
+@numba.njit(parallel=False, cache=True, error_model="numpy")
+def _rebuild_all_ox_profiles(
+        id_agg_cutoff: int,
         key_idx_map: npt.NDArray[np.int64],
         profiles: npt.NDArray[np.float64],
         offsets: npt.NDArray[np.int64],
         start_idxs: npt.NDArray[np.int64],
-        num_grid: int
+        num_grid: int,
 ) -> npt.NDArray[np.float64]:
     """
-    Rebuild the full spontaneous emission profile from upper state o_idx to any lower state.
+    Rebuild full spontaneous emission profiles for all upper states in a single pass.
+
+    Scanning key_idx_map once, accumulating each band's contribution directly into the row of the output matrix
+    corresponding to its upper state.
+
+    Could be refactored to accumulate into a 3D, per-thread buffer if performance struggles for polyatomics.
 
     Parameters
     ----------
-    upper_state_id
-    key_idx_map
-    profiles
-    offsets
-    start_idxs
-    num_grid
+    id_agg_cutoff : int
+        ID cutoff; sets the number of rows in the output as id_agg_cutoff + 1.
+    key_idx_map : np.ndarray, shape (n_profiles, 2)
+        Each row is (upper_state_id, lower_state_id) for the stored band.
+    profiles : np.ndarray, shape (total_points,)
+        Contiguous array of trimmed profile values.
+    offsets : np.ndarray, shape (n_profiles + 1,)
+        Start index of each profile in `profiles`, with a terminator at the end.
+    start_idxs : np.ndarray, shape (n_profiles,)
+        Position of each trimmed profile on the full wavenumber grid.
+    num_grid : int
+        Length of the full wavenumber grid.
 
     Returns
     -------
-
+    all_profiles : np.ndarray, shape (id_agg_cutoff + 1, num_grid)
+        Row o_idx contains the summed emission profile from upper state o_idx
+        to all lower states. Unnormalised.
     """
-    full_profile = np.zeros(num_grid, dtype=np.float64)
+    all_profiles = np.zeros((id_agg_cutoff + 1, num_grid), dtype=np.float64)
 
     num_profiles = key_idx_map.shape[0]
     for idx in range(num_profiles):
-        if key_idx_map[idx, 0] == upper_state_id:
-            offset_start = offsets[idx]
-            offset_end = offsets[idx + 1]
-            wn_start = start_idxs[idx]
+        upper_state_id = key_idx_map[idx, 0]
+        if upper_state_id < 0 or upper_state_id > id_agg_cutoff:
+            continue
 
-            profile_len = offset_end - offset_start
-            wn_end = min(wn_start + profile_len, num_grid)
+        offset_start = offsets[idx]
+        offset_end = offsets[idx + 1]
+        wn_start = start_idxs[idx]
+        profile_len = offset_end - offset_start
+        wn_end = min(wn_start + profile_len, num_grid)
 
-            # Add contribution
-            for j in range(wn_end - wn_start):
-                full_profile[wn_start + j] += profiles[offset_start + j]
+        for j in range(wn_end - wn_start):
+            all_profiles[upper_state_id, wn_start + j] += profiles[offset_start + j]
 
-    return full_profile
+    return all_profiles
 
 
 @numba.njit(parallel=True, cache=True, error_model="numpy")
 def _compute_all_cross_terms_vectorized(
         emission_profiles: npt.NDArray[np.float64],
-        pop_matrix: npt.NDArray[np.float64],
         chem_factor: float,
 ) -> npt.NDArray[np.float64]:
     """
@@ -277,7 +338,6 @@ def _compute_all_cross_terms_vectorized(
     Parameters
     ----------
     emission_profiles
-    pop_matrix
     chem_factor
 
     Returns
@@ -288,14 +348,40 @@ def _compute_all_cross_terms_vectorized(
     result = np.zeros((n_agg_states, num_grid), dtype=np.float64)
 
     for o_idx in numba.prange(n_agg_states):
-        if pop_matrix[o_idx] != 0.0:
-            pop_chem_factor = pop_matrix[o_idx] * chem_factor
-            for wn_idx in range(num_grid):
-                result[o_idx, wn_idx] = (
-                        emission_profiles[o_idx, wn_idx] * pop_chem_factor
-                )
+        for wn_idx in range(num_grid):
+            result[o_idx, wn_idx] = (
+                    emission_profiles[o_idx, wn_idx] * chem_factor
+            )
 
     return result
+
+
+# @numba.njit(parallel=True, cache=True, error_model="numpy")
+# def _compute_all_cross_terms_vectorized_new(
+#         emission_profiles: npt.NDArray[np.float64],
+#         chem_factor: float,
+# ) -> npt.NDArray[np.float64]:
+#     """
+#
+#     Parameters
+#     ----------
+#     emission_profiles
+#     chem_factor
+#
+#     Returns
+#     -------
+#
+#     """
+#     n_agg_states, num_grid = emission_profiles.shape
+#     result = np.zeros((n_agg_states, num_grid), dtype=np.float64)
+#
+#     for o_idx in numba.prange(n_agg_states):
+#         for wn_idx in range(num_grid):
+#             result[o_idx, wn_idx] = (
+#                     emission_profiles[o_idx, wn_idx] * chem_factor
+#             )
+#
+#     return result
 
 
 class CompactProfile:
@@ -344,7 +430,7 @@ class CompactProfile:
         """
         num_profiles = self.temporary_profiles.height
         if num_profiles == 0:
-            log.warn("CompactProfile finalising with 0 inputs!")
+            log.warning("CompactProfile finalising with 0 inputs!")
             return
 
         n_cols = len(self.temporary_profiles.columns)
@@ -428,15 +514,34 @@ class CompactProfile:
             profiles, offsets, start_idxs, key_idx_map, pop_matrix, wn_grid.shape[0], is_abs
         )
 
-    def get_emission_from_upper(
-            self, upper_state_id: int, num_grid: int
+    # def get_emission_from_upper(
+    #         self, upper_state_id: int, num_grid: int
+    # ) -> npt.NDArray[np.float64]:
+    #     return _rebuild_ox_profile(
+    #         upper_state_id=upper_state_id,
+    #         key_idx_map=self.key_idx_map,
+    #         profiles=self.profiles,
+    #         offsets=self.offsets,
+    #         start_idxs=self.start_idxs,
+    #         num_grid=num_grid,
+    #     )
+
+    def get_all_emission_from_upper(
+            self, id_agg_cutoff: int, num_grid: int
     ) -> npt.NDArray[np.float64]:
-        return _rebuild_ox_profile(
-            upper_state_id=upper_state_id,
-            key_idx_map=self.key_idx_map,
-            profiles=self.profiles,
-            offsets=self.offsets,
-            start_idxs=self.start_idxs,
+        """
+        Rebuild spontaneous emission profiles for all upper states in a single pass.
+
+        Returns
+        -------
+        all_profiles : np.ndarray, shape (id_agg_cutoff, num_grid)
+        """
+        return _rebuild_all_ox_profiles(
+            id_agg_cutoff=id_agg_cutoff,
+            key_idx_map=np.ascontiguousarray(self.key_idx_map, dtype=np.int64),
+            profiles=np.ascontiguousarray(self.profiles, dtype=np.float64),
+            offsets=np.ascontiguousarray(self.offsets, dtype=np.int64),
+            start_idxs=np.ascontiguousarray(self.start_idxs, dtype=np.int64),
             num_grid=num_grid,
         )
 
@@ -459,9 +564,14 @@ class ProfileStore:
         """
         The batch is a polars DataFrame containing id_agg_f and id_agg_i keys plus arrays representing each profile.
 
-        :param batch:
-        :param layer_idx:
-        :return:
+        Parameters
+        ----------
+        batch
+        layer_idx
+
+        Returns
+        -------
+
         """
         self.abs_profiles[layer_idx].add_batch(
             batch.select(pl.col("id_agg_f"), pl.col("id_agg_i"), pl.col("abs_profile"))
@@ -507,30 +617,69 @@ class ProfileStore:
         spe_profile = self.spe_profiles[layer_idx].build_xsec(pop_matrix=pop_matrix, wn_grid=wn_grid, is_abs=False)
         return abs_profile - ste_profile, spe_profile
 
-    def precompute_all_emission_profiles(
-            self, layer_idx: int, n_agg_states: int, num_grid: int
+    def precompute_downward_emission_profiles(
+            self, layer_idx: int, id_agg_cutoff: int, num_grid: int
     ) -> npt.NDArray[np.float64]:
         """
-        Precompute total spontaneous emission profiles for all states.
+        Precompute spontaneous emission profiles for all upper states.
+
+        Each profile represents the total downward emission from a given upper state summed over all lower states.
 
         Parameters
         ----------
-        layer_idx
-        n_agg_states
-        num_grid
+        layer_idx : int
+        id_agg_cutoff : int
+        num_grid : int
 
         Returns
         -------
-
+        all_profiles : np.ndarray, shape (n_agg_states, num_grid)
         """
-        all_profiles = np.zeros((n_agg_states, num_grid), dtype=np.float64)
+        # all_profiles = np.zeros((n_agg_states, num_grid), dtype=np.float64)
+        #
+        # for o_idx in range(n_agg_states):
+        #     all_profiles[o_idx] = self.spe_profiles[layer_idx].get_emission_from_upper(
+        #         upper_state_id=o_idx, num_grid=num_grid,
+        #     )
+        #
+        # return all_profiles
+        return self.spe_profiles[layer_idx].get_all_emission_from_upper(
+            id_agg_cutoff=id_agg_cutoff,
+            num_grid=num_grid,
+        )
 
-        for o_idx in range(n_agg_states):
-            all_profiles[o_idx] = self.spe_profiles[layer_idx].get_emission_from_upper(
-                upper_state_id=o_idx, num_grid=num_grid,
-            )
+    def precompute_normalised_downward_emission_profiles(
+            self,
+            layer_idx: int,
+            id_agg_cutoff: int,
+            wn_grid: u.Quantity,
+    ) -> npt.NDArray[np.float64]:
+        """
+        Precompute normalised spontaneous emission profiles for all upper states.
 
-        return all_profiles
+        Each profile represents the total downward emission from a given upper state summed over all lower states, then
+        integral normalised over wn_grid so. Profiles with zero integral (no emission from that state) are left as zero.
+
+        Parameters
+        ----------
+        layer_idx : int
+        id_agg_cutoff : int
+            id above which to cutoff calculations.
+        wn_grid : astropy.units.Quantity, shape (num_grid,)
+            Wavenumber grid used for normalisation. Must match the grid against which
+            profiles were originally built.
+
+        Returns
+        -------
+        all_profiles : astropy.units.Quantity, shape (n_agg_states, num_grid)
+            Normalised emission profiles; each row integrates to 1 (or is zero).
+            Units are 1/wn_grid.unit.
+        """
+        all_profiles = self.spe_profiles[layer_idx].get_all_emission_from_upper(
+            id_agg_cutoff=id_agg_cutoff,
+            num_grid=wn_grid.shape[0],
+        )
+        return simpson_normalise_2d(y_data=all_profiles, x_data=wn_grid.value) << 1 / wn_grid.unit
 
 
 class ContinuumProfileStore:
@@ -2560,9 +2709,14 @@ def calc_einstein_b_fi(a_fi: npt.NDArray[np.float64], energy_fi: npt.NDArray[np.
     .. math::
         B_{fi}=\\frac{A_{fi}}{2hc\\tilde{\\nu}^{3}_{fi}}
 
-    :param a_fi:
-    :param energy_fi:
-    :return:
+    Parameters
+    ----------
+    a_fi
+    energy_fi
+
+    Returns
+    -------
+
     """
     # return a_fi / (2 * ac.h * ac.c * (energy_fi ** 3))  # WAVENUMBERS
     return (a_fi * (ac.c ** 2)) / (2 * ac.h * (energy_fi ** 3))  # FREQUENCY
@@ -2651,7 +2805,7 @@ def _sample_indices(
 
     Returns
     -------
-        Integer indices corresponding to the uniform samplign points in the CDF.
+        Integer indices corresponding to the uniform sampling points in the CDF.
 
     """
     num_cdf_points = len(ev_cdf)
@@ -2888,74 +3042,3 @@ class MALIWorkflow(NLTEWorkflow):
         pass
 
 
-@numba.njit(cache=True, error_model="numpy")
-def simpson_integral_numba(y_data: npt.NDArray[np.float64], x_data: npt.NDArray[np.float64]) -> float:
-    """
-    Fast Simpson's rule integration using numba.
-    Assumes evenly or unevenly spaced x values.
-    """
-    n_points = len(y_data)
-    if n_points < 2:
-        return 0.0
-
-    if n_points == 2:
-        # Trapezoidal for 2 points
-        return 0.5 * (y_data[0] + y_data[1]) * (x_data[1] - x_data[0])
-
-    # Simpson's 1/3 rule
-    h = x_data[1:] - x_data[:-1]
-    result = 0.0
-
-    for i in range(0, n_points - 2, 2):
-        # Simpson's rule for each pair of intervals
-        h0 = h[i]
-        h1 = h[i + 1]
-
-        if abs(h0 - h1) < 1e-10:  # Uniform spacing
-            result += (h0 / 3.0) * (y_data[i] + 4 * y_data[i + 1] + y_data[i + 2])
-        else:  # Non-uniform spacing
-            alpha = (2 * h0 ** 2 + 2 * h0 * h1 - h1 ** 2) / (6 * h0)
-            beta = (h0 ** 2 + h0 * h1) / (3 * h1)
-            result += alpha * y_data[i] + beta * y_data[i + 1] + (h0 + h1 - alpha - beta) * y_data[i + 2]
-
-    # Handle last interval if odd number of points (use trapezoidal)
-    if n_points % 2 == 0:
-        result += 0.5 * (y_data[n_points - 2] + y_data[n_points - 1]) * h[n_points - 2]
-
-    return result
-
-
-@numba.njit(parallel=True, cache=True, error_model="numpy")
-def simpson_integral_2d(
-        y_data: npt.NDArray[np.float64],
-        x_data: npt.NDArray[np.float64],
-) -> npt.NDArray[np.float64]:
-    """
-    Vectorized Simpson integration over axis 1.
-    Each row is integrated independently.
-    """
-    num_rows, num_grid = y_data.shape
-    result = np.zeros(num_rows, dtype=np.float64)
-
-    if num_grid < 2:
-        return result
-
-    for row in numba.prange(num_rows):
-        result[row] = simpson_integral_numba(y_data[row], x_data)
-
-    return result
-
-
-def simpson_quantity(y_data: u.Quantity, x_data: u.Quantity) -> u.Quantity:
-    """Simpson integration preserving units."""
-    result = simpson_integral_numba(y_data.value, x_data.value)
-    return result * (y_data.unit * x_data.unit)
-
-
-def simpson_quantity_2d(
-    y_data: u.Quantity,
-    x_data: u.Quantity,
-) -> u.Quantity:
-    """Vectorized Simpson integration preserving units."""
-    result = simpson_integral_2d(y_data.value, x_data.value)
-    return result << (y_data.unit * x_data.unit)

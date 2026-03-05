@@ -1,8 +1,17 @@
+import logging
 import numpy as np
 import numpy.typing as npt
-from dataclasses import dataclass
 import typing as t
+import astropy.units as u
 import numba
+from dataclasses import dataclass
+
+from .chemistry import ChemicalProfile, SpeciesFormula
+from .nlte import const_h_c_on_kB
+
+log = logging.getLogger(__name__)
+
+rate_unit = 1 / u.s
 
 
 @dataclass
@@ -14,23 +23,155 @@ class RateTransition:
     mol_depend: str  # Collision partner species
 
 
+@dataclass
+class SpeciesRateInfo:
+    """
+    Metadata about collisional rates for a species.
+
+    Attributes
+    ----------
+    temperature_dependent : bool
+        Whether rates require temperature interpolation
+    collision_partners : set of str
+        Species for which collision rates are configured (e.g., {'O2', 'O', 'He', 'H'})
+    """
+    temperature_dependent: bool
+    collision_partners: t.Set[str]
+
+
 class CollisionalRatesDatabase:
     """
     Database of collisional and chemical rates for various species.
     Completely independent of any specific molecule instance.
+
+    Attributes
+    ----------
+    SPECIES_INFO : Dict[str, SpeciesRateInfo]
+        Metadata for each species with configured rates.
+        If a species is in this dict, it has rates configured.
     """
+    SPECIES_INFO: t.Dict[str, SpeciesRateInfo] = {
+        "OH": SpeciesRateInfo(
+            temperature_dependent=False,
+            collision_partners={"O2", "O", "O3", "He", "H", "H2"}
+        ),
+        "CO": SpeciesRateInfo(
+            temperature_dependent=True,
+            collision_partners={"H", "He", "H2"}
+        ),
+    }
+
+    @classmethod
+    def has_rates(cls, species: str) -> bool:
+        """
+        Check if rates are configured for a species.
+
+        Parameters
+        ----------
+        species : str
+            Chemical formula (e.g., 'OH', 'CO')
+
+        Returns
+        -------
+        bool
+            True if rates are available
+        """
+        return species in cls.SPECIES_INFO
+
+    @classmethod
+    def is_temperature_dependent(cls, species: str) -> bool:
+        """
+        Check if rates require temperature interpolation.
+
+        Parameters
+        ----------
+        species : str
+            Chemical formula
+
+        Returns
+        -------
+        bool
+            True if rates vary with temperature
+
+        Raises
+        ------
+        KeyError
+            If species has no configured rates
+        """
+        return cls.SPECIES_INFO[species].temperature_dependent
+
+    @classmethod
+    def get_collision_partners(cls, species: str) -> t.Set[str]:
+        """
+        Get the collision partners for which rates are configured.
+
+        Parameters
+        ----------
+        species : str
+            Chemical formula
+
+        Returns
+        -------
+        set of str
+            Collision partner species (e.g., {'O2', 'O', 'He'})
+
+        Raises
+        ------
+        KeyError
+            If species has no configured rates
+        """
+        return cls.SPECIES_INFO[species].collision_partners
+
+    @classmethod
+    def get_species_info(cls, species: str) -> SpeciesRateInfo | None:
+        """
+        Get metadata for a species.
+
+        Parameters
+        ----------
+        species : str
+            Chemical formula
+
+        Returns
+        -------
+        SpeciesRateInfo or None
+            Rate metadata, or None if species not configured
+        """
+        return cls.SPECIES_INFO.get(species)
+
+    @classmethod
+    def get_configured_species(cls) -> t.Set[str]:
+        """
+        Get all species with configured rates.
+
+        Returns
+        -------
+        set of str
+            Species with collisional rates configured
+        """
+        return set(cls.SPECIES_INFO.keys())
 
     @staticmethod
     def get_rates(species: str, layer_temp: float | None = None) -> list[RateTransition]:
         """
         Get collisional rates for a species.
 
-        Parameters:
-            species: Chemical formula (e.g., 'OH', 'CO')
-            layer_temp: Temperature in K (required for temperature-dependent rates)
+        Parameters
+        ----------
+        species : str
+            Chemical formula (e.g., 'OH', 'CO')
+        layer_temp : float, optional
+            Temperature in K (required for temperature-dependent rates)
 
-        Returns:
-            List of RateTransition objects
+        Returns
+        -------
+        list of RateTransition
+            List of rate transitions for the species
+
+        Raises
+        ------
+        ValueError
+            If temperature-dependent species called without layer_temp.
         """
         if species == "OH":
             return CollisionalRatesDatabase._get_oh_rates()
@@ -40,6 +181,309 @@ class CollisionalRatesDatabase:
             return CollisionalRatesDatabase._get_co_rates(layer_temp)
         else:
             return []
+
+    @staticmethod
+    def _sum_collisional_rates(
+            rates_table: t.List[RateTransition],
+            temperature_profile: u.Quantity,
+            chem_profile: ChemicalProfile,
+            density_profile: u.Quantity,
+            agg_lookup_cache: t.Dict,
+            id_agg_cutoff: int,
+    ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], float]:
+        """
+        Vectorized computation of collisional rates for all layers at once.
+
+        Used for species with temperature-independent rates (e.g., OH). Fully vectorized over both layers and
+        transitions for maximum performance.
+
+        Parameters
+        ----------
+        rates_table : list of RateTransition
+            Pre-computed rate transitions.
+        temperature_profile : astropy.units.Quantity
+            Temperature at each layer, shape (n_layers,).
+        chem_profile : ChemicalProfile
+            Chemical abundance profile.
+        density_profile : astropy.units.Quantity
+            Total number density profile, shape (n_layers,).
+        agg_lookup_cache : dict
+            Mapping from state keys to (state_id, energy) tuples.
+        id_agg_cutoff : int
+            Maximum state ID to include in rate summation.
+
+        Returns
+        -------
+        c_fi_profile : np.ndarray
+            Sum of downward rates, shape (n_layers,), units: 1/s.
+        c_if_profile : np.ndarray
+            Sum of upward rates, shape (n_layers,), units: 1/s.
+        mean_energy_dif : float
+            Mean energy gap for collisional rates, units: 1/cm.
+        """
+        n_layers = len(temperature_profile)
+        temp_vals = temperature_profile.value  # [n_layers]
+
+        # Initialize output arrays
+        c_fi_profile = np.zeros(n_layers, dtype=np.float64)
+        c_if_profile = np.zeros(n_layers, dtype=np.float64)
+
+        # Pre-filter rates and extract metadata
+        transitions_by_partner = {}
+        energy_diffs = []
+        weights = []
+
+        for rate in rates_table:
+            # Check if collision partner exists
+            if rate.mol_depend not in chem_profile.species:
+                continue
+
+            try:
+                upper_id, upper_energy = agg_lookup_cache[rate.upper_key]
+                lower_id, lower_energy = agg_lookup_cache[rate.lower_key]
+            except KeyError:
+                continue
+
+            # Only include if both states within cutoff and not diagonal
+            if upper_id > id_agg_cutoff or lower_id > id_agg_cutoff or upper_id == lower_id:
+                continue
+
+            # Add to partner group
+            partner = rate.mol_depend
+            if partner not in transitions_by_partner:
+                transitions_by_partner[partner] = []
+
+            energy_diff = upper_energy - lower_energy
+            energy_diffs.append(energy_diff)
+            weights.append(rate.rate)
+
+            transitions_by_partner[partner].append({
+                'upper_id': upper_id,
+                'lower_id': lower_id,
+                'energy_diff': energy_diff,
+                'rate': rate.rate,  # cm^3/s
+            })
+
+        if len(transitions_by_partner) == 0:
+            return c_fi_profile, c_if_profile, 0
+
+        energy_diffs = np.array(energy_diffs)
+        weights = np.array(weights)
+        mean_energy_dif = (energy_diffs * weights).sum() / weights.sum()
+        # mean_energy_dif = np.mean(mean_energy_dif)
+
+        # Process each collision partner
+        for partner, partner_transitions in transitions_by_partner.items():
+            # Get number density profile for this partner [n_layers] in 1/cm^3
+            num_dens_profile = (
+                    chem_profile[SpeciesFormula(partner)] * density_profile
+            ).to_value(u.cm ** -3)  # [n_layers]
+
+            # Extract arrays for this partner's transitions
+            energy_diffs = np.array([t['energy_diff'] for t in partner_transitions], dtype=np.float64)
+            base_rates = np.array([t['rate'] for t in partner_transitions], dtype=np.float64)  # cm^3/s
+
+            # Vectorized computation over all layers and transitions
+            # Shape: [n_layers, n_transitions]
+            # Units: cm^3/s * 1/cm^3 = 1/s (no conversion needed!)
+            c_fi_matrix = base_rates[None, :] * num_dens_profile[:, None]
+
+            # Vectorized detailed balance
+            # Shape: [n_layers, n_transitions]
+            exp_factors = np.exp(-energy_diffs[None, :] * const_h_c_on_kB / temp_vals[:, None])
+            c_if_matrix = c_fi_matrix * exp_factors
+
+            # Sum over transitions for each layer
+            c_fi_profile += np.sum(c_fi_matrix, axis=1)
+            c_if_profile += np.sum(c_if_matrix, axis=1)
+
+        return c_fi_profile, c_if_profile, mean_energy_dif
+
+    @staticmethod
+    def _sum_collisional_rates_t_dependent(
+            species: str,
+            temperature_profile: u.Quantity,
+            chem_profile: ChemicalProfile,
+            density_profile: u.Quantity,
+            agg_lookup_cache: t.Dict,
+            id_agg_cutoff: int,
+    ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], float]:
+        """
+        Compute collisional rates for species with temperature-dependent rates.
+
+        Used for species like CO where rates must be interpolated at each temperature. Processes layers sequentially
+        with temperature-specific rate interpolation.
+
+        Parameters
+        ----------
+        species : str
+            Chemical formula of the species (e.g. 'CO').
+        temperature_profile : astropy.units.Quantity
+            Temperature at each layer, shape (n_layers,).
+        chem_profile : ChemicalProfile
+            Chemical abundance profile.
+        density_profile : astropy.units.Quantity
+            Total number density profile, shape (n_layers,).
+        agg_lookup_cache : dict
+            Mapping from state keys to (state_id, energy) tuples.
+        id_agg_cutoff : int
+            Maximum state ID to include in rate summation.
+
+        Returns
+        -------
+        c_fi_profile : np.ndarray
+            Sum of downward rates, shape (n_layers,), units: 1/s.
+        c_if_profile : np.ndarray
+            Sum of upward rates, shape (n_layers,), units: 1/s.
+        mean_energy_dif : float
+            Mean energy gap for collisional rates, units: 1/cm.
+        """
+        n_layers = len(temperature_profile)
+
+        # Initialize output arrays
+        c_fi_profile = np.zeros(n_layers, dtype=np.float64)
+        c_if_profile = np.zeros(n_layers, dtype=np.float64)
+        energy_diffs = []
+        weights = []
+
+        # Process each layer with its own temperature-interpolated rates
+        for layer_idx in range(n_layers):
+            layer_temp = temperature_profile[layer_idx].value
+
+            # Get rates interpolated for this temperature
+            rates_table = CollisionalRatesDatabase.get_rates(
+                species=species,
+                layer_temp=layer_temp
+            )
+
+            if not rates_table:
+                continue
+
+            # Filter and compute for this layer
+            for rate in rates_table:
+                if rate.mol_depend not in chem_profile.species:
+                    continue
+
+                try:
+                    upper_id, upper_energy = agg_lookup_cache[rate.upper_key]
+                    lower_id, lower_energy = agg_lookup_cache[rate.lower_key]
+                except KeyError:
+                    continue
+
+                # Only include if both states within cutoff and not diagonal
+                if upper_id > id_agg_cutoff or lower_id > id_agg_cutoff or upper_id == lower_id:
+                    continue
+
+                # Number density for this partner at this layer (1/cm^3)
+                depend_num_dens = (
+                        chem_profile[SpeciesFormula(rate.mol_depend)][layer_idx] * density_profile[layer_idx]
+                ).to_value(u.cm ** -3)
+
+                # Compute downward rate: cm^3/s * 1/cm^3 = 1/s
+                c_fi = rate.rate * depend_num_dens
+
+                # Detailed balance for upward rate
+                energy_diff = upper_energy - lower_energy
+                energy_diffs.append(energy_diff)
+                weights.append(rate.rate)
+                c_if = c_fi * np.exp(-energy_diff * const_h_c_on_kB / layer_temp)
+
+                # Accumulate
+                c_fi_profile[layer_idx] += c_fi
+                c_if_profile[layer_idx] += c_if
+
+        energy_diffs = np.array(energy_diffs)
+        weights = np.array(weights)
+        mean_energy_dif = (energy_diffs * weights).sum() / weights.sum()
+        # mean_energy_dif = np.mean(mean_energy_dif)
+
+        return c_fi_profile, c_if_profile, mean_energy_dif
+
+    @staticmethod
+    def compute_total_collisional_rates_profile(
+            species: str,
+            temperature_profile: u.Quantity,
+            chem_profile: ChemicalProfile,
+            density_profile: u.Quantity,
+            agg_lookup_cache: t.Dict,
+            id_agg_cutoff: int,
+    ) -> t.Tuple[u.Quantity, u.Quantity, u.Quantity]:
+        """
+        Compute total collisional rates for all layers.
+
+        Computes sum of all c_fi (downward) and c_if (upward) collisional rates for transitions where both upper and
+        lower states are below the cutoff. Used for approximate excitation temperature calculations.
+
+        Parameters
+        ----------
+        species : str
+            Chemical formula of the species (e.g. 'OH', 'CO').
+        temperature_profile : astropy.units.Quantity
+            Temperature at each layer, shape (n_layers,).
+        chem_profile : ChemicalProfile
+            Chemical abundance profile.
+        density_profile : astropy.units.Quantity
+            Total number density profile, shape (n_layers,).
+        agg_lookup_cache : dict
+            Mapping from state keys to (state_id, energy) tuples.
+        id_agg_cutoff : int
+            Maximum state ID to include in rate summation.
+
+        Returns
+        -------
+        c_fi_profile : astropy.units.Quantity
+            Sum of downward collision rates at each layer, shape (n_layers,), units: 1/s.
+        c_if_profile : astropy.units.Quantity
+            Sum of upward collision rates at each layer, shape (n_layers,), units: 1/s.
+        mean_energy_dif : astropy.units.Quantity
+            Mean energy gap for collisional rates, units: 1/cm.
+
+        Notes
+        -----
+        - Diagonal (formation/destruction) rates are excluded.
+        - For temperature-dependent species (e.g., CO), rates are interpolated per layer.
+        - For temperature-independent species (e.g., OH), rates are vectorized over all layers.
+        """
+        if not CollisionalRatesDatabase.has_rates(species):
+            log.info(f"No collisional rates configured for {species}")
+            n_layers = len(temperature_profile)
+            return np.zeros(n_layers) << rate_unit, np.zeros(n_layers) << rate_unit, 0 << 1 / u.cm
+
+        # Choose computation method based on temperature dependence
+        if CollisionalRatesDatabase.is_temperature_dependent(species):
+            c_fi_profile, c_if_profile, mean_energy_dif = CollisionalRatesDatabase._sum_collisional_rates_t_dependent(
+                species=species,
+                temperature_profile=temperature_profile,
+                chem_profile=chem_profile,
+                density_profile=density_profile,
+                agg_lookup_cache=agg_lookup_cache,
+                id_agg_cutoff=id_agg_cutoff,
+            )
+        else:
+            # Get rates once (temperature-independent)
+            rates_table = CollisionalRatesDatabase.get_rates(
+                species=species,
+                layer_temp=None
+            )
+
+            c_fi_profile, c_if_profile, mean_energy_dif = CollisionalRatesDatabase._sum_collisional_rates(
+                rates_table=rates_table,
+                temperature_profile=temperature_profile,
+                chem_profile=chem_profile,
+                density_profile=density_profile,
+                agg_lookup_cache=agg_lookup_cache,
+                id_agg_cutoff=id_agg_cutoff,
+            )
+
+        return c_fi_profile << rate_unit, c_if_profile << rate_unit, mean_energy_dif * 1 / u.cm
+
+    @staticmethod
+    @numba.njit(cache=True, error_model="numpy")
+    def _interp_rate(temp: float, temp_grid: npt.NDArray[np.float64], rate_grid: npt.NDArray[np.float64]) -> float:
+        """Fast temperature interpolation."""
+        return np.interp(temp, temp_grid, rate_grid)
+
+    # ----------------------------------------- BEGIN SPECIES SPECIFIC METHODS -----------------------------------------
 
     @staticmethod
     def _get_oh_rates() -> t.List[RateTransition]:
@@ -156,7 +600,7 @@ class CollisionalRatesDatabase:
                 upper_key=("X2Pi", v_u),
                 lower_key=("X2Pi", v_l),
                 rate=rate,
-                mol_depend="H",
+                mol_depend="He",
             ))
 
         # Atahan & Alexander (2006) H multi-quantum quenching @ 300K; doi:10.1021/jp055860m.
@@ -174,17 +618,17 @@ class CollisionalRatesDatabase:
             ))
 
         # H single-quantum extrapolation (conservative) @ 300K
-        h_rates_extrap = [
-            # (1, 0, 1.6e-10), (2, 1, 1.7e-10),
-            (3, 2, 1.8e-10), (4, 3, 1.8e-10), (5, 4, 1.9e-10), (6, 5, 2.0e-10),
-            (7, 6, 2.1e-10), (8, 7, 2.2e-10), (9, 8, 2.3e-10), (10, 9, 2.4e-10),
-            # (11, 10, 2.6e-10),
-        ]
-        # Fit to LTE @ 1bar.
         # h_rates_extrap = [
-        #     (3, 2, 5.8e-10), (4, 3, 1.5e-09), (5, 4, 4.0e-09), (6, 5, 9.8e-09),
-        #     (7, 6, 2.4e-08), (8, 7, 7.6e-08), (9, 8, 1.8e-07), (10, 9, 5.1e-07),
+        #     # (1, 0, 1.6e-10), (2, 1, 1.7e-10),
+        #     (3, 2, 1.8e-10), (4, 3, 1.8e-10), (5, 4, 1.9e-10), (6, 5, 2.0e-10),
+        #     (7, 6, 2.1e-10), (8, 7, 2.2e-10), (9, 8, 2.3e-10), (10, 9, 2.4e-10),
+        #     # (11, 10, 2.6e-10),
         # ]
+        # Fit to LTE @ 1bar.
+        h_rates_extrap = [
+            (3, 2, 5.8e-10), (4, 3, 1.5e-09), (5, 4, 4.0e-09), (6, 5, 9.8e-09),
+            (7, 6, 2.4e-08), (8, 7, 7.6e-08), (9, 8, 1.8e-07), (10, 9, 5.1e-07),
+        ]
         for v_u, v_l, rate in h_rates_extrap:
             rates.append(RateTransition(
                 upper_key=("X2Pi", v_u),
@@ -208,12 +652,6 @@ class CollisionalRatesDatabase:
             ))
 
         return rates
-
-    @staticmethod
-    @numba.njit(cache=True, error_model="numpy")
-    def _interp_rate(temp: float, temp_grid: npt.NDArray[np.float64], rate_grid: npt.NDArray[np.float64]) -> float:
-        """Fast temperature interpolation."""
-        return np.interp(temp, temp_grid, rate_grid)
 
     @staticmethod
     def _get_co_rates(layer_temp: float) -> list[RateTransition]:
