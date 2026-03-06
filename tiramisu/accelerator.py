@@ -40,6 +40,9 @@ class LayerAccelerator:
     Tracks history and applies acceleration/damping as needed.
     """
 
+    __slots__ = ["layer_idx", "config", "change_history", "ng_history", "omega", "ng_disabled_until_iter",
+                 "last_iteration", ]
+
     def __init__(self, layer_idx: int, config: AccelerationConfig):
         self.layer_idx = layer_idx
         self.config = config
@@ -160,15 +163,15 @@ class LayerAccelerator:
         deltas = np.diff(pops, axis=0)
 
         # Build matrix A_ij = delta_n^i · delta_n^j
-        A = np.zeros((n, n))
+        a_matrix = np.zeros((n, n))
         for i in range(n):
             for j in range(n):
-                A[i, j] = np.dot(deltas[i], deltas[j])
+                a_matrix[i, j] = np.dot(deltas[i], deltas[j])
 
         # Solve for weights
         ones = np.ones(n)
-        reg = 1e-12 * np.trace(A)
-        alpha = np.linalg.solve(A + reg * np.eye(n), ones)
+        reg = 1e-12 * np.trace(a_matrix)
+        alpha = np.linalg.solve(a_matrix + reg * np.eye(n), ones)
         alpha /= alpha.sum()
 
         # Extrapolate
@@ -283,6 +286,8 @@ class HybridAccelerator:
     Convergence acceleration/damping manager for separate layers of a given species.
     """
 
+    __slots__ = ["n_layers", "config", "layer_accelerators"]
+
     def __init__(
             self,
             n_layers: int,
@@ -375,3 +380,12 @@ class HybridAccelerator:
                 acc.get_max_change()
                 for acc in self.layer_accelerators
             )
+
+    def get_max_changes(self) -> npt.NDArray[np.float64]:
+        """
+
+        Returns
+        -------
+            Array containing the maximum population changes across all layers.
+        """
+        return np.array([acc.get_max_change() for acc in self.layer_accelerators])

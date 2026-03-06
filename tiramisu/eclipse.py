@@ -105,6 +105,11 @@ def integrate_emission_quadrature(
 
 
 class ExoplanetEmission:
+    __slots__ = [
+        "planet_mass", "planet_radius", "boa_pressure", "toa_pressure", "nlayers", "chemistry_profile",
+        "temperature_profile", "ngauss", "central_pressure", "pressure_levels", "planet_gravity", "altitude",
+        "scale_height", "gravity", "dz", "density",
+    ]
 
     def __init__(
             self,
@@ -155,7 +160,6 @@ class ExoplanetEmission:
             spectral_grid: t.Optional[u.Quantity] = None,
             output_intensity: bool = False,
             incident_radiation_field: u.Quantity = None,
-            approximate_t_ex: bool = False,
     ) -> t.Tuple[u.Quantity, u.Quantity, u.Quantity, npt.NDArray[np.float64], t.Dict[SpeciesFormula, u.Quantity]]:
 
         if spectral_grid is None:
@@ -163,7 +167,7 @@ class ExoplanetEmission:
 
         spectral_grid = spectral_grid
 
-        self.mu_tau, self.mu_weights = emission_quadratures(4)
+        # self.mu_tau, self.mu_weights = emission_quadratures(4)
         opacities = xsecs.compute_opacities_profile(
             chem_profile=self.chemistry_profile,
             density_profile=self.density,
@@ -171,7 +175,6 @@ class ExoplanetEmission:
             temperature=self.temperature_profile,
             pressure=self.central_pressure,
             spectral_grid=spectral_grid,
-            approximate_t_ex=approximate_t_ex,
         )
         source_func, global_chi, global_eta = self.source_function(spectral_grid, xsecs)
         np.save(
@@ -303,7 +306,7 @@ class ExoplanetEmission:
 
         # global_chi: (n_layers, n_wn) is mixing ratio weighted sum of absorption cross-sections [cm^2].
         _, global_chi, _ = self.source_function(spectral_grid, xsecs)
-        
+
         # Kappa is the mass extinction coefficient [m^2 / kg] and rho is mass density [kg/m^3].
         # alpha_nu_r is kappa*rho = (sigma/mu)*rho, but our self.density is number density i.e. n=rho/mu.
         # Avoid bringing mu back in and just get alpha_nu_r = sigma*n.
@@ -427,7 +430,6 @@ def slant_tau(alpha_nu_r: u.Quantity, r_edges: u.Quantity, b_mid: u.Quantity) ->
     ds_mat = np.zeros((n_impacts, n_layers)) << r_edges_m.unit
     for k, b in enumerate(b_mid_m):
         ds_mat[k, :] = chord_lengths_through_shells(b, r_edges_m)
-
 
     # alpha: (n_wn, n_layers), ds_mat: (n_impacts, n_layers) -> tau: (n_impacts,n_wn) [m * 1/m -> dimensionless]
     tau = np.einsum('kn,ln->kl', ds_mat.value, alpha_nu_r.value)

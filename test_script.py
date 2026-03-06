@@ -158,10 +158,10 @@ if __name__ == "__main__":
     )
     n_lte_layers = 40
     xsecs = xsec.XSecCollection(
+        n_layers=n_layers,
         n_lte_layers=n_lte_layers,
         incident_radiation_field=incident_radiation_field,
         debug=True,
-        sor=False ,
     )
 
     hdf5_xsecs = xsec.ExomolHDF5Xsec.discover_all(
@@ -179,18 +179,17 @@ if __name__ == "__main__":
     )
     nlte_xsec = xsec.ExomolNLTEXsec(
         species="OH",
-        n_layers=n_layers,
         states_file=Path(r"/mnt/c/PhD/OH/ExoMol/16O-1H__MYTHOS.noB4.states"),
         trans_files=Path(r"/mnt/c/PhD/OH/ExoMol/16O-1H__MYTHOS.trunc.trans"),
         agg_col_nums=[9, 10],
         broadening_params=broadening_params,  # (gamma, n) for H, He
-        n_lte_layers=n_lte_layers,
         lte_grid_file=Path(r"/mnt/c/PhD/OH/Opacities/16O-1H__MYTHOS_cont.R15000_0.125-100000mu.xsec.TauREx.h5"),
         cont_states_file=Path(r"/mnt/c/PhD/OH/ExoMol/XABC11_Unbound_States_Trans/16O-1H__MYTHOS.states.cont"),
         cont_trans_files=Path(r"/mnt/c/PhD/OH/ExoMol/XABC11_Unbound_States_Trans/16O-1H__MYTHOS.trans.cont"),
         cont_box_length=6.5E-8,
         cont_broad_col_num=10,
         dissociation_products=("O", "H"),
+        approximate_t_ex=True,
         debug=True,
     )
     xsecs.add_replace_xsec_data(nlte_xsec)
@@ -207,7 +206,6 @@ if __name__ == "__main__":
         spectral_grid=spectral_grid,
         output_intensity=True,
         incident_radiation_field=incident_radiation_field,
-        approximate_t_ex=True,
     )
     # exit()
     # import matplotlib.colors as colors
