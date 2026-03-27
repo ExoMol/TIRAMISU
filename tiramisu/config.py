@@ -53,7 +53,7 @@ def setup_logging_main(logfile: str = "nlte.log"):
     root._queue_listener = listener
 
     logging.info(f"Writing outputs to {output_dir}.")
-    logging.info(f"Numba set to {numba.get_num_threads()}.")
+    logging.info(f"Numba num threads set to {numba.get_num_threads()}.")
 
 
 def worker_logging_init(queue):

@@ -196,7 +196,7 @@ class ExoplanetEmission:
         )
 
         if output_intensity:
-            if xsecs.is_converged:
+            if xsecs._is_converged:
                 out_name = "KELT-20b_nLTE_intensity_"
             else:
                 out_name = "KELT-20b_LTE_intensity_"
@@ -221,17 +221,17 @@ class ExoplanetEmission:
     ) -> t.Tuple[u.Quantity, u.Quantity, u.Quantity]:
         lte_source_func = blackbody(spectral_grid, self.temperature_profile)
 
-        negative_chi_cap = - 1e-6 * xsecs.global_chi_matrix.max(axis=1)[:, None]
-        effective_chi = np.clip(xsecs.global_chi_matrix, min=negative_chi_cap)
+        negative_chi_cap = - 1e-6 * xsecs._global_chi_matrix.max(axis=1)[:, None]
+        effective_chi = np.clip(xsecs._global_chi_matrix, min=negative_chi_cap)
         negative_source_func_cap = - lte_source_func.max(axis=1)[:, None]
 
-        effective_source_func = (xsecs.global_eta_matrix / (ac.c * effective_chi)).to(u.J / (u.sr * u.m ** 2),
-                                                                                      equivalencies=u.spectral())
+        effective_source_func = (xsecs._global_eta_matrix / (ac.c * effective_chi)).to(u.J / (u.sr * u.m ** 2),
+                                                                                       equivalencies=u.spectral())
         # Limit the effects of stimulated emission to avoid exponential overflows.
         # combined_source_func[combined_source_func < negative_source_func_cap] = negative_source_func_cap
         effective_source_func = np.clip(effective_source_func, min=negative_source_func_cap)
 
-        return effective_source_func, effective_chi, xsecs.global_eta_matrix
+        return effective_source_func, effective_chi, xsecs._global_eta_matrix
 
     def compute_transmission(
             self,
@@ -239,7 +239,6 @@ class ExoplanetEmission:
             star_radius: u.Quantity,
             spectral_grid: t.Optional[u.Quantity] = None,
             return_ratio: bool = False,
-            approximate_t_ex: bool = False,
     ) -> t.Tuple[u.Quantity, u.Quantity, u.Quantity]:
         """
         Compute the transmission spectrum of the atmosphere using the slant-geometry integral over wavenumber grid
@@ -301,7 +300,6 @@ class ExoplanetEmission:
             temperature=self.temperature_profile,
             pressure=self.central_pressure,
             spectral_grid=spectral_grid,
-            approximate_t_ex=approximate_t_ex,
         )
 
         # global_chi: (n_layers, n_wn) is mixing ratio weighted sum of absorption cross-sections [cm^2].

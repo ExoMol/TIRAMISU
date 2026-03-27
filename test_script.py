@@ -11,7 +11,7 @@ from tiramisu import xsec
 from tiramisu.chemistry import ChemicalProfile
 from tiramisu.eclipse import ExoplanetEmission
 from tiramisu.config import output_dir, setup_logging_main
-from tiramisu.nlte import incident_stellar_radiation, cdf_opacity_sampling
+from tiramisu.nlte import cdf_opacity_sampling, incident_srf
 from tiramisu.xsec import create_r_wn_grid
 from pathlib import Path
 
@@ -113,11 +113,24 @@ if __name__ == "__main__":
     planet_radius = 1.83 << u.Rjup
     star_temperature = 8730 << u.K
     orbital_radius = 0.057 << u.AU
-    incident_radiation_field = incident_stellar_radiation(
+    # KELT-20; Talens et al. (2018).
+    star_logg = 4.31
+    star_feh = -0.02
+    star_radius = 1.60 * u.R_sun
+
+    # incident_radiation_field = incident_stellar_radiation(
+    #     wn_grid=spectral_grid,
+    #     star_temperature=star_temperature,
+    #     orbital_radius=orbital_radius,
+    #     planet_radius=planet_radius
+    # )
+    incident_radiation_field = incident_srf(
+        star_temperature=star_temperature.value,
+        star_logg=star_logg,
+        star_feh=star_feh,
         wn_grid=spectral_grid,
-        star_temperature=star_temperature,
+        star_radius=star_radius,
         orbital_radius=orbital_radius,
-        planet_radius=planet_radius
     )
 
     chemistry_profile = ChemicalProfile.from_species_definition(
@@ -175,7 +188,7 @@ if __name__ == "__main__":
     # NLTE Cross-sections:
     # mass_oh = 15.99491461957 + 1.00782503223  # O + H
     broadening_params = xsec.weight_broadening_parameters(
-        broadening_dict={"H": (0.089, 0.5), "He": (0.015, 0.5)}, chemistry_profile=chemistry_profile
+        broadening_dict={"H2": (0.089, 0.5), "He": (0.015, 0.5)}, chemistry_profile=chemistry_profile
     )
     nlte_xsec = xsec.ExomolNLTEXsec(
         species="OH",
