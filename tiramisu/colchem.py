@@ -1077,8 +1077,8 @@ class CollisionalRatesDatabase:
 
         rates = []
         isomer_datasets: t.List[t.Tuple[str, t.Dict]] = [
-            ("ortho", h2o_ortho_rates),
-            ("para", h2o_para_rates),
+            ("o", h2o_ortho_rates),
+            ("p", h2o_para_rates),
         ]
 
         for isomer_label, rate_dict in isomer_datasets:

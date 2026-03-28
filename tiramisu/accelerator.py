@@ -79,7 +79,7 @@ class LayerAccelerator:
 
         # Check iteration sequence
         if iteration != self.last_iteration + 1 and iteration != self.last_iteration:
-            log.warning(f"[L{self.layer_idx}] Non-sequential iteration (I{self.last_iteration}->{iteration})")
+            log.warning(f"[nL{self.layer_idx}] Non-sequential iteration (I{self.last_iteration}->{iteration})")
 
         # Calculate change
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -98,7 +98,7 @@ class LayerAccelerator:
             self.ng_history[iteration] = pop_new.copy()
 
         if iteration < self.config.warmup_iterations:
-            log.debug(f"[L{self.layer_idx}] Warmup - no acceleration (max. change={max_change:.4e})")
+            log.debug(f"[nL{self.layer_idx}] Warmup - no acceleration (max. change={max_change:.4e})")
             self.last_iteration = iteration
             return pop_new
 
@@ -108,22 +108,22 @@ class LayerAccelerator:
                 pop_ng = self._apply_ng()
 
                 if self._ng_is_safe(pop_ng, pop_old):
-                    log.info(f"[L{self.layer_idx}] Ng acceleration (max. change={max_change:.4e})")
+                    log.info(f"[nL{self.layer_idx}] Ng acceleration (max. change={max_change:.4e})")
 
                     self.last_iteration = iteration
                     return pop_ng
                 else:
-                    log.warning(f"[L{self.layer_idx}] Ng unsafe, falling back to damping")
+                    log.warning(f"[nL{self.layer_idx}] Ng unsafe, falling back to damping")
 
                     self.ng_disabled_until_iter = iteration + self.config.ng_disable_iterations
 
             except RuntimeError as e:
-                log.warning(f"[L{self.layer_idx}] Ng failed: {e}, using damping.")
+                log.warning(f"[nL{self.layer_idx}] Ng failed: {e}, using damping.")
                 self.ng_disabled_until_iter = iteration + self.config.ng_disable_iterations
 
         pop_damped = self._apply_damping(pop_new, pop_old)
 
-        log.debug(f"[L{self.layer_idx}] Damping omega={self.omega:.3f} (max. change={max_change:.4e})")
+        log.debug(f"[nL{self.layer_idx}] Damping omega={self.omega:.3f} (max. change={max_change:.4e})")
 
         self.last_iteration = iteration
         return pop_damped
@@ -220,7 +220,7 @@ class LayerAccelerator:
                     self.config.omega_min
                 )
                 if self.omega < old_omega:
-                    log.info(f"[L{self.layer_idx}] Oscillating - omega={old_omega:.2f}->{self.omega:.2f}")
+                    log.info(f"[nL{self.layer_idx}] Oscillating - omega={old_omega:.2f}->{self.omega:.2f}")
             else:
                 # Monotonic - reduce damping (approach omega=1).
                 if self.omega < self.config.omega_max:
@@ -230,12 +230,12 @@ class LayerAccelerator:
                         self.config.omega_max
                     )
                     if self.omega > old_omega:
-                        log.debug(f"[L{self.layer_idx}] Smooth - omega={old_omega:.2f}->{self.omega:.2f}")
+                        log.debug(f"[nL{self.layer_idx}] Smooth - omega={old_omega:.2f}->{self.omega:.2f}")
 
         pop_damped = self.omega * pop_new + (1 - self.omega) * pop_old
 
         if np.any(pop_damped < 0):
-            log.warning(f"[L{self.layer_idx}] Damping produced negatives, clamping.")
+            log.warning(f"[nL{self.layer_idx}] Damping produced negatives, clamping.")
             pop_damped = np.maximum(pop_damped, 0.0)
 
         pop_damped /= pop_damped.sum()

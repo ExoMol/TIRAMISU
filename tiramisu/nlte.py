@@ -19,7 +19,7 @@ from phoenix4all import get_spectrum
 from astropy import units as u, constants as ac
 from pyarrow import parquet as pq
 
-from scipy.integrate import simpson, cumulative_simpson
+from scipy.integrate import cumulative_simpson
 from scipy.optimize import least_squares
 
 from .accelerator import HybridAccelerator
@@ -2766,85 +2766,111 @@ class NLTEProcessor:
         # self.mol_chi_matrix = super().opacity(temperature, pressure, spectral_grid)
         # self.mol_source_func_matrix = blackbody(spectral_grid=spectral_grid, temperature=temperature)
         # self.mol_eta_matrix = self.mol_source_func_matrix * self.mol_chi_matrix * ac.c
-        for layer_idx in range(self.n_lte_layers, len(temperature_profile)):
-            layer_temp = temperature_profile[layer_idx]
-            layer_pres = pressure_profile[layer_idx]
-
-            n_agg_lte_col = f"n_agg_L{layer_idx}"
-            n_lte_col = f"n_L{layer_idx}"
-            n_agg_nlte_col = f"n_agg_nlte_L{layer_idx}"
-            n_nlte_col = f"n_nlte_L{layer_idx}"
-            self._states = self._states.with_columns(
-                pl.Series(self._pop_matrix[-1, layer_idx]).gather(self._states["id_agg"]).alias(n_agg_nlte_col)
-            )
-            self._states = self._states.with_columns(
-                pl.when(pl.col(n_agg_lte_col) == 0)
-                .then(0)
-                .otherwise(pl.col(n_lte_col) * pl.col(n_agg_nlte_col) / pl.col(n_agg_lte_col))
-                .alias(n_nlte_col)
-            )
-
-            abs_xsec, emi_xsec = abs_emi_xsec(
+        n_nlte_layers = self.n_layers - self.n_lte_layers
+        abs_xsec, emi_xsec = abs_emi_xsec(
+            states=self._states,
+            trans_files=self.trans_files,
+            n_lte_layers=self.n_lte_layers,
+            n_nlte_layers=n_nlte_layers,
+            temperature_profile=temperature_profile,
+            pressure_profile=pressure_profile,
+            wn_grid=wn_grid.value,
+            species_mass=self.species_mass,
+            broadening_params=self.broadening_params,
+        )
+        if self._cont_states is not None:
+            cont_xsec = continuum_xsec(
                 states=self._states,
-                trans_files=self.trans_files,
-                layer_idx=layer_idx,
-                temperature=layer_temp,
-                pressure=layer_pres,
-                species_mass=self.species_mass,
+                continuum_states=self._cont_states,
+                continuum_trans_files=self.cont_trans_files,
+                n_lte_layers=self.n_lte_layers,
+                n_nlte_layers=n_nlte_layers,
+                temperature_profile=temperature_profile,
                 wn_grid=wn_grid.value,
-                broad_n=(self.broadening_params[1] if self.broadening_params is not None else None),
-                broad_gamma=(
-                    self.broadening_params[0][:, layer_idx] if self.broadening_params is not None else None
-                ),
+                species_mass=self.species_mass,
+                cont_box_length=self.cont_box_length
             )
-            if self._cont_states is not None:
-                nlte_select_cols = [pl.col("id"), pl.col(n_nlte_col)]
-                nlte_cont_states = self._cont_states.join(self._states.select(nlte_select_cols), on="id", how="left")
-                cont_xsec = continuum_xsec(
-                    continuum_states=nlte_cont_states,
-                    continuum_trans_files=self.cont_trans_files,
-                    layer_idx=layer_idx,
-                    wn_grid=wn_grid.value,
-                    temperature=layer_temp,
-                    species_mass=self.species_mass,
-                    cont_box_length=self.cont_box_length
-                )
-                abs_xsec += cont_xsec
-                # np.savetxt(
-                #     (
-                #             output_dir
-                #             / f"nLTE_cxsec_L{layer_idx}_T{int(layer_temp.value)}_P{layer_pres.value:.4e}.txt"
-                #     ).resolve(),
-                #     np.array([wn_grid.value, cont_xsec]).T,
-                #     fmt="%17.8E",
-                # )
-                # # LTE Comparison
-                # lte_select_cols = [pl.col("id"), pl.col(n_lte_col)]
-                # lte_cont_states = self._cont_states.join(self._states.select(lte_select_cols), on="id", how="left")
-                # # lte_cont_states = self.cont_states.merge(nlte_states[["id", "n"]], on="id", how="left")
-                # # Fudge for how continuum_xsec() picks column.
-                # lte_cont_states = lte_cont_states.with_columns(pl.col(n_lte_col).alias(n_nlte_col))
-                # lte_cont_xsec = continuum_xsec(
-                #     continuum_states=lte_cont_states,
-                #     continuum_trans_files=self.cont_trans_files,
-                #     layer_idx=layer_idx,
-                #     wn_grid=wn_grid.value,
-                #     temperature=layer_temp,
-                #     species_mass=self.species_mass,
-                #     cont_box_length=self.cont_box_length
-                # )
-                # np.savetxt(
-                #     (
-                #             output_dir
-                #             / f"LTE_cxsec_L{layer_idx}_T{int(layer_temp.value)}_P{layer_pres.value:.4e}.txt"
-                #     ).resolve(),
-                #     np.array([wn_grid.value, lte_cont_xsec]).T,
-                #     fmt="%17.8E",
-                # )
-            abs_xsec = abs_xsec << u.cm ** 2
-            self.mol_chi_matrix[layer_idx] = abs_xsec
-            emi_xsec = emi_xsec << u.erg * u.cm / (u.s * u.sr)
-            self.mol_eta_matrix[layer_idx] = emi_xsec
+            abs_xsec += cont_xsec
+        abs_xsec = abs_xsec << u.cm ** 2
+        self.mol_chi_matrix[self.n_lte_layers:] = abs_xsec
+        emi_xsec = emi_xsec << u.erg * u.cm / (u.s * u.sr)
+        self.mol_eta_matrix[self.n_lte_layers:] = emi_xsec
+
+        # for layer_idx in range(self.n_lte_layers, len(temperature_profile)):
+        #     layer_temp = temperature_profile[layer_idx]
+        #     layer_pres = pressure_profile[layer_idx]
+        #
+        #     n_agg_lte_col = f"n_agg_L{layer_idx}"
+        #     n_lte_col = f"n_L{layer_idx}"
+        #     n_agg_nlte_col = f"n_agg_nlte_L{layer_idx}"
+        #     n_nlte_col = f"n_nlte_L{layer_idx}"
+        #     self._states = self._states.with_columns(
+        #         pl.Series(self._pop_matrix[-1, layer_idx]).gather(self._states["id_agg"]).alias(n_agg_nlte_col)
+        #     )
+        #     self._states = self._states.with_columns(
+        #         pl.when(pl.col(n_agg_lte_col) == 0)
+        #         .then(0)
+        #         .otherwise(pl.col(n_lte_col) * pl.col(n_agg_nlte_col) / pl.col(n_agg_lte_col))
+        #         .alias(n_nlte_col)
+        #     )
+        #
+        #     abs_xsec, emi_xsec = abs_emi_xsec(
+        #         states=self._states,
+        #         trans_files=self.trans_files,
+        #         temperature_profile=temperature_profile,
+        #         pressure_profile=pressure_profile,
+        #         species_mass=self.species_mass,
+        #         wn_grid=wn_grid.value,
+        #         broadening_params=self.broadening_params,
+        #     )
+        #     if self._cont_states is not None:
+        #         nlte_select_cols = [pl.col("id"), pl.col(n_nlte_col)]
+        #         nlte_cont_states = self._cont_states.join(self._states.select(nlte_select_cols), on="id", how="left")
+        #         cont_xsec = continuum_xsec(
+        #             continuum_states=nlte_cont_states,
+        #             continuum_trans_files=self.cont_trans_files,
+        #             layer_idx=layer_idx,
+        #             wn_grid=wn_grid.value,
+        #             temperature=layer_temp,
+        #             species_mass=self.species_mass,
+        #             cont_box_length=self.cont_box_length
+        #         )
+        #         abs_xsec += cont_xsec
+        #         # np.savetxt(
+        #         #     (
+        #         #             output_dir
+        #         #             / f"nLTE_cxsec_L{layer_idx}_T{int(layer_temp.value)}_P{layer_pres.value:.4e}.txt"
+        #         #     ).resolve(),
+        #         #     np.array([wn_grid.value, cont_xsec]).T,
+        #         #     fmt="%17.8E",
+        #         # )
+        #         # # LTE Comparison
+        #         # lte_select_cols = [pl.col("id"), pl.col(n_lte_col)]
+        #         # lte_cont_states = self._cont_states.join(self._states.select(lte_select_cols), on="id", how="left")
+        #         # # lte_cont_states = self.cont_states.merge(nlte_states[["id", "n"]], on="id", how="left")
+        #         # # Fudge for how continuum_xsec() picks column.
+        #         # lte_cont_states = lte_cont_states.with_columns(pl.col(n_lte_col).alias(n_nlte_col))
+        #         # lte_cont_xsec = continuum_xsec(
+        #         #     continuum_states=lte_cont_states,
+        #         #     continuum_trans_files=self.cont_trans_files,
+        #         #     layer_idx=layer_idx,
+        #         #     wn_grid=wn_grid.value,
+        #         #     temperature=layer_temp,
+        #         #     species_mass=self.species_mass,
+        #         #     cont_box_length=self.cont_box_length
+        #         # )
+        #         # np.savetxt(
+        #         #     (
+        #         #             output_dir
+        #         #             / f"LTE_cxsec_L{layer_idx}_T{int(layer_temp.value)}_P{layer_pres.value:.4e}.txt"
+        #         #     ).resolve(),
+        #         #     np.array([wn_grid.value, lte_cont_xsec]).T,
+        #         #     fmt="%17.8E",
+        #         # )
+        #     abs_xsec = abs_xsec << u.cm ** 2
+        #     self.mol_chi_matrix[layer_idx] = abs_xsec
+        #     emi_xsec = emi_xsec << u.erg * u.cm / (u.s * u.sr)
+        #     self.mol_eta_matrix[layer_idx] = emi_xsec
         with open((output_dir / f"{self.species}_abs_xsec.pickle").resolve(), "wb") as abs_pickle_file:
             pickle.dump(self.mol_chi_matrix, abs_pickle_file, protocol=pickle.HIGHEST_PROTOCOL)
         with open((output_dir / f"{self.species}_emi_xsec.pickle").resolve(), "wb") as emi_pickle_file:
