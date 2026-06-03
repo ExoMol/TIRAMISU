@@ -4,7 +4,6 @@ import abc
 import pathlib
 import typing as t
 
-from scipy.integrate import simpson
 import numpy.typing as npt
 import numpy as np
 
@@ -21,6 +20,7 @@ from .nlte import (
     formal_solve_general,
     NLTEProcessor,
 )
+from .numerics import loglinear_integral_1d
 
 log = logging.getLogger(__name__)
 
@@ -34,8 +34,8 @@ def rebin_spectrum(
         new_centers: npt.NDArray[np.float64]
 ) -> npt.NDArray[np.float64]:
     """
-    Re-bin a high-resolution spectrum onto bins centered at `new_centers`
-    using integration (Simpson's rule) for scientifically accurate averaging.
+    Re-bin a high-resolution spectrum onto bins centered at `new_centers` using piecewise log-linear integration  for
+    scientifically accurate averaging.
     """
 
     # Compute bin edges
@@ -48,15 +48,27 @@ def rebin_spectrum(
 
     for i in range(len(new_centers)):
         # Mask high-res points in this bin
-        mask = (x_in >= edges[i]) & (x_in < edges[i + 1])
+        left = edges[i]
+        right = edges[i + 1]
 
-        if np.sum(mask) < 2:
-            # Fallback: interpolate if not enough points to integrate
-            y_out[i] = np.interp(new_centers[i], x_in, y_in)
-            continue
+        # Interior points only
+        mask = (x_in > left) & (x_in < right)
 
-        # Integrate and divide by bin width
-        y_out[i] = simpson(y_in[mask], x=x_in[mask]) / (edges[i + 1] - edges[i])
+        # Add exact edge values via interpolation
+        x_bin = np.concatenate((
+            [left],
+            x_in[mask],
+            [right]
+        ))
+        y_bin = np.concatenate((
+            [np.interp(left, x_in, y_in)],
+            y_in[mask],
+            [np.interp(right, x_in, y_in)]
+        ))
+        # Bin average
+        dx_bin = np.diff(x_bin)
+        bin_integral = loglinear_integral_1d(y_data=y_bin, dx=dx_bin)
+        y_out[i] = bin_integral / (right - left)
 
     return y_out
 
@@ -392,6 +404,7 @@ class ExomolNLTEXsec(ExomolHDF5Xsec):
             cont_broad_col_num: int = None,
             dissociation_products: t.Tuple = None,
             load_in_memory: bool = True,
+            do_super_lines: bool = False,
             approximate_t_ex: bool = True,
             debug: bool = False,
             debug_pop_matrix: npt.NDArray[np.float64] = None,
@@ -412,6 +425,7 @@ class ExomolNLTEXsec(ExomolHDF5Xsec):
             cont_box_length=cont_box_length,
             cont_broad_col_num=cont_broad_col_num,
             dissociation_products=dissociation_products,
+            do_super_lines=do_super_lines,
             approximate_t_ex=approximate_t_ex,
             debug=debug,
             debug_pop_matrix=debug_pop_matrix,
@@ -429,9 +443,9 @@ class ExomolNLTEXsec(ExomolHDF5Xsec):
 
         Parameters
         ----------
-        n_layers: int
+        n_layers : int
             The total number of atmospehric layers.
-        n_lte_layers:
+        n_lte_layers : int
             The number of LTE layers.
 
         Returns
@@ -713,6 +727,9 @@ class XSecCollection(dict):
     ) -> t.Dict[SpeciesFormula, u.Quantity]:
         active_species = self.active_absorbers(chem_profile.species)
 
+        spectral_grid = spectral_grid.to(1 / u.cm, equivalencies=u.spectral())
+        wn_dx = np.diff(spectral_grid)
+
         any_approximate_t_ex = False
         nlte_processors = {}
         for species in active_species:
@@ -809,8 +826,8 @@ class XSecCollection(dict):
                     density_profile=density_profile,
                     temperature_profile=temperature,
                     wn_grid=spectral_grid,
+                    wn_dx=wn_dx,
                 )
-                log.info(f"T_ex profile for {species} = {t_ex_profile}.")
                 for layer_idx in range(self.n_lte_layers, n_layers):
                     self._global_chi_matrix[layer_idx], self._global_eta_matrix[layer_idx] = (
                         processor.update_layer_global_chi_eta(
@@ -962,6 +979,7 @@ class XSecCollection(dict):
                             global_chi_matrix=self._global_chi_matrix,
                             global_source_func_matrix=self._global_source_func_matrix,
                             wn_grid=spectral_grid,
+                            wn_dx=wn_dx,
                             full_prec=self._full_prec,
                         )
                     # Solve statistical equilibrium for all species and update layer opacities, etc.

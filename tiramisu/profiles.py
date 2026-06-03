@@ -17,7 +17,7 @@ from numpy import typing as npt
 from scipy.special import roots_hermite, erf
 
 from .config import _DEFAULT_NUM_THREADS, _INTENSITY_CUTOFF, _N_GH_QUAD_POINTS
-from .numerics import simpson_normalise_2d
+from .numerics import loglinear_normalise_2d_nonnegative
 
 log = logging.getLogger(__name__)
 
@@ -141,17 +141,17 @@ def calc_band_profile_layered(
 
     Parameters
     ----------
-    wn_grid : (n_grid,)
+    wn_grid : ndarray, shape (n_grid,)
         The full wavenumber grid.
-    temperature_profile : (n_nlte_layers,)
+    temperature_profile : ndarray, shape (n_nlte_layers,)
         Kinetic temperatures for NLTE layers, float values in Kelvin.
-    pressure_profile : (n_nlte_layers,)
+    pressure_profile : ndarray, shape (n_nlte_layers,)
         Pressure for NLTE layers, float values in bars.
     species_mass : float
         Mass of the species for broadening.
-    broad_n : (n_broadeners,)
+    broad_n : ndarray, shape (n_broadeners,)
         Exponential temperature factor for pressure broadening.
-    broad_gamma : (n_broadeners, n_nlte_layers)
+    broad_gamma : ndarray, shape (n_broadeners, n_nlte_layers)
         gamma_0 for pressure broadening, weighted by mixing ratio at each layer.
     n_nlte_layers: int
         Number of NLTE layers.
@@ -228,9 +228,9 @@ def calc_continuum_band_profile_layered(
 
     Parameters
     ----------
-    wn_grid : (n_grid,)
+    wn_grid : ndarray, shape (n_grid,)
         The full wavenumber grid.
-    temperature_profile : (n_nlte_layers,)
+    temperature_profile : ndarray, shape (n_nlte_layers,)
         Kinetic temperatures for NLTE layers, plain float values in Kelvin.
     species_mass : float
         Mass of the species for broadening.
@@ -280,7 +280,7 @@ def calc_continuum_band_profile_layered(
 
 # ------------------------------------- EINSTEIN COEFFICIENTS -------------------------------------
 
-@numba.njit()
+@numba.njit(parallel=False, cache=True, error_model="numpy")
 def calc_einstein_b_fi(a_fi: npt.NDArray[np.float64], energy_fi: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
     """
     Here the Einstein B coefficient is given in :math:`\text{m}^2 / (\text{J·s})`.
@@ -302,7 +302,7 @@ def calc_einstein_b_fi(a_fi: npt.NDArray[np.float64], energy_fi: npt.NDArray[np.
     # return a_fi * (energy_fi ** 3) / (2 * ac.h * ac.c)  # LAMBDA
 
 
-@numba.njit()
+@numba.njit(parallel=False, cache=True, error_model="numpy")
 def calc_einstein_b_if(
         b_fi: npt.NDArray[np.float64],
         g_f: npt.NDArray[np.float64],
@@ -312,6 +312,71 @@ def calc_einstein_b_if(
 
 
 # ------------------------------------- PROCESS BATCH HELPERS -------------------------------------
+
+@numba.njit(parallel=True, cache=True, error_model="numpy")
+def _accumulate_batch(
+        buffer_abs: npt.NDArray[np.float64],
+        buffer_ste: npt.NDArray[np.float64],
+        buffer_spe: npt.NDArray[np.float64],
+        band_indices: npt.NDArray[np.int32],
+        bin_indices: npt.NDArray[np.int32],
+        a_fi: npt.NDArray[np.float64],
+        g_i: npt.NDArray[np.float64],
+        g_f: npt.NDArray[np.float64],
+        denom: npt.NDArray[np.float64],
+        spe_factor: npt.NDArray[np.float64],
+        id_i: npt.NDArray[np.int32],
+        id_f: npt.NDArray[np.int32],
+        n_frac_lookup: npt.NDArray[np.float64],
+):
+    """
+
+    Parameters
+    ----------
+    buffer_abs : ndarray, shape (n_bands, n_layers, n_grid)
+    buffer_ste : ndarray, shape (n_bands, n_layers, n_grid)
+    buffer_spe : ndarray, shape (n_bands, n_layers, n_grid)
+    band_indices : ndarray, shape (n_trans,)
+    bin_indices : ndarray, shape (n_trans,)
+    a_fi : ndarray, shape (n_trans,)
+    g_i : ndarray, shape (n_trans,)
+    g_f : ndarray, shape (n_trans,)
+    denom : ndarray, shape (n_trans,)
+    spe_factor : ndarray, shape (n_trans,)
+    id_i : ndarray, shape (n_trans,)
+    id_f : ndarray, shape (n_trans,)
+    n_frac_lookup : ndarray, shape (n_trans, n_layers)
+
+    Returns
+    -------
+
+    """
+    n_trans = band_indices.shape[0]
+    n_layers = n_frac_lookup.shape[1]
+
+    inv_denom = 1.0 / denom
+    abs_prefactor = a_fi * g_f * inv_denom / g_i
+    ste_prefactor = a_fi * inv_denom
+    spe_prefactor = a_fi * spe_factor
+
+    for l in numba.prange(n_layers):
+        for t in range(n_trans):
+            band_t = band_indices[t]
+            bin_t = bin_indices[t]
+            abs_prefactor_t = abs_prefactor[t]
+            ste_prefactor_t = ste_prefactor[t]
+            spe_prefactor_t = spe_prefactor[t]
+            # Accumulate into buffers.
+            buffer_abs[band_t, l, bin_t] += (
+                    abs_prefactor_t * n_frac_lookup[id_i[t], l]
+            )
+            buffer_ste[band_t, l, bin_t] += (
+                    ste_prefactor_t * n_frac_lookup[id_f[t], l]
+            )
+            buffer_spe[band_t, l, bin_t] += (
+                    spe_prefactor_t * n_frac_lookup[id_f[t], l]
+            )
+
 
 def _process_trans_batch_layered(
         trans_batch: pl.DataFrame,
@@ -339,15 +404,15 @@ def _process_trans_batch_layered(
         (broad_gamma, broad_n) where broad_gamma has shape (n_broadeners, n_total_layers).
     species_mass : float
         Mass of the species for broadening, in Daltons.
-    wn_grid : (n_grid,)
+    wn_grid : ndarray, shape (n_grid,)
         The full wavenumber grid.
     n_lte_layers : int
         Number of LTE layers.
     n_layers : int
         Total number of layers (LTE + NLTE).
-    temperature_profile : (n_nlte_layers,)
+    temperature_profile : ndarray, shape (n_nlte_layers,)
         Kinetic temperatures for NLTE layers, plain float values in Kelvin.
-    pressure_profile : (n_nlte_layers,)
+    pressure_profile : ndarray, shape (n_nlte_layers,)
         Pressures for NLTE layers, plain float values in Pascals.
 
     Returns
@@ -364,44 +429,6 @@ def _process_trans_batch_layered(
         the nlte_layer_idx == 0 branch in the original).
     """
     n_nlte_layers = n_layers - n_lte_layers
-
-    # n_frac_cols = [f"n_frac_nL{nlte_idx}" for nlte_idx in range(n_nlte_layers)]
-    #
-    # states_frac = states.with_columns(
-    #     (
-    #             pl.col(f"n_L{n_lte_layers + nlte_idx}") / pl.col(f"n_agg_L{n_lte_layers + nlte_idx}")
-    #     ).alias(f"n_frac_nL{nlte_idx}")
-    #     for nlte_idx in range(n_nlte_layers)
-    # )
-    #
-    # invariant_cols_i = ["id", "energy", "g", "id_agg"] + n_frac_cols
-    # invariant_cols_f = ["id", "energy", "g", "id_agg", "tau"] + n_frac_cols
-    #
-    # states_i = (
-    #     states_frac
-    #     .select(invariant_cols_i)
-    #     .rename({col: f"{col}_i" for col in invariant_cols_i})
-    # )
-    # states_f = (
-    #     states_frac
-    #     .select(invariant_cols_f)
-    #     .rename({col: f"{col}_f" for col in invariant_cols_f})
-    # )
-    #
-    # trans_batch = trans_batch.join(states_i, on="id_i", how="inner")
-    # trans_batch = trans_batch.join(states_f, on="id_f", how="inner")
-    # trans_batch = trans_batch.with_columns(
-    #     (pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi")
-    # )
-    #
-    # wn_min = wn_grid[0]
-    # wn_max = wn_grid[-1]
-    # trans_batch = trans_batch.filter(
-    #     (pl.col("energy_f") >= wn_min)
-    #     & (pl.col("energy_i") <= wn_max)
-    #     & (pl.col("energy_fi") >= wn_min)
-    #     & (pl.col("energy_fi") <= wn_max)
-    # )
     trans_batch = trans_batch.fill_null(strategy="zero")
     # Broadening parameters: broad_gamma needs shape (n_broadeners, n_nlte_layers).
     # In the original, broadening_params[0] has shape (n_broadeners, n_total_layers) so we slice to the NLTE columns.
@@ -416,21 +443,6 @@ def _process_trans_batch_layered(
         raise RuntimeError(f"Either broadening n or gamma missing: n={broad_n}, gamma={broad_gamma}.")
 
     # Compute band profiles for all bands and all layers at once.
-    # OLD:
-    # start_time = time.perf_counter()
-    # band_profile_partial = partial(
-    #     calc_band_profile_layered,
-    #     wn_grid,
-    #     temperature_profile,
-    #     pressure_profile,
-    #     species_mass,
-    #     broad_n,
-    #     broad_gamma,
-    #     n_nlte_layers,
-    # )
-    # band_profile_data = trans_batch.group_by(*["id_agg_f", "id_agg_i"]).map_groups(band_profile_partial)
-    # log.info(f"Trans batch duration = {time.perf_counter() - start_time:.3f}s.")
-    # NEW:
     start_time = time.perf_counter()
     id_agg_f_arr = trans_batch["id_agg_f"].to_numpy()
     id_agg_i_arr = trans_batch["id_agg_i"].to_numpy()
@@ -464,7 +476,9 @@ def _process_trans_batch_layered(
 
     gh_roots, gh_weights = roots_hermite(_N_GH_QUAD_POINTS)
 
+    log.info(f"Looping through {n_bands} bands...")
     for band_idx, (gs, ge) in enumerate(zip(group_starts, group_ends)):
+        log.info(f"Processing band idx = {band_idx}")
         abs_xsec, ste_xsec, spe_xsec = _band_profile_binned_voigt_variable_width_layered(
             wn_grid=wn_grid,
             n_i=n_frac_i_all[:, gs:ge],
@@ -486,6 +500,10 @@ def _process_trans_batch_layered(
         profile_buffer[1, band_idx] = ste_xsec
         profile_buffer[2, band_idx] = spe_xsec
     log.info(f"Numpy batch duration = {time.perf_counter() - start_time:.3f}s.")
+
+    # DEBUG
+    # combinations = trans_batch.select(["id_agg_f", "id_agg_i"]).unique().iter_rows()
+    # log.info(f"Permutations of IDs = {list(combinations)}")
 
     # Compute all rates.
     trans_batch_rates = trans_batch.filter(pl.col("id_agg_f") != pl.col("id_agg_i"))
@@ -540,7 +558,7 @@ def _process_continuum_trans_batch_layered(
         Polars DataFrame of raw transitions (id_f, id_i, A_fi).
     species_mass : float
         Mass of the species for broadening, in Daltons.
-    wn_grid : (n_grid,)
+    wn_grid : ndarray, shape (n_grid,)
         The full wavenumber grid.
     n_lte_layers : int
         Number of LTE layers.
@@ -548,7 +566,7 @@ def _process_continuum_trans_batch_layered(
         Total number of layers (LTE + NLTE).
     cont_box_length : float
         Box length off to use in continuum box broadening.
-    temperature_profile : (n_nlte_layers,)
+    temperature_profile : ndarray, shape (n_nlte_layers,)
         Kinetic temperatures for NLTE layers, plain float values in Kelvin.
 
     Returns
@@ -710,7 +728,7 @@ def _process_continuum_trans_batch_layered(
 def _analyse_profiles(
         profile_matrix_2d: npt.NDArray[np.float64], cutoff: float
 ) -> t.Tuple[npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.bool_]]:
-    # profile_matrix_2d: (n_profiles, n_grid) — caller reshapes
+    # profile_matrix_2d: (n_profiles, n_grid) - caller reshapes
     n_profiles, n_grid = profile_matrix_2d.shape
     start_idxs = np.empty(n_profiles, dtype=np.int64)
     end_idxs = np.empty(n_profiles, dtype=np.int64)
@@ -912,103 +930,19 @@ def _compute_all_cross_terms_vectorized(
 
 
 class CompactProfile:
-    __slots__ = ["temporary_profiles", "profiles", "offsets", "start_idxs", "key_idx_map", "key_lookup"]
+    __slots__ = ["profiles", "offsets", "start_idxs", "key_idx_map", "key_lookup"]
 
     def __init__(self):
-        self.temporary_profiles: pl.DataFrame | None = None
         self.profiles: npt.NDArray[np.float64] | None = None
         self.offsets: npt.NDArray[np.int64] | None = None
         self.start_idxs: npt.NDArray[np.int64] | None = None
         self.key_idx_map: npt.NDArray[np.int64] | None = None
         self.key_lookup: t.Dict[t.Tuple[int, int], int] = {}
 
-    # def finalise_old_polars(self) -> None:
-    #     """
-    #     Trimmed profiles are stored contiguously in self.profiles.
-    #
-    #     The starting indices within self.profiles of each individual profile is contained within self.offsets. An extra
-    #     terminator is stored at the end of self.offsets equal to the total length of self.profiles; this is so the start
-    #     and end indices of a given profile can always be obtained by looking at the current and next offset.
-    #
-    #     The starting position of each profile on the main wavenumber grid is stored at the corresponding index in
-    #     self.start_idxs.
-    #
-    #     The upper and lower state IDs are stored in self.key_idx_map; the index of theh first dimension of this array
-    #     matches the corresponding index in self.offsets and self.start_idxs. This is used for fast cross-section
-    #     reconstruction in :func:`tiramisu.nlte.CompactProfile.build_xsec`. A fast dictionary lookup for accessing
-    #     individual bands is stored in self.key_lookup, used by :func:`tiramisu.nlte.CompactProfile.get_profile`.
-    #
-    #     Returns
-    #     -------
-    #
-    #     """
-    #     num_profiles = self.temporary_profiles.height
-    #     if num_profiles == 0:
-    #         log.warning("CompactProfile finalising with 0 inputs!")
-    #         return
-    #
-    #     n_cols = len(self.temporary_profiles.columns)
-    #     if n_cols not in (2, 3):
-    #         raise ValueError("Unsupported number of columns in CompactProfile input.")
-    #
-    #     if n_cols == 3:
-    #         # Key is a tuple of the first two elements: (row[0], row[1])
-    #         key_selector = lambda row_data: (row_data[0], row_data[1])
-    #     else:  # n_cols == 2
-    #         # Key is the first element: row[0]
-    #         key_selector = lambda row_data: (-1, row_data[0])
-    #
-    #     profile_idx = n_cols - 1
-    #
-    #     estimate_profile_len = len(self.temporary_profiles.row(0)[profile_idx])
-    #     self.profiles = np.zeros(num_profiles * estimate_profile_len, dtype=np.float64)
-    #     # Offsets contains a terminator at the end of the array.
-    #     self.offsets = np.zeros(num_profiles + 1, dtype=int)
-    #     self.start_idxs = np.zeros(num_profiles, dtype=int)
-    #     self.key_idx_map = np.empty((num_profiles, 2), dtype=int)
-    #
-    #     current_offset = 0
-    #     store_idx = 0
-    #     for idx, row in enumerate(self.temporary_profiles.iter_rows(named=False)):
-    #         key = key_selector(row)
-    #         profile = np.array(row[profile_idx])
-    #
-    #         above = profile >= _INTENSITY_CUTOFF
-    #         if not np.any(above):
-    #             # Nothing above threshold: skip or store empty?
-    #             continue
-    #         start_idx = np.argmax(above)
-    #         end_idx = len(profile) - np.argmax(above[::-1])
-    #         trimmed = profile[start_idx:end_idx]
-    #
-    #         length = len(trimmed)
-    #         if current_offset + length > len(self.profiles):
-    #             remaining = num_profiles - idx
-    #             self.profiles.resize(len(self.profiles) + remaining * length, refcheck=False)
-    #
-    #         self.profiles[current_offset: current_offset + length] = trimmed
-    #         self.offsets[store_idx] = current_offset
-    #         self.start_idxs[store_idx] = start_idx
-    #         self.key_idx_map[store_idx, :] = key
-    #         self.key_lookup[key] = store_idx
-    #
-    #         current_offset += length
-    #         store_idx += 1
-    #
-    #     # num_final_profiles = len(self.key_idx_map)
-    #     num_final_profiles = store_idx + 1
-    #     if num_final_profiles < num_profiles:
-    #         # Some profiles where skipped (below cut-off); resize arrays.
-    #         self.offsets = self.offsets[:num_final_profiles + 1]
-    #         self.start_idxs = self.start_idxs[:num_final_profiles]
-    #     # Add terminator and trim profiles to this length, in case it was overestimated or extended.
-    #     self.offsets[-1] = current_offset
-    #     self.profiles = self.profiles[:current_offset]
-    #     self.temporary_profiles = None
-    #     log.info(f"Finalised CompactProfile with {current_offset} points for {len(self.start_idxs)} bands.")
-
-    def finalise_old(self, profile_matrix: npt.NDArray[np.float64]) -> None:
+    def finalise_from_buffer(self, profile_matrix: npt.NDArray[np.float64], keys: npt.NDArray[np.int64]):
         """
+        Finalise a set of band profiles stored in the compact super-line representation.
+
         The starting indices within self.profiles of each individual profile is contained within self.offsets. An extra
         terminator is stored at the end of self.offsets equal to the total length of self.profiles; this is so the start
         and end indices of a given profile can always be obtained by looking at the current and next offset.
@@ -1016,84 +950,94 @@ class CompactProfile:
         The starting position of each profile on the main wavenumber grid is stored at the corresponding index in
         self.start_idxs.
 
-        The upper and lower state IDs are stored in self.key_idx_map; the index of theh first dimension of this array
+        The upper and lower state IDs are stored in self.key_idx_map; the index of the first dimension of this array
         matches the corresponding index in self.offsets and self.start_idxs. This is used for fast cross-section
         reconstruction in :func:`tiramisu.nlte.CompactProfile.build_xsec`. A fast dictionary lookup for accessing
         individual bands is stored in self.key_lookup, used by :func:`tiramisu.nlte.CompactProfile.get_profile`.
 
         Parameters
         ----------
-        profile_matrix : ndarray, shape (n_agg_states, n_agg_states, n_grid)
-            Array containing the profiles for every band in the layer on the same fixed grid.
+        profile_matrix : ndarray, shape (n_bands, n_grid)
+            Profile values for every populated band on the common wavenumber grid.
+
+        keys : ndarray, shape (n_bands, 2)
+            Mapping from profile index -> (id_f_agg, id_i_agg).
+            Row i corresponds to profile_matrix[i].
+
+        Notes
+        -----
+        For each populated profile only the section exceeding _INTENSITY_CUTOFF is stored. The resulting compressed
+        arrays are:
+
+        profiles
+            Concatenated profile values.
+
+        offsets
+            Start position of each stored profile within profiles.
+
+        start_idxs
+            Starting wavenumber-grid index of each stored profile.
+
+        key_idx_map
+            (id_f_agg, id_i_agg) identifiers corresponding to each stored
+            profile.
+
+        key_lookup
+            Dictionary mapping (id_f_agg, id_i_agg) -> profile index.
         """
-        n_cols = len(profile_matrix.shape)
-        if n_cols not in (2, 3):
-            raise ValueError("Unsupported number of columns in CompactProfile input.")
+        n_profiles, n_grid = profile_matrix.shape
 
-        if n_cols == 3:
-            # Bound-bound transitions.
-            # Key is a tuple of the first two elements: (row[0], row[1])
-            key_selector = lambda key_data: (key_data[0], key_data[1])
-            num_profiles = profile_matrix.shape[0] * profile_matrix.shape[1]
-        else:  # n_cols == 2
-            # Bound-continuum transitions.
-            # Key is the first element: row[0]
-            key_selector = lambda key_data: (-1, key_data[0])
-            num_profiles = profile_matrix.shape[0]
+        if keys.shape[0] != n_profiles:
+            raise ValueError(
+                f"Number of keys ({keys.shape[0]}) does not match number of profiles ({n_profiles})."
+            )
 
-        if num_profiles == 0:
-            log.warning("CompactProfile finalising with 0 inputs!")
-            return
+        start_idxs, end_idxs, valid = _analyse_profiles(
+            profile_matrix_2d=profile_matrix,
+            cutoff=_INTENSITY_CUTOFF,
+        )
+        lengths = np.where(valid, end_idxs - start_idxs, 0)
 
-        estimate_profile_len = profile_matrix.shape[-1]
-        self.profiles = np.zeros(num_profiles * estimate_profile_len, dtype=np.float64)
-        # Offsets contains a terminator at the end of the array.
-        self.offsets = np.zeros(num_profiles + 1, dtype=int)
-        self.start_idxs = np.zeros(num_profiles, dtype=int)
-        self.key_idx_map = np.empty((num_profiles, 2), dtype=int)
+        # Prefix sum gives output offsets.
+        offsets_full = np.zeros(n_profiles + 1, dtype=np.int64)
+        offsets_full[1:] = np.cumsum(lengths)
+        total_len = offsets_full[-1]
 
-        current_offset = 0
+        profiles_out = np.empty(total_len, dtype=np.float64,)
+        _write_profiles(
+            profile_matrix_2d=profile_matrix,
+            profiles_out=profiles_out,
+            offsets_full=offsets_full,
+            start_idxs=start_idxs,
+            end_idxs=end_idxs,
+            valid=valid,
+        )
+        # Build compact index arrays (only valid entries).
+        n_valid = int(valid.sum())
+
+        self.offsets = np.empty(n_valid + 1, dtype=np.int64)
+        self.start_idxs = np.empty(n_valid, dtype=np.int64)
+        self.key_idx_map = np.empty((n_valid, 2), dtype=np.int64)
+        self.key_lookup.clear()
+
         store_idx = 0
-        # By construction, the indices in the first 2 dimensions are the id_agg values.
-        for idx, profile_idx in enumerate(np.ndindex(profile_matrix.shape[:-1])):
-            key = key_selector(profile_idx)
-            profile = np.array(profile_matrix[profile_idx])
-
-            above = profile >= _INTENSITY_CUTOFF
-            if not np.any(above):
-                # Nothing above threshold: skip or store empty?
+        for profile_idx in range(n_profiles):
+            if not valid[profile_idx]:
                 continue
-            start_idx = np.argmax(above)
-            end_idx = len(profile) - np.argmax(above[::-1])
-            trimmed = profile[start_idx:end_idx]
-
-            length = len(trimmed)
-            if current_offset + length > len(self.profiles):
-                remaining = num_profiles - idx
-                self.profiles.resize(len(self.profiles) + remaining * length, refcheck=False)
-
-            self.profiles[current_offset: current_offset + length] = trimmed
-            self.offsets[store_idx] = current_offset
-            self.start_idxs[store_idx] = start_idx
-            self.key_idx_map[store_idx, :] = key
-            self.key_lookup[key] = store_idx
-
-            current_offset += length
+            self.offsets[store_idx] = offsets_full[profile_idx]
+            self.start_idxs[store_idx] = start_idxs[profile_idx]
+            self.key_idx_map[store_idx] = keys[profile_idx]
+            self.key_lookup[(int(keys[profile_idx, 0]), int(keys[profile_idx, 1]))] = store_idx
             store_idx += 1
 
-        # num_final_profiles = len(self.key_idx_map)
-        num_final_profiles = store_idx  # + 1
-        if num_final_profiles < num_profiles:
-            # Some profiles where skipped (below cut-off); resize arrays.
-            self.offsets = self.offsets[:num_final_profiles + 1]
-            self.start_idxs = self.start_idxs[:num_final_profiles]
-        # Add terminator and trim profiles to this length, in case it was overestimated or extended.
-        self.offsets[-1] = current_offset
-        self.profiles = self.profiles[:current_offset]
-        log.info(f"Finalised CompactProfile with {current_offset} points for {len(self.start_idxs)} bands.")
+        self.offsets[n_valid] = total_len
+        self.profiles = profiles_out
+        log.info(f"Finalised CompactProfile with {total_len} points for {n_valid} bands.")
 
     def finalise(self, profile_matrix: npt.NDArray[np.float64]) -> None:
         """
+        Used when super-lines is disabled.
+
         The starting indices within self.profiles of each individual profile is contained within self.offsets. An extra
         terminator is stored at the end of self.offsets equal to the total length of self.profiles; this is so the start
         and end indices of a given profile can always be obtained by looking at the current and next offset.
@@ -1310,80 +1254,18 @@ class ProfileStore:
     def __init__(self, n_layers: int, n_agg_states: int, n_grid: int):
         self.n_layers = n_layers
         self.n_grid = n_grid
+        self.n_agg_states = n_agg_states  # Only used for non-super implementations; deprecate?
         # Accumulator buffers to write to until the final data is computed:
-        self._abs_accum = np.zeros((n_layers, n_agg_states, n_agg_states, n_grid), dtype=np.float32)
-        self._ste_accum = np.zeros_like(self._abs_accum)
-        self._spe_accum = np.zeros_like(self._abs_accum)
+        # self._abs_accum = np.zeros((n_layers, n_agg_states, n_agg_states, n_grid), dtype=np.float32)
+        # self._ste_accum = np.zeros_like(self._abs_accum)
+        # self._spe_accum = np.zeros_like(self._abs_accum)
+        self._abs_accum = None
+        self._ste_accum = None
+        self._spe_accum = None
         # Storage for final profiles.
         self.abs_profiles = [CompactProfile() for _ in range(n_layers)]  # Absorption
         self.ste_profiles = [CompactProfile() for _ in range(n_layers)]  # Stimulated Emission
         self.spe_profiles = [CompactProfile() for _ in range(n_layers)]  # Spontaneous Emission
-
-    # def add_batch_old(self, batch: pl.DataFrame) -> None:
-    #     """
-    #     Layered interface. Accepts a batch whose profile columns contain ravelled (n_nlte_layers * n_grid,) arrays
-    #     alongside n_layers and n_grid metadata columns, produced by calc_band_profile_layered.
-    #
-    #     Each band row is unravelled and the per-layer 1D slices are routed to the corresponding CompactProfile,
-    #     preserving the existing behaviour that CompactProfile.add_batch always receives 1D profiles.
-    #
-    #     Consistency checks
-    #     ------------------
-    #     - batch n_layers must equal self.n_layers on every call.
-    #     - n_grid must be consistent across all calls; stored on first call.
-    #
-    #     Parameters
-    #     ----------
-    #     batch: polars.DataFrame
-    #         Output from :func:`~profiles.ProfileStore.calc_band_profile_layered`.
-    #
-    #     Returns
-    #     -------
-    #
-    #     """
-    #     if batch.height == 0:
-    #         return
-    #
-    #     batch_n_layers = batch["n_layers"][0]
-    #     if batch_n_layers != self.n_layers:
-    #         raise ValueError(f"ProfileStore has n_layers={self.n_layers} but batch reports n_layers={batch_n_layers}.")
-    #
-    #     batch_n_grid = batch["n_grid"][0]
-    #     # if self.n_grid is None:
-    #     #     self.n_grid = batch_n_grid
-    #     if batch_n_grid != self.n_grid:
-    #         raise ValueError(f"ProfileStore has n_grid={self.n_grid} but batch reports n_grid={batch_n_grid}.")
-    #
-    #     id_agg_f = batch["id_agg_f"]
-    #     id_agg_i = batch["id_agg_i"]
-    #     n_bands = batch.height
-    #
-    #     abs_ravelled = np.stack(batch["abs_profile"].to_list()).reshape(n_bands, self.n_layers, self.n_grid)
-    #     ste_ravelled = np.stack(batch["ste_profile"].to_list()).reshape(n_bands, self.n_layers, self.n_grid)
-    #     spe_ravelled = np.stack(batch["spe_profile"].to_list()).reshape(n_bands, self.n_layers, self.n_grid)
-    #
-    #     # Pure numpy scatter-add: no Python loop over groups, no Polars overhead
-    #     np.add.at(self._abs_accum, (slice(None), id_agg_f, id_agg_i), abs_ravelled.transpose(1, 0, 2))
-    #     np.add.at(self._ste_accum, (slice(None), id_agg_f, id_agg_i), ste_ravelled.transpose(1, 0, 2))
-    #     np.add.at(self._spe_accum, (slice(None), id_agg_f, id_agg_i), spe_ravelled.transpose(1, 0, 2))
-    #
-    #     # for layer_idx in range(self.n_layers):
-    #     #     # Slice this layer's profiles: (n_bands, n_grid) -> list of 1D arrays.
-    #     #     self.abs_profiles[layer_idx].add_batch(pl.DataFrame({
-    #     #         "id_agg_f": id_agg_f,
-    #     #         "id_agg_i": id_agg_i,
-    #     #         "abs_profile": list(abs_ravelled[:, layer_idx, :]),
-    #     #     }))
-    #     #     self.ste_profiles[layer_idx].add_batch(pl.DataFrame({
-    #     #         "id_agg_f": id_agg_f,
-    #     #         "id_agg_i": id_agg_i,
-    #     #         "ste_profile": list(ste_ravelled[:, layer_idx, :]),
-    #     #     }))
-    #     #     self.spe_profiles[layer_idx].add_batch(pl.DataFrame({
-    #     #         "id_agg_f": id_agg_f,
-    #     #         "id_agg_i": id_agg_i,
-    #     #         "spe_profile": list(spe_ravelled[:, layer_idx, :]),
-    #     #     }))
 
     def add_batch(
             self,
@@ -1391,6 +1273,15 @@ class ProfileStore:
             band_id_f: npt.NDArray[np.float64],
             band_id_i: npt.NDArray[np.float64]
     ) -> None:
+        # Check accumulators are initilised.
+        accum_shape = (self.n_layers, self.n_agg_states, self.n_agg_states, self.n_grid)
+        if self._abs_accum is None:
+            self._abs_accum = np.zeros(accum_shape, dtype=np.float32)
+        if self._abs_accum is None:
+            self._abs_accum = np.zeros(accum_shape, dtype=np.float32)
+        if self._abs_accum is None:
+            self._abs_accum = np.zeros(accum_shape, dtype=np.float32)
+
         _scatter_add_profiles(
             abs_accum=self._abs_accum,
             ste_accum=self._ste_accum,
@@ -1400,15 +1291,111 @@ class ProfileStore:
             band_id_i=band_id_i,
         )
 
-    def finalise(self) -> None:
+    def finalise_from_buffer(
+            self,
+            buffer_abs: npt.NDArray[np.float64],
+            buffer_ste: npt.NDArray[np.float64],
+            buffer_spe: npt.NDArray[np.float64],
+            band_keys: npt.NDArray[np.int64],
+            save: bool = False,
+            species: str = None,
+    ) -> None:
+        """
+
+        Parameters
+        ----------
+        buffer_abs : ndarray, shape (n_bands, n_layers, n_grid)
+        buffer_ste : ndarray, shape (n_bands, n_layers, n_grid)
+        buffer_spe : ndarray, shape (n_bands, n_layers, n_grid)
+        band_keys : ndarray, shape (n_bands, 2)
+            Contains the (id_f_agg, id_i_agg) pairs for each band.
+        save : bool
+            Flag for whether compressed ProfileStore outputs should be saved.
+        species : str
+            String label for the species for naming saved outputs.
+
+        Returns
+        -------
+
+        """
+        # TEMP below!
+        export_dir = pathlib.Path(r"/mnt/c/PhD/programs/TIRAMISU/tests/outputs/")
+        export_dir.mkdir(parents=True, exist_ok=True)
+        #####
+        for l in range(self.n_layers):
+            self.abs_profiles[l].finalise_from_buffer(
+                profile_matrix=buffer_abs[:, l, :],
+                keys=band_keys,
+            )
+
+            self.ste_profiles[l].finalise_from_buffer(
+                profile_matrix=buffer_ste[:, l, :],
+                keys=band_keys,
+            )
+
+            self.spe_profiles[l].finalise_from_buffer(
+                profile_matrix=buffer_spe[:, l, :],
+                keys=band_keys,
+            )
+            if save:
+                for label, store in (
+                        ("abs", self.abs_profiles[l]),
+                        ("ste", self.ste_profiles[l]),
+                        ("spe", self.spe_profiles[l]),
+                ):
+                    if store.profiles is None:
+                        continue
+                    np.savez_compressed(
+                        export_dir / f"{species}_L{l:03d}_{label}.npz",
+                        profiles=store.profiles,  # flat 1D array of all profile data
+                        offsets=store.offsets,  # ragged array boundaries
+                        start_idxs=store.start_idxs,  # position of each profile on wn_grid
+                        key_idx_map=store.key_idx_map,
+                    )
+
+    def finalise(self, save: bool = False, species: str = None) -> None:
+        """
+
+        Parameters
+        ----------
+        save : bool
+            Flag for whether compressed ProfileStore outputs should be saved.
+        species : str
+            String label for the species for naming saved outputs.
+
+        Returns
+        -------
+
+        """
+        export_dir = pathlib.Path(r"/mnt/c/PhD/programs/TIRAMISU/tests/outputs/")
+        export_dir.mkdir(parents=True, exist_ok=True)
         for layer_idx in range(self.n_layers):
             self.abs_profiles[layer_idx].finalise(profile_matrix=self._abs_accum[layer_idx])
             self.ste_profiles[layer_idx].finalise(profile_matrix=self._ste_accum[layer_idx])
             self.spe_profiles[layer_idx].finalise(profile_matrix=self._spe_accum[layer_idx])
+            if save:
+                for label, store in (
+                        ("abs", self.abs_profiles[layer_idx]),
+                        ("ste", self.ste_profiles[layer_idx]),
+                        ("spe", self.spe_profiles[layer_idx]),
+                ):
+                    if store.profiles is None:
+                        continue
+                    np.savez_compressed(
+                        export_dir / f"{species}_L{layer_idx:03d}_{label}.npz",
+                        profiles=store.profiles,  # flat 1D array of all profile data
+                        offsets=store.offsets,  # ragged array boundaries
+                        start_idxs=store.start_idxs,  # position of each profile on wn_grid
+                        key_idx_map=store.key_idx_map,
+                    )
 
     def get_profiles(
             self, layer_idx: int, key: t.Tuple[int, int]
-    ) -> t.Tuple[t.Tuple[npt.NDArray, int], t.Tuple[npt.NDArray, int], t.Tuple[npt.NDArray, int]]:
+    ) -> t.Tuple[
+        t.Tuple[npt.NDArray[np.float64], int],
+        t.Tuple[npt.NDArray[np.float64], int],
+        t.Tuple[npt.NDArray[np.float64], int]
+    ]:
         return (
             self.abs_profiles[layer_idx].get_profile(key),
             self.ste_profiles[layer_idx].get_profile(key),
@@ -1416,7 +1403,9 @@ class ProfileStore:
         )
 
     @lru_cache(maxsize=1000)
-    def get_profile(self, layer_idx: int, key: t.Tuple[int, int], profile_type: str) -> t.Tuple[npt.NDArray, int]:
+    def get_profile(
+            self, layer_idx: int, key: t.Tuple[int, int], profile_type: str
+    ) -> t.Tuple[npt.NDArray[np.float64], int]:
         if profile_type == "abs":
             return self.abs_profiles[layer_idx].get_profile(key)
         if profile_type == "ste":
@@ -1434,43 +1423,36 @@ class ProfileStore:
         spe_profile = self.spe_profiles[layer_idx].build_xsec(pop_matrix=pop_matrix, wn_grid=wn_grid, is_abs=False)
         return abs_profile - ste_profile, spe_profile
 
-    def precompute_downward_emission_profiles(
-            self, layer_idx: int, id_agg_cutoff: int, num_grid: int
-    ) -> npt.NDArray[np.float64]:
-        """
-        Precompute spontaneous emission profiles for all upper states.
-
-        Each profile represents the total downward emission from a given upper state summed over all lower states.
-
-        Parameters
-        ----------
-        layer_idx : int
-        id_agg_cutoff : int
-        num_grid : int
-
-        Returns
-        -------
-        all_profiles : np.ndarray, shape (n_agg_states, num_grid)
-        """
-        # all_profiles = np.zeros((n_agg_states, num_grid), dtype=np.float64)
-        #
-        # for o_idx in range(n_agg_states):
-        #     all_profiles[o_idx] = self.spe_profiles[layer_idx].get_emission_from_upper(
-        #         upper_state_id=o_idx, num_grid=num_grid,
-        #     )
-        #
-        # return all_profiles
-        return self.spe_profiles[layer_idx].get_all_emission_from_upper(
-            id_agg_cutoff=id_agg_cutoff,
-            num_grid=num_grid,
-        )
+    # def precompute_downward_emission_profiles(
+    #         self, layer_idx: int, id_agg_cutoff: int, num_grid: int
+    # ) -> npt.NDArray[np.float64]:
+    #     """
+    #     Deprecated - we only need normalised profiles.
+    #     Precompute spontaneous emission profiles for all upper states.
+    #
+    #     Each profile represents the total downward emission from a given upper state summed over all lower states.
+    #
+    #     Parameters
+    #     ----------
+    #     layer_idx : int
+    #     id_agg_cutoff : int
+    #     num_grid : int
+    #
+    #     Returns
+    #     -------
+    #     all_profiles : np.ndarray, shape (n_agg_states, num_grid)
+    #     """
+    #     return self.spe_profiles[layer_idx].get_all_emission_from_upper(
+    #         id_agg_cutoff=id_agg_cutoff,
+    #         num_grid=num_grid,
+    #     )
 
     def precompute_normalised_downward_emission_profiles(
             self,
             layer_idx: int,
             id_agg_cutoff: int,
             wn_grid: u.Quantity,
-    ) -> npt.NDArray[np.float64]:
+    ) -> u.Quantity:
         """
         Precompute normalised spontaneous emission profiles for all upper states.
 
@@ -1496,7 +1478,56 @@ class ProfileStore:
             id_agg_cutoff=id_agg_cutoff,
             num_grid=wn_grid.shape[0],
         )
-        return simpson_normalise_2d(y_data=all_profiles, x_data=wn_grid.value) << 1 / wn_grid.unit
+        wn_dx = np.diff(wn_grid.value)
+        # return simpson_normalise_2d(y_data=all_profiles, x_data=wn_grid.value) << 1 / wn_grid.unit
+        return loglinear_normalise_2d_nonnegative(y_data=all_profiles, dx=wn_dx) << 1 / wn_grid.unit
+
+    def get_sorted_band_keys(
+            self, num_max: int, id_cutoff: int, agg_energies: npt.NDArray[np.float64], profile_type: str = "abs",
+    ) -> t.List[t.Tuple[int, int]]:
+        """
+        Returns band keys (id_agg_f, id_agg_i) from the CompactProfile for the given layer, sorted by energy gap
+        (id_agg_f - id_agg_i) ascending, then by id_agg_i, then by id_agg_f. Returns at most num_max keys.
+
+        Parameters
+        ----------
+        num_max : int
+            Maximum number of keys to return.
+        id_cutoff : int
+            ID above which states are fixed, so key pairs containing IDs above this should be excluded.
+        agg_energies : ndarray
+            Array containing the energies for each aggregate state ordered on id_agg (ascending).
+        profile_type : str
+            One of "abs", "ste", "spe" - selects which CompactProfile to inspect.
+
+        Returns
+        -------
+        List of (id_agg_f, id_agg_i) tuples in the above order.
+        """
+        match profile_type:
+            case "abs":
+                profiles = self.abs_profiles
+            case "ste":
+                profiles = self.ste_profiles
+            case "spe":
+                profiles = self.spe_profiles
+            case _:
+                raise ValueError(f"Unknown profile_type '{profile_type}': expected 'abs', 'ste' or 'spe'.")
+
+        key_sets = [set(compact.key_lookup.keys()) for compact in profiles]
+        common_keys = key_sets[0].intersection(*key_sets[1:])
+        common_keys = [k for k in common_keys if id_cutoff >= k[0] > k[1] >= 0]
+
+        def sort_key(k):
+            id_f, id_i = k
+            e_i = agg_energies[id_i]  # lower state energy
+            e_f = agg_energies[id_f]  # upper state energy
+            nu = e_f - e_i  # band centre frequency
+            return e_i, nu
+
+        common_keys.sort(key=sort_key)
+
+        return common_keys[:num_max]
 
 
 class ContinuumProfileStore:
@@ -1656,14 +1687,35 @@ def abs_emi_xsec(
         pressure_profile: npt.NDArray[np.float64],
         wn_grid: npt.NDArray[np.float64],
         species_mass: float,
-        broadening_params: npt.NDArray[np.float64] = None,
+        broadening_params: t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]] = None,
         n_gh_quad_points: int = _N_GH_QUAD_POINTS,
-):
+) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """
+    Uses sampled profiles for final computations, so GH quadrature is deprecated.
+
+    Parameters
+    ----------
+    states
+    trans_files
+    n_lte_layers
+    n_nlte_layers
+    temperature_profile
+    pressure_profile
+    wn_grid
+    species_mass
+    broadening_params
+    n_gh_quad_points: int
+        Deprecated Gauss-Hermite quadrature for binned Voigt profiles.
+
+    Returns
+    -------
+
+    """
     half_bin_width = abs(wn_grid[1] - wn_grid[0]) / 2.0
     # TODO: Check is_fixed_width rigour!
     is_fixed_width = np.all(np.isclose(np.diff(wn_grid), np.abs(wn_grid[1] - wn_grid[0]), atol=0))
     num_grid = wn_grid.shape[0]
-    abs_xsec = np.zeros((n_lte_layers, num_grid), dtype=np.float64)
+    abs_xsec = np.zeros((n_nlte_layers, num_grid), dtype=np.float64)
     emi_xsec = np.zeros_like(abs_xsec, dtype=np.float64)
 
     wn_min = wn_grid[0]
@@ -1672,7 +1724,7 @@ def abs_emi_xsec(
     n_cols = [f"n_nlte_L{n_lte_layers + nlte_idx}" for nlte_idx in range(n_nlte_layers)]
 
     invariant_cols_i = ["id", "energy", "g"] + n_cols
-    invariant_cols_f = ["id", "energy", "g" "tau"] + n_cols
+    invariant_cols_f = ["id", "energy", "g", "tau"] + n_cols
 
     states_i = (
         states
@@ -1684,7 +1736,7 @@ def abs_emi_xsec(
         .select(invariant_cols_f)
         .rename({col: f"{col}_f" for col in invariant_cols_f})
     )
-    # Plain float arrays — no astropy units — passed directly to Numba.
+    # Plain float arrays - no astropy units - passed directly to Numba.
     temperature_slice = temperature_profile[n_lte_layers:]  # (n_nlte_layers,)
     pressure_slice = pressure_profile[n_lte_layers:]  # (n_nlte_layers,)
 
@@ -1723,9 +1775,9 @@ def abs_emi_xsec(
                         .join(states_f, on="id_f", how="inner")
                         .with_columns((pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi"))
                         .filter(
-                            (pl.col("energy_f") >= wn_min)
-                            & (pl.col("energy_i") <= wn_max)
-                            & (pl.col("energy_fi") >= wn_min)
+                            # (pl.col("energy_f") >= wn_min)
+                            # & (pl.col("energy_i") <= wn_max)
+                            (pl.col("energy_fi") >= wn_min)
                             & (pl.col("energy_fi") <= wn_max)
                         )
                         .fill_null(strategy="zero")
@@ -1785,9 +1837,9 @@ def abs_emi_xsec(
                     .join(states_f, on="id_f", how="inner")
                     .with_columns((pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi"))
                     .filter(
-                        (pl.col("energy_f") >= wn_min)
-                        & (pl.col("energy_i") <= wn_max)
-                        & (pl.col("energy_fi") >= wn_min)
+                        # (pl.col("energy_f") >= wn_min)
+                        # & (pl.col("energy_i") <= wn_max)
+                        (pl.col("energy_fi") >= wn_min)
                         & (pl.col("energy_fi") <= wn_max)
                     )
                     .fill_null(strategy="zero")
@@ -1827,86 +1879,86 @@ def abs_emi_xsec(
                 abs_xsec += _abs_xsec
                 emi_xsec += _emi_xsec
     log.info(f"DEBUG: new rates/profiles duration = {time.perf_counter() - process_time:.3f}.")
-            # OLD:
-            # final_cols = ["n_nlte_i", "n_nlte_f", "A_fi", "g_f", "g_i", "energy_fi", "tau_f"]
-            # trans_batch = trans_batch.select(final_cols)
-            # trans_chunk_np = trans_batch.to_numpy()
-            # # Matches final_cols ordering.
-            # n_i = np.ascontiguousarray(trans_chunk_np[:, 0])
-            # n_f = np.ascontiguousarray(trans_chunk_np[:, 1])
-            # a_fi = np.ascontiguousarray(trans_chunk_np[:, 2])
-            # g_f = np.ascontiguousarray(trans_chunk_np[:, 3])
-            # g_i = np.ascontiguousarray(trans_chunk_np[:, 4])
-            # energy_fi = np.ascontiguousarray(trans_chunk_np[:, 5])
-            # lifetimes = np.ascontiguousarray(trans_chunk_np[:, 6])
-            #
-            # if broad_n is None or broad_gamma is None:
-            #     if is_fixed_width:
-            #         _abs_xsec, _emi_xsec = _abs_emi_binned_doppler_fixed_width(
-            #             wn_grid=wn_grid,
-            #             n_i=n_i,
-            #             n_f=n_f,
-            #             a_fi=a_fi,
-            #             g_f=g_f,
-            #             g_i=g_i,
-            #             energy_fi=energy_fi,
-            #             temperature=temperature.value,
-            #             species_mass=species_mass,
-            #             half_bin_width=half_bin_width,
-            #         )
-            #     else:
-            #         _abs_xsec, _emi_xsec = _abs_emi_binned_doppler_variable_width(
-            #             wn_grid=wn_grid,
-            #             n_i=n_i,
-            #             n_f=n_f,
-            #             a_fi=a_fi,
-            #             g_f=g_f,
-            #             g_i=g_i,
-            #             energy_fi=energy_fi,
-            #             temperature=temperature.value,
-            #             species_mass=species_mass,
-            #         )
-            # else:
-            #     gh_roots, gh_weights = roots_hermite(n_gh_quad_points)
-            #     if is_fixed_width:
-            #         _abs_xsec, _emi_xsec = _abs_emi_binned_voigt_fixed_width(
-            #             wn_grid=wn_grid,
-            #             n_i=n_i,
-            #             n_f=n_f,
-            #             a_fi=a_fi,
-            #             g_f=g_f,
-            #             g_i=g_i,
-            #             energy_fi=energy_fi,
-            #             lifetimes=lifetimes,
-            #             temperature=temperature.value,
-            #             pressure=pressure.value,
-            #             broad_n=broad_n,
-            #             broad_gamma=broad_gamma,
-            #             species_mass=species_mass,
-            #             half_bin_width=half_bin_width,
-            #             gh_roots=gh_roots,
-            #             gh_weights=gh_weights,
-            #         )
-            #     else:
-            #         _abs_xsec, _emi_xsec = _abs_emi_binned_voigt_variable_width(
-            #             wn_grid=wn_grid,
-            #             n_i=n_i,
-            #             n_f=n_f,
-            #             a_fi=a_fi,
-            #             g_f=g_f,
-            #             g_i=g_i,
-            #             energy_fi=energy_fi,
-            #             lifetimes=lifetimes,
-            #             temperature=temperature.value,
-            #             pressure=pressure.value,
-            #             broad_n=broad_n,
-            #             broad_gamma=broad_gamma,
-            #             species_mass=species_mass,
-            #             gh_roots=gh_roots,
-            #             gh_weights=gh_weights,
-            #         )
-            # abs_xsec += _abs_xsec
-            # emi_xsec += _emi_xsec
+    # OLD:
+    # final_cols = ["n_nlte_i", "n_nlte_f", "A_fi", "g_f", "g_i", "energy_fi", "tau_f"]
+    # trans_batch = trans_batch.select(final_cols)
+    # trans_chunk_np = trans_batch.to_numpy()
+    # # Matches final_cols ordering.
+    # n_i = np.ascontiguousarray(trans_chunk_np[:, 0])
+    # n_f = np.ascontiguousarray(trans_chunk_np[:, 1])
+    # a_fi = np.ascontiguousarray(trans_chunk_np[:, 2])
+    # g_f = np.ascontiguousarray(trans_chunk_np[:, 3])
+    # g_i = np.ascontiguousarray(trans_chunk_np[:, 4])
+    # energy_fi = np.ascontiguousarray(trans_chunk_np[:, 5])
+    # lifetimes = np.ascontiguousarray(trans_chunk_np[:, 6])
+    #
+    # if broad_n is None or broad_gamma is None:
+    #     if is_fixed_width:
+    #         _abs_xsec, _emi_xsec = _abs_emi_binned_doppler_fixed_width(
+    #             wn_grid=wn_grid,
+    #             n_i=n_i,
+    #             n_f=n_f,
+    #             a_fi=a_fi,
+    #             g_f=g_f,
+    #             g_i=g_i,
+    #             energy_fi=energy_fi,
+    #             temperature=temperature.value,
+    #             species_mass=species_mass,
+    #             half_bin_width=half_bin_width,
+    #         )
+    #     else:
+    #         _abs_xsec, _emi_xsec = _abs_emi_binned_doppler_variable_width(
+    #             wn_grid=wn_grid,
+    #             n_i=n_i,
+    #             n_f=n_f,
+    #             a_fi=a_fi,
+    #             g_f=g_f,
+    #             g_i=g_i,
+    #             energy_fi=energy_fi,
+    #             temperature=temperature.value,
+    #             species_mass=species_mass,
+    #         )
+    # else:
+    #     gh_roots, gh_weights = roots_hermite(n_gh_quad_points)
+    #     if is_fixed_width:
+    #         _abs_xsec, _emi_xsec = _abs_emi_binned_voigt_fixed_width(
+    #             wn_grid=wn_grid,
+    #             n_i=n_i,
+    #             n_f=n_f,
+    #             a_fi=a_fi,
+    #             g_f=g_f,
+    #             g_i=g_i,
+    #             energy_fi=energy_fi,
+    #             lifetimes=lifetimes,
+    #             temperature=temperature.value,
+    #             pressure=pressure.value,
+    #             broad_n=broad_n,
+    #             broad_gamma=broad_gamma,
+    #             species_mass=species_mass,
+    #             half_bin_width=half_bin_width,
+    #             gh_roots=gh_roots,
+    #             gh_weights=gh_weights,
+    #         )
+    #     else:
+    #         _abs_xsec, _emi_xsec = _abs_emi_binned_voigt_variable_width(
+    #             wn_grid=wn_grid,
+    #             n_i=n_i,
+    #             n_f=n_f,
+    #             a_fi=a_fi,
+    #             g_f=g_f,
+    #             g_i=g_i,
+    #             energy_fi=energy_fi,
+    #             lifetimes=lifetimes,
+    #             temperature=temperature.value,
+    #             pressure=pressure.value,
+    #             broad_n=broad_n,
+    #             broad_gamma=broad_gamma,
+    #             species_mass=species_mass,
+    #             gh_roots=gh_roots,
+    #             gh_weights=gh_weights,
+    #         )
+    # abs_xsec += _abs_xsec
+    # emi_xsec += _emi_xsec
     return abs_xsec, emi_xsec
 
 
@@ -1932,7 +1984,7 @@ def continuum_xsec(
 
     cont_states = continuum_states.join(states.select(select_cols), on="id", how="left")
 
-    invariant_cols_i = ["id", "energy", "g",] + n_cols
+    invariant_cols_i = ["id", "energy", "g", ] + n_cols
     invariant_cols_f = ["id", "energy", "g", "v"] + n_cols
 
     states_i = (
@@ -1945,7 +1997,7 @@ def continuum_xsec(
         .select(invariant_cols_f)
         .rename({col: f"{col}_f" for col in invariant_cols_f})
     )
-    # Plain float arrays — no astropy units — passed directly to Numba.
+    # Plain float arrays - no astropy units - passed directly to Numba.
     temperature_slice = temperature_profile[n_lte_layers:]  # (n_nlte_layers,)
 
     trans_columns = ["id_f", "id_i", "A_fi"]
@@ -1976,9 +2028,9 @@ def continuum_xsec(
                         .join(states_f, on="id_f", how="inner")
                         .with_columns((pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi"))
                         .filter(
-                            (pl.col("energy_f") >= wn_min)
-                            & (pl.col("energy_i") <= wn_max)
-                            & (pl.col("energy_fi") >= wn_min)
+                            # (pl.col("energy_f") >= wn_min)
+                            # & (pl.col("energy_i") <= wn_max)
+                            (pl.col("energy_fi") >= wn_min)
                             & (pl.col("energy_fi") <= wn_max)
                         )
                         .fill_null(strategy="zero")
@@ -2030,9 +2082,9 @@ def continuum_xsec(
                     .join(states_f, on="id_f", how="inner")
                     .with_columns((pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi"))
                     .filter(
-                        (pl.col("energy_f") >= wn_min)
-                        & (pl.col("energy_i") <= wn_max)
-                        & (pl.col("energy_fi") >= wn_min)
+                        # (pl.col("energy_f") >= wn_min)
+                        # & (pl.col("energy_i") <= wn_max)
+                        (pl.col("energy_fi") >= wn_min)
                         & (pl.col("energy_fi") <= wn_max)
                     )
                     .fill_null(strategy="zero")
@@ -2186,7 +2238,7 @@ def _voigt_humlicek_w(x: float, y: float) -> float:
 
     Returns
     -------
-    float  Re[w(z)] — proportional to the Voigt profile at this point.
+    float  Re[w(z)] - proportional to the Voigt profile at this point.
     """
     humlicek_t = y - 1j * x  # Numba supports complex arithmetic in njit
 
@@ -2210,7 +2262,7 @@ def _voigt_humlicek_w(x: float, y: float) -> float:
     else:
         # Region 4: intermediate, exponential term dominates.
         humlicek_u = humlicek_t * humlicek_t
-        humlicek_w = math.exp(humlicek_u) - humlicek_t * (
+        humlicek_w = np.exp(humlicek_u) - humlicek_t * (
                 36183.31 - humlicek_u * (3321.99 - humlicek_u * (1540.787 - humlicek_u * (
                 219.031 - humlicek_u * (35.7668 - humlicek_u * (1.320522 - humlicek_u * 0.56419)))))
         ) / (
@@ -2220,6 +2272,131 @@ def _voigt_humlicek_w(x: float, y: float) -> float:
                      )
 
     return humlicek_w.real
+
+
+# ------------------------------------------- BAND PROFILE ACCUMULATORS -------------------------------------------
+@numba.njit(parallel=True, cache=True, error_model="numpy")
+def _broaden_superline_buffer(
+        buffer_abs: npt.NDArray[np.float64],
+        buffer_ste: npt.NDArray[np.float64],
+        buffer_spe: npt.NDArray[np.float64],
+        wn_grid: npt.NDArray[np.float64],
+        temperatures: npt.NDArray[np.float64],
+        pressures: npt.NDArray[np.float64],
+        broad_n: npt.NDArray[np.float64],
+        broad_gamma: npt.NDArray[np.float64],
+        species_mass: float,
+        n_bands_used,
+        t_ref=296.0,
+        pressure_ref=1.0,
+) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """
+    Parameters
+    ----------
+    buffer_abs : (n_bands, n_layers, n_grid)
+        Accumulated absorption super-line coefficients per band per layer per grid bin.
+    buffer_ste : (n_bands, n_layers, n_grid)
+        Accumulated stimulated emission super-line coefficients per band per layer per grid bin.
+    buffer_spe : (n_bands, n_layers, n_grid)
+        Accumulated spontaneous emission super-line coefficients per band per layer per grid bin.
+    wn_grid : ndarray, shape (n_grid,)
+    temperatures : ndarray, shape (n_layers,)
+    pressures : ndarray, shape (n_layers,)
+    broad_n : ndarray, shape (n_broadeners,)
+    broad_gamma : ndarray, shape (n_broadeners, n_layers)
+        Note: layers on axis-1, matching broadening_params[0].
+    species_mass : float
+    n_bands_used : int
+        How many entries in axis-0 of the buffers actually contain data.
+
+    Returns
+    -------
+    out_abs, out_ste, out_spe : each (n_bands_used, n_layers, n_grid)
+    """
+    n_layers = temperatures.shape[0]
+    n_grid = wn_grid.shape[0]
+    n_broad = broad_n.shape[0]
+    cutoff = 25.0
+
+    out_abs = np.zeros((n_bands_used, n_layers, n_grid), dtype=np.float64)
+    out_ste = np.zeros((n_bands_used, n_layers, n_grid), dtype=np.float64)
+    out_spe = np.zeros((n_bands_used, n_layers, n_grid), dtype=np.float64)
+
+    sqrt2 = np.sqrt(2.0)
+    sqrt2_NA_kB_on_c = sqrt2 * const_sqrt_NA_kB_on_c
+    inv_sqrt_pi = 1 / np.sqrt(np.pi)
+
+    inv_sigma_sqrt2 = np.empty((n_grid, n_layers), dtype=np.float64)
+    # gamma_total = np.empty((n_layers, n_grid), dtype=np.float64)
+    gamma_total = np.empty((n_layers,), dtype=np.float64)
+    # Voigt y-parameter: gamma_L / (sigma_D * sqrt(2)).
+    # sigma here is the Gaussian sigma (standard deviation), so
+    # sigma_D * sqrt(2) = sigma * sqrt(2).
+    y_voigt = np.empty((n_grid, n_layers), dtype=np.float64)
+    # gamma_lifetime = 1.0 / (const_4_pi_c * lifetimes)  # (n_trans,)
+
+    for l in range(n_layers):
+        temp_l = temperatures[l]
+        pres_l = pressures[l]
+        inv_sigma_sqrt2_l = 1 / (wn_grid * sqrt2_NA_kB_on_c * np.sqrt(temp_l / species_mass))
+        inv_sigma_sqrt2[:, l] = inv_sigma_sqrt2_l
+
+        gamma_pressure_l = 0.0
+        for b in range(n_broad):
+            gamma_pressure_l += broad_gamma[b, l] * pres_l * (t_ref / temp_l) ** broad_n[b] / pressure_ref
+        # gamma_total[l] = gamma_lifetime + gamma_pressure_l
+        gamma_total[l] = gamma_pressure_l
+        y_voigt[:, l] = gamma_total[l] * inv_sigma_sqrt2_l
+
+    # Bin edges for natural linewidth from accumulated A_fi.
+    # gamma_lifetime[band, bin] = A_fi_sum / (4 * pi * c) — approximation for super-line.
+    # Only needed for occupied bins so we compute inline below.
+
+    # Precompute occupation mask: True if any layer has nonzero coefficients.
+    occupied = np.zeros((n_bands_used, n_grid), dtype=numba.boolean)
+    for band in numba.prange(n_bands_used):
+        for i in range(n_grid):
+            for l in range(n_layers):
+                # Loop and l/i index ordering could maybe be changed.
+                if buffer_abs[band, l, i] != 0.0 or buffer_ste[band, l, i] != 0.0 or buffer_spe[band, l, i] != 0.0:
+                    occupied[band, i] = True
+                    break
+
+    # Parallelise over bands — each band is fully independent.
+    for band in numba.prange(n_bands_used):
+        # As in other implementations, "i" tracks transitions.
+        for i in range(n_grid):
+            # Super-line centre is the bin centre.
+            if not occupied[band, i]:
+                continue
+            energy_i = wn_grid[i]
+            transition_min = energy_i - cutoff
+            transition_max = energy_i + cutoff
+            j_start = max(0, _binary_search_left(wn_grid, transition_min))
+            j_end = min(n_grid, _binary_search_right(wn_grid, transition_max) + 1)
+
+            for l in range(n_layers):
+                abs_li = buffer_abs[band, l, i]
+                ste_li = buffer_ste[band, l, i]
+                spe_li = buffer_spe[band, l, i]
+                # Skip empty bins.
+                if abs_li == 0.0 and ste_li == 0.0 and spe_li == 0.0:
+                    continue
+                inv_sigma_sqrt2_il = inv_sigma_sqrt2[i, l]
+                y_il = y_voigt[i, l]
+                # Integral of Re[w(x,y)] dx = sqrt(pi), so the normalised Voigt is Re[w(z)] / (sigma * sqrt(2*pi)).
+                norm = inv_sigma_sqrt2_il * inv_sqrt_pi
+
+                for j in range(j_start, j_end):
+                    wn_j = wn_grid[j]
+                    x_ij = (wn_j - energy_i) * inv_sigma_sqrt2_il
+                    voigt_val = _voigt_humlicek_w(x_ij, y_il) * norm
+
+                    out_abs[band, l, j] += abs_li * voigt_val
+                    out_ste[band, l, j] += ste_li * voigt_val
+                    out_spe[band, l, j] += spe_li * voigt_val
+
+    return out_abs, out_ste, out_spe
 
 
 # ------------------------------------- ALL LAYER, BINNED VOIGT CALCULATIONS -------------------------------------
@@ -2248,38 +2425,37 @@ def _band_profile_binned_voigt_variable_width_layered(
     """
     Vectorised multi-layer variant of _band_profile_binned_voigt_variable_width.
 
-    Computes absorption, stimulated emission, and spontaneous emission profiles
-    for all layers simultaneously. The bin_term inner loop — the dominant cost —
-    is computed once per transition per grid point and reused across all layers,
-    with only the per-layer coefficients (which depend on populations,
-    temperature, and pressure) applied on top.
+    Computes absorption, stimulated emission, and spontaneous emission profiles for all layers simultaneously. The
+    bin_term inner loop - the dominant cost - is computed once per transition per grid point and reused across all 
+    layers, with only the per-layer coefficients (which depend on populations, temperature, and pressure) applied on 
+    top.
 
     Parameters
     ----------
-    wn_grid : (n_grid,)
-    n_i : (n_layers, n_trans)
+    wn_grid : ndarray, shape (n_grid,)
+    n_i : ndarray, shape (n_layers, n_trans)
        LTE population fractions of lower states, per layer.
-    n_f : (n_layers, n_trans)
+    n_f : ndarray, shape (n_layers, n_trans)
        LTE population fractions of upper states, per layer.
-    a_fi : (n_trans,)
-    g_f : (n_trans,)
-    g_i : (n_trans,)
-    energy_fi : (n_trans,)
-    lifetimes : (n_trans,)
-    temperatures : (n_layers,)
-    pressures : (n_layers,)
-    broad_n : (n_broadeners,)
-    broad_gamma : (n_broadeners, n_layers)
+    a_fi : ndarray, shape (n_trans,)
+    g_f : ndarray, shape (n_trans,)
+    g_i : ndarray, shape (n_trans,)
+    energy_fi : ndarray, shape (n_trans,)
+    lifetimes : ndarray, shape (n_trans,)
+    temperatures : ndarray, shape (n_layers,)
+    pressures : ndarray, shape (n_layers,)
+    broad_n : ndarray, shape (n_broadeners,)
+    broad_gamma : ndarray, shape (n_broadeners, n_layers)
         Note: layers on axis-1, matching broadening_params[0].
     species_mass : float
-    gh_roots : (n_gh,)
-    gh_weights : (n_gh,)
+    gh_roots : ndarray, shape (n_gh,)
+    gh_weights : ndarray, shape (n_gh,)
 
     Returns
     -------
-    abs_xsec : (n_layers, n_grid)
-    ste_xsec : (n_layers, n_grid)
-    spe_xsec : (n_layers, n_grid)
+    abs_xsec : ndarray, shape (n_layers, n_grid)
+    ste_xsec : ndarray, shape (n_layers, n_grid)
+    spe_xsec : ndarray, shape (n_layers, n_grid)
     """
     n_layers = temperatures.shape[0]
     num_grid = wn_grid.shape[0]
@@ -2287,7 +2463,7 @@ def _band_profile_binned_voigt_variable_width_layered(
     num_broad = broad_n.shape[0]
     cutoff = 25
 
-    # Bin geometry — identical to the 1-D version, computed once.
+    # Bin geometry - identical to the 1-D version, computed once.
     bin_edges = np.empty(num_grid + 1, dtype=np.float64)
     bin_edges[0] = wn_grid[0] - (wn_grid[1] - wn_grid[0]) * 0.5
     for j in range(1, num_grid):
@@ -2348,7 +2524,7 @@ def _band_profile_binned_voigt_variable_width_layered(
         transition_min = energy_fi_i - cutoff
         transition_max = energy_fi_i + cutoff
 
-        # Grid range is the same for all layers — compute once.
+        # Grid range is the same for all layers - compute once.
         j_start = _binary_search_right(bin_edges, transition_min) - 1
         j_start = max(0, j_start)
         j_end = _binary_search_left(bin_edges, transition_max, start=j_start)
@@ -2439,37 +2615,37 @@ def _band_profile_binned_voigt_fixed_width_layered(
     Vectorised multi-layer variant of _band_profile_binned_voigt_variable_width.
 
     Computes absorption, stimulated emission, and spontaneous emission profiles
-    for all layers simultaneously. The bin_term inner loop — the dominant cost —
+    for all layers simultaneously. The bin_term inner loop - the dominant cost -
     is computed once per transition per grid point and reused across all layers,
     with only the per-layer coefficients (which depend on populations,
     temperature, and pressure) applied on top.
 
     Parameters
     ----------
-    wn_grid : (n_grid,)
-    n_i : (n_layers, n_trans)
+    wn_grid : ndarray, shape (n_grid,)
+    n_i : ndarray, shape (n_layers, n_trans)
        LTE population fractions of lower states, per layer.
-    n_f : (n_layers, n_trans)
+    n_f : ndarray, shape (n_layers, n_trans)
        LTE population fractions of upper states, per layer.
-    a_fi : (n_trans,)
-    g_f : (n_trans,)
-    g_i : (n_trans,)
-    energy_fi : (n_trans,)
-    lifetimes : (n_trans,)
-    temperatures : (n_layers,)
-    pressures : (n_layers,)
-    broad_n : (n_broadeners,)
-    broad_gamma : (n_broadeners, n_layers)
+    a_fi : ndarray, shape (n_trans,)
+    g_f : ndarray, shape (n_trans,)
+    g_i : ndarray, shape (n_trans,)
+    energy_fi : ndarray, shape (n_trans,)
+    lifetimes : ndarray, shape (n_trans,)
+    temperatures : ndarray, shape (n_layers,)
+    pressures : ndarray, shape (n_layers,)
+    broad_n : ndarray, shape (n_broadeners,)
+    broad_gamma : ndarray, shape (n_broadeners, n_layers)
         Note: layers on axis-1, matching broadening_params[0].
     species_mass : float
-    gh_roots : (n_gh,)
-    gh_weights : (n_gh,)
+    gh_roots : ndarray, shape (n_gh,)
+    gh_weights : ndarray, shape (n_gh,)
 
     Returns
     -------
-    abs_xsec : (n_layers, n_grid)
-    ste_xsec : (n_layers, n_grid)
-    spe_xsec : (n_layers, n_grid)
+    abs_xsec : ndarray, shape (n_layers, n_grid)
+    ste_xsec : ndarray, shape (n_layers, n_grid)
+    spe_xsec : ndarray, shape (n_layers, n_grid)
     """
     n_layers = temperatures.shape[0]
     num_grid = wn_grid.shape[0]
@@ -2478,7 +2654,7 @@ def _band_profile_binned_voigt_fixed_width_layered(
     bin_width = 2.0 * half_bin_width
     cutoff = 25 + half_bin_width
 
-    # Bin geometry — identical to the 1-D version, computed once.
+    # Bin geometry - identical to the 1-D version, computed once.
     bin_edges = np.empty(num_grid + 1, dtype=np.float64)
     bin_edges[0] = wn_grid[0] - (wn_grid[1] - wn_grid[0]) * 0.5
     for j in range(1, num_grid):
@@ -2527,7 +2703,7 @@ def _band_profile_binned_voigt_fixed_width_layered(
         transition_min = energy_fi_i - cutoff
         transition_max = energy_fi_i + cutoff
 
-        # Grid range is the same for all layers — compute once.
+        # Grid range is the same for all layers - compute once.
         j_start = _binary_search_right(bin_edges, transition_min) - 1
         j_start = max(0, j_start)
         j_end = _binary_search_left(bin_edges, transition_max, start=j_start)
@@ -2612,7 +2788,7 @@ def _abs_emi_binned_voigt_variable_width_layered(
 ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
     """
     Computes absorption (including stimulated emission) and spontaneous emission profiles for all layers simultaneously.
-    The bin_term inner loop — the dominant cost — is computed once per transition per grid point and reused across all
+    The bin_term inner loop - the dominant cost - is computed once per transition per grid point and reused across all
     layers, with only the per-layer coefficients (which depend on populations, temperature, and pressure) applied on
     top.
 
@@ -2620,29 +2796,29 @@ def _abs_emi_binned_voigt_variable_width_layered(
 
     Parameters
     ----------
-    wn_grid : (n_grid,)
-    n_i : (n_layers, n_trans)
+    wn_grid : ndarray, shape (n_grid,)
+    n_i : ndarray, shape (n_layers, n_trans)
        LTE population fractions of lower states, per layer.
-    n_f : (n_layers, n_trans)
+    n_f : ndarray, shape (n_layers, n_trans)
        LTE population fractions of upper states, per layer.
-    a_fi : (n_trans,)
-    g_f : (n_trans,)
-    g_i : (n_trans,)
-    energy_fi : (n_trans,)
-    lifetimes : (n_trans,)
-    temperatures : (n_layers,)
-    pressures : (n_layers,)
-    broad_n : (n_broadeners,)
-    broad_gamma : (n_broadeners, n_layers)
+    a_fi : ndarray, shape (n_trans,)
+    g_f : ndarray, shape (n_trans,)
+    g_i : ndarray, shape (n_trans,)
+    energy_fi : ndarray, shape (n_trans,)
+    lifetimes : ndarray, shape (n_trans,)
+    temperatures : ndarray, shape (n_layers,)
+    pressures : ndarray, shape (n_layers,)
+    broad_n : ndarray, shape (n_broadeners,)
+    broad_gamma : ndarray, shape (n_broadeners, n_layers)
         Note: layers on axis-1, matching broadening_params[0].
     species_mass : float
-    gh_roots : (n_gh,)
-    gh_weights : (n_gh,)
+    gh_roots : ndarray, shape (n_gh,)
+    gh_weights : ndarray, shape (n_gh,)
 
     Returns
     -------
-    abs_xsec : (n_layers, n_grid)
-    emi_xsec : (n_layers, n_grid)
+    abs_xsec : ndarray, shape (n_layers, n_grid)
+    emi_xsec : ndarray, shape (n_layers, n_grid)
     """
     n_layers = temperatures.shape[0]
     num_grid = wn_grid.shape[0]
@@ -2650,7 +2826,7 @@ def _abs_emi_binned_voigt_variable_width_layered(
     num_broad = broad_n.shape[0]
     cutoff = 25
 
-    # Bin geometry — identical to the 1-D version, computed once.
+    # Bin geometry - identical to the 1-D version, computed once.
     bin_edges = np.empty(num_grid + 1, dtype=np.float64)
     bin_edges[0] = wn_grid[0] - (wn_grid[1] - wn_grid[0]) * 0.5
     for j in range(1, num_grid):
@@ -2704,7 +2880,7 @@ def _abs_emi_binned_voigt_variable_width_layered(
         transition_min = energy_fi_i - cutoff
         transition_max = energy_fi_i + cutoff
 
-        # Grid range is the same for all layers — compute once.
+        # Grid range is the same for all layers - compute once.
         j_start = _binary_search_right(bin_edges, transition_min) - 1
         j_start = max(0, j_start)
         j_end = _binary_search_left(bin_edges, transition_max, start=j_start)
@@ -2787,7 +2963,7 @@ def _abs_emi_binned_voigt_fixed_width_layered(
 ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
     """
     Computes absorption (including stimulated emission) and spontaneous emission profiles for all layers simultaneously.
-    The bin_term inner loop — the dominant cost — is computed once per transition per grid point and reused across all
+    The bin_term inner loop - the dominant cost - is computed once per transition per grid point and reused across all
     layers, with only the per-layer coefficients (which depend on populations, temperature, and pressure) applied on
     top.
 
@@ -2795,29 +2971,29 @@ def _abs_emi_binned_voigt_fixed_width_layered(
 
     Parameters
     ----------
-    wn_grid : (n_grid,)
-    n_i : (n_layers, n_trans)
+    wn_grid : ndarray, shape (n_grid,)
+    n_i : ndarray, shape (n_layers, n_trans)
        LTE population fractions of lower states, per layer.
-    n_f : (n_layers, n_trans)
+    n_f : ndarray, shape (n_layers, n_trans)
        LTE population fractions of upper states, per layer.
-    a_fi : (n_trans,)
-    g_f : (n_trans,)
-    g_i : (n_trans,)
-    energy_fi : (n_trans,)
-    lifetimes : (n_trans,)
-    temperatures : (n_layers,)
-    pressures : (n_layers,)
-    broad_n : (n_broadeners,)
-    broad_gamma : (n_broadeners, n_layers)
+    a_fi : ndarray, shape (n_trans,)
+    g_f : ndarray, shape (n_trans,)
+    g_i : ndarray, shape (n_trans,)
+    energy_fi : ndarray, shape (n_trans,)
+    lifetimes : ndarray, shape (n_trans,)
+    temperatures : ndarray, shape (n_layers,)
+    pressures : ndarray, shape (n_layers,)
+    broad_n : ndarray, shape (n_broadeners,)
+    broad_gamma : ndarray, shape (n_broadeners, n_layers)
         Note: layers on axis-1, matching broadening_params[0].
     species_mass : float
-    gh_roots : (n_gh,)
-    gh_weights : (n_gh,)
+    gh_roots : ndarray, shape (n_gh,)
+    gh_weights : ndarray, shape (n_gh,)
 
     Returns
     -------
-    abs_xsec : (n_layers, n_grid)
-    emi_xsec : (n_layers, n_grid)
+    abs_xsec : ndarray, shape (n_layers, n_grid)
+    emi_xsec : ndarray, shape (n_layers, n_grid)
     """
     n_layers = temperatures.shape[0]
     num_grid = wn_grid.shape[0]
@@ -2826,7 +3002,7 @@ def _abs_emi_binned_voigt_fixed_width_layered(
     bin_width = 2.0 * half_bin_width
     cutoff = 25 + half_bin_width
 
-    # Bin geometry — identical to the 1-D version, computed once.
+    # Bin geometry - identical to the 1-D version, computed once.
     bin_edges = np.empty(num_grid + 1, dtype=np.float64)
     bin_edges[0] = wn_grid[0] - (wn_grid[1] - wn_grid[0]) * 0.5
     for j in range(1, num_grid):
@@ -2873,7 +3049,7 @@ def _abs_emi_binned_voigt_fixed_width_layered(
         transition_min = energy_fi_i - cutoff
         transition_max = energy_fi_i + cutoff
 
-        # Grid range is the same for all layers — compute once.
+        # Grid range is the same for all layers - compute once.
         j_start = _binary_search_right(bin_edges, transition_min) - 1
         j_start = max(0, j_start)
         j_end = _binary_search_left(bin_edges, transition_max, start=j_start)
@@ -2955,7 +3131,7 @@ def _band_profile_sampled_voigt_layered(
 
     Evaluates the Voigt profile at each wn_grid point directly rather than integrating over bins. This is faster per
     grid point than the binned version (no quadrature loop) but less accurate for coarse grids where the bin width is
-    comparable to the line width — in that regime the binned version is preferred. For high-resolution grids (resolving
+    comparable to the line width - in that regime the binned version is preferred. For high-resolution grids (resolving
     power, R >> line width / grid spacing) the two should converge.
 
     Can be used for wn_grid input with variable or fixed grid spacing, as profiles are compute at grid points and are
@@ -2963,28 +3139,28 @@ def _band_profile_sampled_voigt_layered(
 
     Parameters
     ----------
-    wn_grid : (n_grid,)
-    n_i : (n_layers, n_trans)
+    wn_grid : ndarray, shape (n_grid,)
+    n_i : ndarray, shape (n_layers, n_trans)
        LTE population fractions of lower states, per layer.
-    n_f : (n_layers, n_trans)
+    n_f : ndarray, shape (n_layers, n_trans)
        LTE population fractions of upper states, per layer.
-    a_fi : (n_trans,)
-    g_f : (n_trans,)
-    g_i : (n_trans,)
-    energy_fi : (n_trans,)
-    lifetimes : (n_trans,)
-    temperatures : (n_layers,)
-    pressures : (n_layers,)
-    broad_n : (n_broadeners,)
-    broad_gamma : (n_broadeners, n_layers)
+    a_fi : ndarray, shape (n_trans,)
+    g_f : ndarray, shape (n_trans,)
+    g_i : ndarray, shape (n_trans,)
+    energy_fi : ndarray, shape (n_trans,)
+    lifetimes : ndarray, shape (n_trans,)
+    temperatures : ndarray, shape (n_layers,)
+    pressures : ndarray, shape (n_layers,)
+    broad_n : ndarray, shape (n_broadeners,)
+    broad_gamma : ndarray, shape (n_broadeners, n_layers)
         Note: layers on axis-1, matching broadening_params[0].
     species_mass : float
 
     Returns
     -------
-    abs_xsec : (n_layers, n_grid)
-    ste_xsec : (n_layers, n_grid)
-    spe_xsec : (n_layers, n_grid)
+    abs_xsec : ndarray, shape (n_layers, n_grid)
+    ste_xsec : ndarray, shape (n_layers, n_grid)
+    spe_xsec : ndarray, shape (n_layers, n_grid)
     """
     n_layers = temperatures.shape[0]
     num_grid = wn_grid.shape[0]
@@ -3106,7 +3282,7 @@ def _abs_emi_sampled_voigt_layered(
 
     Evaluates the Voigt profile at each wn_grid point directly rather than integrating over bins. This is faster per
     grid point than the binned version (no quadrature loop) but less accurate for coarse grids where the bin width is
-    comparable to the line width — in that regime the binned version is preferred. For high-resolution grids (resolving
+    comparable to the line width - in that regime the binned version is preferred. For high-resolution grids (resolving
     power, R >> line width / grid spacing) the two should converge.
 
     Can be used for wn_grid input with variable or fixed grid spacing, as profiles are compute at grid points and are
@@ -3114,27 +3290,27 @@ def _abs_emi_sampled_voigt_layered(
 
     Parameters
     ----------
-    wn_grid : (n_grid,)
-    n_i : (n_layers, n_trans)
+    wn_grid : ndarray, shape (n_grid,)
+    n_i : ndarray, shape (n_layers, n_trans)
        LTE population fractions of lower states, per layer.
-    n_f : (n_layers, n_trans)
+    n_f : ndarray, shape (n_layers, n_trans)
        LTE population fractions of upper states, per layer.
-    a_fi : (n_trans,)
-    g_f : (n_trans,)
-    g_i : (n_trans,)
-    energy_fi : (n_trans,)
-    lifetimes : (n_trans,)
-    temperatures : (n_layers,)
-    pressures : (n_layers,)
-    broad_n : (n_broadeners,)
-    broad_gamma : (n_broadeners, n_layers)
+    a_fi : ndarray, shape (n_trans,)
+    g_f : ndarray, shape (n_trans,)
+    g_i : ndarray, shape (n_trans,)
+    energy_fi : ndarray, shape (n_trans,)
+    lifetimes : ndarray, shape (n_trans,)
+    temperatures : ndarray, shape (n_layers,)
+    pressures : ndarray, shape (n_layers,)
+    broad_n : ndarray, shape (n_broadeners,)
+    broad_gamma : ndarray, shape (n_broadeners, n_layers)
         Note: layers on axis-1, matching broadening_params[0].
     species_mass : float
 
     Returns
     -------
-    abs_xsec : (n_layers, n_grid)
-    emi_xsec : (n_layers, n_grid)
+    abs_xsec : ndarray, shape (n_layers, n_grid)
+    emi_xsec : ndarray, shape (n_layers, n_grid)
     """
     n_layers = temperatures.shape[0]
     num_grid = wn_grid.shape[0]
@@ -3245,24 +3421,24 @@ def _continuum_profile_binned_gauss_variable_width_layered(
 
     Parameters
     ----------
-    wn_grid : (n_grid,)
-    n_i : (n_layers, n_trans)
-    a_fi : (n_trans,)
-    g_f : (n_trans,)
-    g_i : (n_trans,)
-    energy_fi : (n_trans,)
-    v_f : (n_trans,)
-    temperatures : (n_layers,)
+    wn_grid : ndarray, shape (n_grid,)
+    n_i : ndarray, shape (n_layers, n_trans)
+    a_fi : ndarray, shape (n_trans,)
+    g_f : ndarray, shape (n_trans,)
+    g_i : ndarray, shape (n_trans,)
+    energy_fi : ndarray, shape (n_trans,)
+    v_f : ndarray, shape (n_trans,)
+    temperatures : ndarray, shape (n_layers,)
     species_mass : float
     box_length : float
-    erf_lut: np.ndarray
+    erf_lut : ndarray
         Precomputed error function look-up table.
-    erf_arg_max: float
+    erf_arg_max : float
         Maximum argument value for the precomputed error function look-up table.
 
     Returns
     -------
-    abs_xsec : (n_layers, n_grid)
+    abs_xsec : ndarray, shape (n_layers, n_grid)
     """
     n_layers = temperatures.shape[0]
     num_grid = wn_grid.shape[0]
@@ -3274,7 +3450,7 @@ def _continuum_profile_binned_gauss_variable_width_layered(
     max_cutoff = 3000.0
     cutoff_fwhm_multiple = 5.0
 
-    # Bin geometry — identical to the 1-D version, computed once.
+    # Bin geometry - identical to the 1-D version, computed once.
     bin_edges = np.empty(num_grid + 1, dtype=np.float64)
     bin_edges[0] = wn_grid[0] - (wn_grid[1] - wn_grid[0]) * 0.5
     for j in range(1, num_grid):
@@ -3333,7 +3509,7 @@ def _continuum_profile_binned_gauss_variable_width_layered(
         transition_min = energy_fi_i - cutoff_i
         transition_max = energy_fi_i + cutoff_i
 
-        # Grid range is the same for all layers — compute once.
+        # Grid range is the same for all layers - compute once.
         j_start = _binary_search_right(bin_edges, transition_min) - 1
         j_start = max(0, j_start)
         j_end = _binary_search_left(bin_edges, transition_max, start=j_start)
@@ -3395,14 +3571,14 @@ def _continuum_profile_binned_gauss_fixed_width_layered(
 
     Parameters
     ----------
-    wn_grid : (n_grid,)
-    n_i : (n_layers, n_trans)
-    a_fi : (n_trans,)
-    g_f : (n_trans,)
-    g_i : (n_trans,)
-    energy_fi : (n_trans,)
-    v_f : (n_trans,)
-    temperatures : (n_layers,)
+    wn_grid : ndarray, shape (n_grid,)
+    n_i : ndarray, shape (n_layers, n_trans)
+    a_fi : ndarray, shape (n_trans,)
+    g_f : ndarray, shape (n_trans,)
+    g_i : ndarray, shape (n_trans,)
+    energy_fi : ndarray, shape (n_trans,)
+    v_f : ndarray, shape (n_trans,)
+    temperatures : ndarray, shape (n_layers,)
     species_mass : float
     half_bin_width: float
     box_length : float
@@ -3413,7 +3589,7 @@ def _continuum_profile_binned_gauss_fixed_width_layered(
 
     Returns
     -------
-    abs_xsec : (n_layers, n_grid)
+    abs_xsec : ndarray, shape (n_layers, n_grid)
     """
     n_layers = temperatures.shape[0]
     num_grid = wn_grid.shape[0]
@@ -3426,7 +3602,7 @@ def _continuum_profile_binned_gauss_fixed_width_layered(
     max_cutoff = 3000.0
     cutoff_fwhm_multiple = 5.0
 
-    # Bin geometry — identical to the 1-D version, computed once.
+    # Bin geometry - identical to the 1-D version, computed once.
     bin_edges = np.empty(num_grid + 1, dtype=np.float64)
     bin_edges[0] = wn_grid[0] - (wn_grid[1] - wn_grid[0]) * 0.5
     for j in range(1, num_grid):
@@ -3481,7 +3657,7 @@ def _continuum_profile_binned_gauss_fixed_width_layered(
         transition_min = energy_fi_i - cutoff_i
         transition_max = energy_fi_i + cutoff_i
 
-        # Grid range is the same for all layers — compute once.
+        # Grid range is the same for all layers - compute once.
         j_start = _binary_search_right(bin_edges, transition_min) - 1
         j_start = max(0, j_start)
         j_end = _binary_search_left(bin_edges, transition_max, start=j_start)
@@ -3538,7 +3714,7 @@ def _continuum_profile_sampled_gauss_layered(
     Sampled (non-binned) multi-layer Gaussian continuum cross-section.
 
     Evaluates the Gaussian profile at each wn_grid point directly rather than integrating over bins. Grid spacing is
-    irrelevant — only the values of wn_grid matter, so this function works equally for uniform, logarithmic, or
+    irrelevant - only the values of wn_grid matter, so this function works equally for uniform, logarithmic, or
     irregular grids.
 
     The cutoff strategy mirrors the binned version: a fixed window per transition derived from the maximum alpha_total
@@ -3547,20 +3723,20 @@ def _continuum_profile_sampled_gauss_layered(
 
     Parameters
     ----------
-    wn_grid : (n_grid,)
-    n_i : (n_layers, n_trans)
-    a_fi : (n_trans,)
-    g_f : (n_trans,)
-    g_i : (n_trans,)
-    energy_fi : (n_trans,)
-    v_f : (n_trans,)
-    temperatures : (n_layers,)
+    wn_grid : ndarray, shape (n_grid,)
+    n_i : ndarray, shape (n_layers, n_trans)
+    a_fi : ndarray, shape (n_trans,)
+    g_f : ndarray, shape (n_trans,)
+    g_i : ndarray, shape (n_trans,)
+    energy_fi : ndarray, shape (n_trans,)
+    v_f : ndarray, shape (n_trans,)
+    temperatures : ndarray, shape (n_layers,)
     species_mass : float
     box_length : float
 
     Returns
     -------
-    abs_xsec : (n_layers, n_grid)
+    abs_xsec : ndarray, shape (n_layers, n_grid)
     """
     n_layers = temperatures.shape[0]
     num_grid = wn_grid.shape[0]

@@ -32,6 +32,7 @@ autodoc_member_order = 'bysource'
 autodoc_typehints = 'description'
 typehints_fully_qualified = False
 typehints_defaults = "braces"
+# napoleon_use_rtype = True
 
 autodoc_default_options = {
     'members': True,

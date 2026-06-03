@@ -3,10 +3,10 @@ import abc
 import pathlib
 import pickle
 import time
+import itertools
 import typing as t
 from concurrent.futures import ThreadPoolExecutor
 
-import numpy.typing as npt
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -23,14 +23,16 @@ from scipy.integrate import cumulative_simpson
 from scipy.optimize import least_squares
 
 from .accelerator import HybridAccelerator
-from .atomic_nuclear_data import get_molecular_mass, get_number_of_atoms
 from .chemistry import SpeciesFormula, ChemicalProfile
 from .colchem import CollisionalRatesDatabase, RateTransition
 from .config import output_dir
-from .numerics import simpson_normalise_quantity_2d, simpson_quantity_2d, simpson_normalise_quantity_1d, \
-    simpson_quantity, simpson_normalise_1d
-from .profiles import ProfileStore, ContinuumProfileStore, _process_trans_batch_layered, \
-    _process_continuum_trans_batch_layered, abs_emi_xsec, continuum_xsec
+from .numerics import (loglinear_normalise_1d_nonnegative, loglinear_normalise_quantity_2d_nonnegative,
+                       loglinear_normalise_quantity_1d_nonnegative, loglinear_integral_quantity_1d,
+                       loglinear_integral_quantity_1d_nonnegative, loglinear_integral_quantity_2d_nonnegative)
+from .profiles import (ProfileStore, ContinuumProfileStore, _process_trans_batch_layered,
+                       _process_continuum_trans_batch_layered, abs_emi_xsec, continuum_xsec, const_8_pi_c,
+                       calc_einstein_b_fi, calc_einstein_b_if, _accumulate_batch, const_h_c_on_4_pi,
+                       _broaden_superline_buffer)
 
 log = logging.getLogger(__name__)
 
@@ -737,7 +739,9 @@ def incident_srf(
         logg=star_logg,
         feh=star_feh,
         alpha=star_alpha,
-        source="synphot",
+        # source="synphot",
+        source="svo",
+        model_name="bt-settl-cifist",
     )
     # srf_flux has units of erg / (Angstrom s cm^2)
     srf_wn = srf_wavelength.to(1 / u.cm, equivalencies=u.spectral())
@@ -869,13 +873,15 @@ def cdf_opacity_sampling(
         wn_end: float,
         temperature_profile: npt.NDArray[np.float64],
         num_points: int,
-        max_step: float = None,
+        max_step: float,
         num_cdf_points: int = 1000000,
 ) -> u.Quantity:
     temp_wn_grid = np.linspace(wn_start, wn_end, num_cdf_points, dtype=np.float64)
     ev_grid = calc_ev_grid(wn_grid=temp_wn_grid, temperature=np.atleast_1d(temperature_profile)[:, None]).sum(axis=0)
     # ev_norm = ev_grid / simpson(ev_grid, x=temp_wn_grid)
-    ev_norm = simpson_normalise_1d(y_data=ev_grid, x_data=temp_wn_grid)
+    temp_dx = np.diff(temp_wn_grid)
+    # ev_norm = simpson_normalise_1d(y_data=ev_grid, x_data=temp_wn_grid)
+    ev_norm = loglinear_normalise_1d_nonnegative(y_data=ev_grid, dx=temp_dx)
 
     ev_cdf = cumulative_simpson(ev_norm, x=temp_wn_grid, initial=0)
 
@@ -1080,13 +1086,13 @@ class NLTEProcessor:
     __slots__ = [
         # Public:
         "species", "states_file", "trans_files", "agg_col_nums", "agg_col_names", "species_mass", "broadening_params",
-        "mol_chi_matrix", "mol_eta_matrix", "cont_states_file", "cont_trans_files", "cont_box_length",
-        "cont_broad_col_num", "dissociation_products", "n_layers", "n_lte_layers", "accelerator", "approximate_t_ex",
-        "debug", "debug_pop_matrix",
+        "cont_states_file", "cont_trans_files", "cont_box_length", "cont_broad_col_num", "dissociation_products",
+        "do_super_lines", "approximate_t_ex", "debug", "debug_pop_matrix",
         # Private:
         "_states", "_n_agg_states", "_agg_states", "_id_agg_cutoff", "_rates_grid", "_profile_store", "_pop_matrix",
-        "_cont_states", "_cont_rates", "_cont_profile_store", "_nlte_pop_frac", "_agg_lookup_cache", "_a_ox_vals",
-        "_col_chem_c_matrix", "_col_chem_rhs_c",
+        "_mol_chi_matrix", "_mol_eta_matrix", "_cont_states", "_cont_rates", "_cont_profile_store", "_accelerator",
+        "_nlte_pop_frac", "_agg_lookup_cache", "_a_ox_vals", "_col_chem_c_matrix", "_col_chem_rhs_c", "_n_layers",
+        "_n_lte_layers",
     ]
 
     def __init__(
@@ -1095,22 +1101,25 @@ class NLTEProcessor:
             states_file: pathlib.Path,
             trans_files: pathlib.Path | t.List[pathlib.Path],
             agg_col_nums: t.List[int],
-            broadening_params: t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]] = None,
-            cont_states_file: pathlib.Path = None,
+            broadening_params: t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]] | None = None,
+            cont_states_file: pathlib.Path | None = None,
             cont_trans_files: pathlib.Path | t.List[pathlib.Path] = None,
-            cont_box_length: float = None,
-            cont_broad_col_num: int = None,
-            dissociation_products: t.Tuple = None,
+            cont_box_length: float | None = None,
+            cont_broad_col_num: int | None = None,
+            dissociation_products: t.Tuple[str] | None = None,
+            do_super_lines: bool = False,
             approximate_t_ex: bool = True,
             debug: bool = False,
             debug_pop_matrix: npt.NDArray[np.float64] = None,
     ):
         self.species = SpeciesFormula(species)
+
         if isinstance(states_file, str):
             states_file = pathlib.Path(states_file)
         self.states_file: pathlib.Path = states_file
         if not self.states_file.is_file():
             raise RuntimeError(f"{self.species} states file not found at {self.states_file}.")
+
         if isinstance(trans_files, str):
             trans_files = [pathlib.Path(trans_files)]
         elif not isinstance(trans_files, list):
@@ -1119,19 +1128,29 @@ class NLTEProcessor:
         for trans_file in self.trans_files:
             if not trans_file.is_file():
                 raise RuntimeError(f"{self.species} trans file not found at {trans_file}.")
+
         self.agg_col_nums: t.List[int] = agg_col_nums
         self.agg_col_names: t.List[str] = ["agg" + str(idx + 1) for idx in range(0, len(self.agg_col_nums))]
-        self.species_mass: float = get_molecular_mass(species)
+
+        # self.species_mass: float = get_molecular_mass(species)
+        self.species_mass: float = self.species.mass
         self.broadening_params = broadening_params
+
+        # Required, set during runtime/setup.
+        self._n_layers: int | None = None
+        self._n_lte_layers: int | None = None
+        self._accelerator: HybridAccelerator | None = None
         self._states: pl.DataFrame | None = None
         self._n_agg_states: int | None = None
         self._agg_states: pl.DataFrame | None = None
         self._id_agg_cutoff: int | None = None
         self._rates_grid: pl.DataFrame | None = None
         self._profile_store: ProfileStore | None = None
-        self.mol_chi_matrix: u.Quantity | None = None
-        self.mol_eta_matrix: u.Quantity | None = None
+        self._mol_chi_matrix: u.Quantity | None = None
+        self._mol_eta_matrix: u.Quantity | None = None
         self._pop_matrix: npt.NDArray[np.float64] | None = None
+
+        # Continuum properties.
         if isinstance(cont_states_file, str):
             cont_states_file = pathlib.Path(cont_states_file)
         self.cont_states_file: pathlib.Path = cont_states_file
@@ -1158,9 +1177,8 @@ class NLTEProcessor:
                 "column index for box broadening n."
             )
         self.dissociation_products: t.Tuple = dissociation_products
-        self.n_layers: int | None = None
-        self.n_lte_layers: int | None = None
-        self.accelerator: HybridAccelerator | None = None
+
+        self.do_super_lines = do_super_lines
         self.approximate_t_ex = approximate_t_ex
         self.debug: bool = debug
         self.debug_pop_matrix: npt.NDArray[np.float64] | None = debug_pop_matrix
@@ -1170,9 +1188,132 @@ class NLTEProcessor:
         self._col_chem_c_matrix = None
         self._col_chem_rhs_c = None
 
+    # Properties and setters for required fields that aren't set at initialisation.
+    @property
+    def n_layers(self) -> int:
+        if self._n_layers is None:
+            raise RuntimeError(f"{self.species} NLTEProcessor field 'n_layers' not initialised.")
+        return self._n_layers
+
+    @n_layers.setter
+    def n_layers(self, value: int) -> None:
+        self._n_layers = value
+
+    @property
+    def n_lte_layers(self) -> int:
+        if self._n_lte_layers is None:
+            raise RuntimeError(f"{self.species} NLTEProcessor field 'n_lte_layers' not initialised.")
+        return self._n_lte_layers
+
+    @n_lte_layers.setter
+    def n_lte_layers(self, value: int) -> None:
+        self._n_lte_layers = value
+
+    @property
+    def n_agg_states(self) -> int:
+        if self._n_agg_states is None:
+            raise RuntimeError(f"{self.species} NLTEProcessor field 'n_agg_states' not initialised.")
+        return self._n_agg_states
+
+    @n_agg_states.setter
+    def n_agg_states(self, value: int) -> None:
+        self._n_agg_states = value
+
+    @property
+    def id_agg_cutoff(self) -> int:
+        if self._id_agg_cutoff is None:
+            raise RuntimeError(f"{self.species} NLTEProcessor field 'id_agg_cutoff' not initialised.")
+        return self._id_agg_cutoff
+
+    @id_agg_cutoff.setter
+    def id_agg_cutoff(self, value: int) -> None:
+        self._id_agg_cutoff = value
+
+    @property
+    def states(self) -> pl.DataFrame:
+        if self._states is None:
+            raise RuntimeError(f"{self.species} NLTEProcessor field 'states' not initialised.")
+        return self._states
+
+    @states.setter
+    def states(self, value: pl.DataFrame) -> None:
+        self._states = value
+
+    @property
+    def agg_states(self) -> pl.DataFrame:
+        if self._agg_states is None:
+            raise RuntimeError(f"{self.species} NLTEProcessor field 'agg_states' not initialised.")
+        return self._agg_states
+
+    @agg_states.setter
+    def agg_states(self, value: pl.DataFrame) -> None:
+        self._agg_states = value
+
+    @property
+    def rates_grid(self) -> pl.DataFrame:
+        if self._rates_grid is None:
+            raise RuntimeError(f"{self.species} NLTEProcessor field 'rates_grid' not initialised.")
+        return self._rates_grid
+
+    @rates_grid.setter
+    def rates_grid(self, value: pl.DataFrame) -> None:
+        self._rates_grid = value
+
+    @property
+    def profile_store(self) -> ProfileStore:
+        if self._profile_store is None:
+            raise RuntimeError(f"{self.species} NLTEProcessor field 'profile_store' not initialised.")
+        return self._profile_store
+
+    @profile_store.setter
+    def profile_store(self, value: ProfileStore) -> None:
+        self._profile_store = value
+
+    @property
+    def pop_matrix(self) -> npt.NDArray[np.float64]:
+        if self._pop_matrix is None:
+            raise RuntimeError(f"{self.species} NLTEProcessor field 'pop_matrix' not initialised.")
+        return self._pop_matrix
+
+    @pop_matrix.setter
+    def pop_matrix(self, value: npt.NDArray[np.float64]) -> None:
+        self._pop_matrix = value
+
+    @property
+    def accelerator(self) -> HybridAccelerator:
+        if self._accelerator is None:
+            raise RuntimeError(f"{self.species} NLTEProcessor field 'accelerator' not initialised.")
+        return self._accelerator
+
+    @accelerator.setter
+    def accelerator(self, value: HybridAccelerator) -> None:
+        self._accelerator = value
+
+    @property
+    def mol_chi_matrix(self) -> u.Quantity:
+        if self._mol_chi_matrix is None:
+            raise RuntimeError(f"{self.species} NLTEProcessor field 'mol_chi_matrix' not initialised.")
+        return self._mol_chi_matrix
+
+    @mol_chi_matrix.setter
+    def mol_chi_matrix(self, value: u.Quantity) -> None:
+        self._mol_chi_matrix = value
+
+    @property
+    def mol_eta_matrix(self) -> u.Quantity:
+        if self._mol_eta_matrix is None:
+            raise RuntimeError(f"{self.species} NLTEProcessor field 'mol_eta_matrix' not initialised.")
+        return self._mol_eta_matrix
+
+    @mol_eta_matrix.setter
+    def mol_eta_matrix(self, value: u.Quantity) -> None:
+        self._mol_eta_matrix = value
+
+    # Methods.
+
     def get_latest_pop_grid(self) -> npt.NDArray[np.float64]:
-        if self._pop_matrix is not None:
-            return self._pop_matrix[-1]
+        if self.pop_matrix is not None:
+            return self.pop_matrix[-1]
         else:
             raise RuntimeError(f"No population matrix available for species {self.species}.")
 
@@ -1187,15 +1328,14 @@ class NLTEProcessor:
 
         if len(self.agg_col_names) == 1:
             # Single aggregation (e.g., vibrational quantum number only)
-            for row in self._agg_states.iter_rows(named=True):
+            for row in self.agg_states.iter_rows(named=True):
                 lookup[row['agg1']] = (row['id_agg'], row['energy_agg'])
         else:
             # Multiple aggregations (e.g., electronic state + vibrational)
-            for row in self._agg_states.iter_rows(named=True):
+            for row in self.agg_states.iter_rows(named=True):
                 # lookup[(row['agg1'], row['agg2'])] = (row['id_agg'], row['energy_agg'])
-                lookup[tuple(row[agg_col_name] for agg_col_name in self.agg_col_names)] = (row['id_agg'], row['energy_agg'])
-
-        log.info(f"DEBUG: {self.species} lookup table = {lookup}")
+                lookup[tuple(row[agg_col_name] for agg_col_name in self.agg_col_names)] = (row['id_agg'],
+                                                                                           row['energy_agg'])
 
         self._agg_lookup_cache = lookup
 
@@ -1224,12 +1364,12 @@ class NLTEProcessor:
         read_col_names = ["id", "energy", "g", "tau"] + self.agg_col_names
         read_col_indices, read_col_names = (list(x) for x in zip(*sorted(zip(read_col_indices, read_col_names))))
         fixed_dtypes = {
-            "id": "Int64",
+            "id": "Int32",
             "energy": np.float64,
             "g": np.float64,
             "tau": np.float64,
         }
-        self._states = pl.from_pandas(pd.read_csv(
+        self.states = pl.from_pandas(pd.read_csv(
             self.states_file,
             sep=r"\s+",
             names=read_col_names,
@@ -1237,7 +1377,7 @@ class NLTEProcessor:
             dtype=fixed_dtypes
         ))
         # Replace any nan or inf lifetimes with 0 to avoid numerical issues.
-        self._states = self._states.with_columns(
+        self.states = self.states.with_columns(
             pl.when(pl.col("tau").is_finite())
             .then(pl.col("tau"))
             .otherwise(0)
@@ -1247,7 +1387,7 @@ class NLTEProcessor:
         # all be nulled.
         null_mask = pl.any_horizontal([pl.col(c).is_null() for c in self.agg_col_names])
         null_check_col = "null_check"
-        self._states = self._states.with_columns(
+        self.states = self.states.with_columns(
             null_mask.alias(null_check_col),
             *[pl.when(null_mask).then(None).otherwise(pl.col(c)).alias(c)
               for c in self.agg_col_names]
@@ -1256,68 +1396,68 @@ class NLTEProcessor:
         # if energy_cutoff is not None:
         #     pl_states = self.states.filter(pl.col("energy") <= energy_cutoff)
         group_cols = self.agg_col_names + [null_check_col]
-        self._agg_states = self._states.group_by(*group_cols).agg(
+        self.agg_states = self.states.group_by(*group_cols).agg(
             pl.col("energy").min().alias("energy_agg")
         )
         valid_mask = (pl.col(null_check_col).not_()) & (pl.col("energy_agg") <= energy_cutoff)
-        self._agg_states = self._agg_states.filter(valid_mask).sort("energy_agg", descending=False).with_columns(
-            pl.int_range(0, pl.len(), dtype=pl.Int64).alias("id_agg")
+        self.agg_states = self.agg_states.filter(valid_mask).sort("energy_agg", descending=False).with_columns(
+            pl.int_range(0, pl.len(), dtype=pl.Int32).alias("id_agg")
         )
-        self._id_agg_cutoff = len(self._agg_states) - 1 if not self._agg_states.is_empty() else -1
+        self.id_agg_cutoff = self.agg_states.height - 1 if not self.agg_states.is_empty() else -1
         # All states above the cutoff or with any null values in agg columns are treated as the same overflow agg state.
-        overflow_id = self._id_agg_cutoff + 1
+        overflow_id = self.id_agg_cutoff + 1
 
-        self._agg_states = self._agg_states.drop(null_check_col)
-        self._n_agg_states = len(self._agg_states) + 1
+        self.agg_states = self.agg_states.drop(null_check_col)
+        self.n_agg_states = self.agg_states.height + 1  # Should this be reduced by 1?
 
-        # self._n_agg_states = len(agg_temp)
-        # self._agg_states = self._agg_states.sort([null_check_col, "energy_agg"], descending=False).with_columns(
-        #     pl.int_range(0, self._n_agg_states, dtype=pl.Int64).alias("id_agg")
+        # self.n_agg_states = len(agg_temp)
+        # self.agg_states = self.agg_states.sort([null_check_col, "energy_agg"], descending=False).with_columns(
+        #     pl.int_range(0, self.n_agg_states, dtype=pl.Int64).alias("id_agg")
         # )
-        log.debug(f"Vibronically aggregated states =\n {self._agg_states}")
-        # self._id_agg_cutoff = self._agg_states.select(
+        log.info(f"{self.species} aggregated states =\n {self.agg_states}")
+        # self.id_agg_cutoff = self.agg_states.select(
         #     pl.col("id_agg").filter(pl.col("energy_agg") <= energy_cutoff).max()
         # ).item()
 
-        self._states = self._states.join(
-            self._agg_states.select(
+        self.states = self.states.join(
+            self.agg_states.select(
                 ["id_agg"] + self.agg_col_names
             ),
             on=self.agg_col_names,
             how="left",
         )
         # Assign null group id_agg, if it exists, on _states.
-        # null_group_data = self._agg_states.filter(pl.col(null_check_col)).select("id_agg")
+        # null_group_data = self.agg_states.filter(pl.col(null_check_col)).select("id_agg")
         # if not null_group_data.is_empty():
         #     null_group_id = null_group_data.item()
-        #     self._states = self._states.with_columns(
+        #     self.states = self.states.with_columns(
         #         pl.when(pl.col(null_check_col))
         #         .then(null_group_id)
         #         .otherwise(pl.col("id_agg"))
         #         .alias("id_agg")
         #     )
-        self._states = self._states.with_columns(
+        self.states = self.states.with_columns(
             pl.col("id_agg").fill_null(overflow_id)
         ).drop(null_check_col)
         # Clean up null check column.
-        # self._states = self._states.drop(null_check_col)
-        # self._agg_states = self._agg_states.drop(null_check_col)
-        log.debug(f"Working states = {self._states}")
+        # self.states = self.states.drop(null_check_col)
+        # self.agg_states = self.agg_states.drop(null_check_col)
+        log.debug(f"Working states = {self.states}")
 
         # Vectorised compute for LTE populations.
-        g_np = self._states["g"].to_numpy()
-        energy_np = self._states["energy"].to_numpy() << 1 / u.cm
-        id_agg_np = self._states["id_agg"].to_numpy()
+        g_np = self.states["g"].to_numpy()
+        energy_np = self.states["energy"].to_numpy() << 1 / u.cm
+        id_agg_np = self.states["id_agg"].to_numpy()
         q_all = g_np[None, :] * np.exp(-ac_h_c_on_kB * energy_np[None, :] / temperature_profile[:, None])
         n_all = q_all / q_all.sum(axis=1, keepdims=True)
-        n_agg_all = np.zeros((self.n_layers, self._n_agg_states))
+        n_agg_all = np.zeros((self.n_layers, self.n_agg_states))
         # Transposes sum into each state, for each layer.
         np.add.at(n_agg_all.T, id_agg_np, n_all.T)
 
-        self._pop_matrix = np.zeros((1, self.n_layers, self._n_agg_states))
-        self._pop_matrix[0] = n_agg_all
+        self.pop_matrix = np.zeros((1, self.n_layers, self.n_agg_states))
+        self.pop_matrix[0] = n_agg_all
 
-        below_cutoff_mask = id_agg_np <= self._id_agg_cutoff
+        below_cutoff_mask = id_agg_np <= self.id_agg_cutoff
         self._nlte_pop_frac = n_all[:, below_cutoff_mask].sum(axis=1)
 
         lte_col_exprs = []
@@ -1328,9 +1468,10 @@ class NLTEProcessor:
                 pl.Series(n_lte_col, n_all[layer_idx]),  # per-state
                 pl.Series(n_agg_lte_col, n_agg_all[layer_idx][id_agg_np]),  # per-state via lookup
             ])
-        self._states = self._states.with_columns(lte_col_exprs)
+        self.states = self.states.with_columns(lte_col_exprs)
 
-        log.info(f"[I0] States = {self._states}")
+        log_columns = read_col_names + ["id_agg"]
+        log.info(f"[I0] {self.species} States = {self.states.select(log_columns)}")
         self._build_agg_state_lookup()
         # Done.
 
@@ -1351,13 +1492,13 @@ class NLTEProcessor:
         assert temperature_profile.shape[0] == pressure_profile.shape[0] == self.n_layers
 
         n_nlte_layers = self.n_layers - self.n_lte_layers
-        self._rates_grid = []
-        self._profile_store = ProfileStore(
-            n_layers=n_nlte_layers, n_agg_states=self._n_agg_states, n_grid=wn_grid.shape[0]
+        rates_list = []
+        self.profile_store = ProfileStore(
+            n_layers=n_nlte_layers, n_agg_states=self.n_agg_states, n_grid=wn_grid.shape[0]
         )
 
         trans_columns = ["id_f", "id_i", "A_fi"]
-        dask_dtypes = {"id_f": "int64", "id_i": "int64", "A_fi": "float64"}
+        dask_dtypes = {"id_f": "int32", "id_i": "int32", "A_fi": "float64"}
         dask_blocksize = "256MB"
 
         # Plain float arrays — no astropy units — passed directly to Numba.
@@ -1366,7 +1507,7 @@ class NLTEProcessor:
 
         # TODO: Move states_f, states_i, states_frac here! They don't change so don't need to be recomputed.
         n_frac_cols = [f"n_frac_nL{nlte_idx}" for nlte_idx in range(n_nlte_layers)]
-        states_frac = self._states.with_columns(
+        states_frac = self.states.with_columns(
             (
                     pl.col(f"n_L{self.n_lte_layers + nlte_idx}") / pl.col(f"n_agg_L{self.n_lte_layers + nlte_idx}")
             ).alias(f"n_frac_nL{nlte_idx}")
@@ -1384,39 +1525,418 @@ class NLTEProcessor:
             .select(invariant_cols_f)
             .rename({col: f"{col}_f" for col in invariant_cols_f})
         )
+        # States lookup
+        state_ids = states_frac["id"].to_numpy()
+        max_state_id = int(state_ids.max())
+        # State ID lookup offset by 1 as IDs are 1-indexed!
+        n_frac_lookup = np.zeros(
+            (max_state_id + 1, n_nlte_layers),
+            dtype=np.float64,
+        )
+        for l in range(n_nlte_layers):
+            n_frac_lookup[state_ids, l] = states_frac[f"n_frac_nL{l}"].to_numpy()
+        n_frac_lookup = np.ascontiguousarray(n_frac_lookup)
+
+        # Grid parameters and buffers.
         wn_min = wn_grid[0]
         wn_max = wn_grid[-1]
+        # Before the batch loop, pre-allocate once.
+        n_bands_max = min(100, self.n_agg_states ** 2)
+        n_grid = wn_grid.shape[0]
+
+        # profile_buffer[0] = abs, profile_buffer[1] = ste, profile_buffer[2] = spe.
+        profile_buffer = np.zeros((3, n_bands_max, n_nlte_layers, n_grid), dtype=np.float64)
+        profile_buffer = np.ascontiguousarray(profile_buffer)
+        # band_key_to_idx: dict[tuple[int, int], int] = {}
+        n_bands_used = 0
+        band_registry = pl.DataFrame(
+            schema={"id_agg_f": pl.Int32, "id_agg_i": pl.Int32, "band_idx": pl.Int32}
+        )
+        band_registry_cols = band_registry.columns
+        buffer_abs = profile_buffer[0]
+        buffer_ste = profile_buffer[1]
+        buffer_spe = profile_buffer[2]
+
+        # Bin edges for finding trans bins.
+        wn_arr = wn_grid.value
+        bin_edges = np.empty(n_grid + 1, dtype=np.float64)
+        bin_edges[0] = wn_arr[0] - (wn_arr[1] - wn_arr[0]) * 0.5
+        for j in range(1, n_grid):
+            bin_edges[j] = (wn_arr[j - 1] + wn_arr[j]) * 0.5
+        bin_edges[-1] = wn_arr[-1] + (wn_arr[-1] - wn_arr[-2]) * 0.5
 
         process_time = time.perf_counter()
-        for trans_file in self.trans_files:
-            log.info(f"Processing file {trans_file}.")
-            # Preprocessed Parquet files (MUCH faster).
-            if str(trans_file).endswith(".parquet"):
-                with pq.ParquetFile(trans_file) as pq_file, ThreadPoolExecutor(max_workers=1) as executor:
-                    num_rg = pq_file.num_row_groups
-
-                    def read_rg(idx):
-                        return pl.from_arrow(
-                            pq_file.read_row_group(idx, columns=trans_columns, use_threads=True)
+        parquet_batch_size = 20_000_000
+        if self.do_super_lines:
+            # ---------------------------------------------- SUPER-LINES ----------------------------------------------
+            for trans_file in self.trans_files:
+                log.info(f"Processing file {trans_file}.")
+                # Preprocessed Parquet files (MUCH faster).
+                if str(trans_file).endswith(".parquet"):
+                    with pq.ParquetFile(trans_file) as pq_file:
+                        batch_iter = pq_file.iter_batches(
+                            batch_size=parquet_batch_size,
+                            columns=trans_columns,
+                            use_threads=True,
                         )
+                        for arrow_batch in batch_iter:
+                            trans_batch = pl.from_arrow(arrow_batch)
+                            start_time = time.perf_counter()
+                            trans_batch = (
+                                trans_batch
+                                .with_columns([
+                                    pl.col("id_i").cast(pl.Int32),
+                                    pl.col("id_f").cast(pl.Int32),
+                                ])
+                                .join(states_i, on="id_i", how="inner")
+                                .join(states_f, on="id_f", how="inner")
+                                .with_columns(
+                                    (pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi")
+                                )
+                                .filter(
+                                    (pl.col("energy_fi") >= wn_min)
+                                    & (pl.col("energy_fi") <= wn_max)
+                                )
+                                .sort(["id_agg_f", "id_agg_i"])
+                            )
+                            log.info(f"Polars duration = {time.perf_counter() - start_time}.")
+                            if trans_batch.height == 0:
+                                log.info("No valid trans in batch.")
+                                continue
+                            # Extract numpy arrays.
+                            start_time = time.perf_counter()
+                            id_i = np.ascontiguousarray(trans_batch["id_i"].to_numpy())
+                            id_f = np.ascontiguousarray(trans_batch["id_f"].to_numpy())
+                            a_fi = np.ascontiguousarray(trans_batch["A_fi"].to_numpy())
 
-                    future = executor.submit(read_rg, 0)
+                            energy_fi = trans_batch["energy_fi"].to_numpy()
+                            g_i = np.ascontiguousarray(trans_batch["g_i"].to_numpy())
+                            g_f = np.ascontiguousarray(trans_batch["g_f"].to_numpy())
+                            denom = np.ascontiguousarray(const_8_pi_c * energy_fi ** 2)
+                            spe_factor = np.ascontiguousarray(energy_fi * const_h_c_on_4_pi)
 
-                    for rg_idx in range(num_rg):
-                        trans_batch = future.result()
-                        # Prefetch next batch.
-                        if rg_idx + 1 < num_rg:
-                            future = executor.submit(read_rg, rg_idx + 1)
+                            log.info(f"Extraction duration = {time.perf_counter() - start_time}.")
+                            # Get bin indices per transition.
+                            bin_indices = np.searchsorted(bin_edges, energy_fi, side="right") - 1
+                            bin_indices = np.clip(bin_indices, 0, n_grid - 1, dtype=np.int32)
+                            bin_indices = np.ascontiguousarray(bin_indices)
 
+                            start_time = time.perf_counter()
+                            batch_bands = trans_batch.select(["id_agg_f", "id_agg_i"])
+                            if band_registry.height == 0:
+                                new_keys = batch_bands.unique()
+                            else:
+                                new_keys = batch_bands.unique().join(
+                                    band_registry, on=["id_agg_f", "id_agg_i"], how="anti"
+                                )
+                            if new_keys.height > 0:
+                                # Generate sequential indices starting right from n_bands_used.
+                                new_keys = (
+                                    new_keys
+                                    .with_row_index(name="band_idx", offset=n_bands_used)
+                                    .with_columns(pl.col("band_idx").cast(pl.Int32))
+                                    .select(band_registry_cols)
+                                )
+                                # Update your global counter
+                                n_bands_used += new_keys.height
+                                # Dynamically resize buffer if exceeding bands number threshold.
+                                if n_bands_used > n_bands_max:
+                                    # Grow exactly by what you need
+                                    needed_extra = max(n_bands_used - n_bands_max, n_bands_max)
+                                    extra = np.zeros((3, needed_extra, n_nlte_layers, n_grid), dtype=np.float64)
+                                    profile_buffer = np.concatenate([profile_buffer, extra], axis=1)
+                                    # n_bands_max *= 2  # Overkill.
+                                    buffer_abs = profile_buffer[0]
+                                    buffer_ste = profile_buffer[1]
+                                    buffer_spe = profile_buffer[2]
+                                    n_bands_max += needed_extra
+                                # Update the global registry dataframe
+                                band_registry = pl.concat([band_registry, new_keys])
+                            mapped_batch = batch_bands.join(
+                                band_registry, on=["id_agg_f", "id_agg_i"], how="left"
+                            )
+                            band_indices = np.ascontiguousarray(mapped_batch["band_idx"].to_numpy().copy())
+                            log.info(f"Band indices duration = {time.perf_counter() - start_time}.")
+                            log.info(f"Accumulating {trans_batch.height} transitions.")
+                            # Write all transitions to respective bins.
+                            start_time = time.perf_counter()
+                            _accumulate_batch(
+                                buffer_abs=buffer_abs,
+                                buffer_ste=buffer_ste,
+                                buffer_spe=buffer_spe,
+                                band_indices=band_indices,
+                                bin_indices=bin_indices,
+                                a_fi=a_fi,
+                                g_i=g_i,
+                                g_f=g_f,
+                                denom=denom,
+                                spe_factor=spe_factor,
+                                id_i=id_i,
+                                id_f=id_f,
+                                n_frac_lookup=n_frac_lookup,
+                            )
+                            log.info(f"Accumulate duration = {time.perf_counter() - start_time}.")
+                            # Do rates for batch.
+                            trans_batch_rates = trans_batch.filter(pl.col("id_agg_f") != pl.col("id_agg_i"))
+                            if trans_batch_rates.height > 0:
+                                b_fi_vals = calc_einstein_b_fi(
+                                    a_fi=trans_batch_rates["A_fi"].to_numpy(),
+                                    energy_fi=(trans_batch_rates["energy_fi"].to_numpy() << 1 / u.cm)
+                                    .to(u.Hz, equivalencies=u.spectral()).value,
+                                )
+                                b_if_vals = calc_einstein_b_if(
+                                    b_fi=b_fi_vals,
+                                    g_f=trans_batch_rates["g_f"].to_numpy(),
+                                    g_i=trans_batch_rates["g_i"].to_numpy(),
+                                )
+                                agg_batch = (
+                                    trans_batch_rates
+                                    .with_columns([
+                                        pl.Series("B_fi", b_fi_vals),
+                                        pl.Series("B_if", b_if_vals),
+                                    ])
+                                    .group_by(["id_agg_f", "id_agg_i"])
+                                    .agg([
+                                        pl.col("A_fi").sum(),
+                                        pl.col("B_fi").sum(),
+                                        pl.col("B_if").sum(),
+                                    ])
+                                )
+                                rates_list.append(agg_batch)
+                else:
+                    # ExoMol format text files (*.trans files from website).
+                    ddf = dd.read_csv(
+                        trans_file,
+                        sep=r"\s+",
+                        engine="python",
+                        header=None,
+                        names=trans_columns,
+                        usecols=[0, 1, 2],
+                        dtype=dask_dtypes,
+                        blocksize=dask_blocksize,
+                    )
+                    for delayed_batch in ddf.to_delayed():
+                        trans_batch = pl.from_pandas(delayed_batch.compute())
                         trans_batch = (
                             trans_batch
                             .join(states_i, on="id_i", how="inner")
                             .join(states_f, on="id_f", how="inner")
                             .with_columns((pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi"))
                             .filter(
-                                (pl.col("energy_f") >= wn_min)
-                                & (pl.col("energy_i") <= wn_max)
-                                & (pl.col("energy_fi") >= wn_min)
+                                (pl.col("energy_fi") >= wn_min)
+                                & (pl.col("energy_fi") <= wn_max)
+                            )
+                            .sort(["id_agg_f", "id_agg_i"])
+                        )
+                        if trans_batch.height == 0:
+                            continue
+                        # Extract numpy arrays.
+                        id_i = np.ascontiguousarray(trans_batch["id_i"].to_numpy())
+                        id_f = np.ascontiguousarray(trans_batch["id_f"].to_numpy())
+                        a_fi = np.ascontiguousarray(trans_batch["A_fi"].to_numpy())
+
+                        energy_fi = trans_batch["energy_fi"].to_numpy()
+                        g_i = np.ascontiguousarray(trans_batch["g_i"].to_numpy())
+                        g_f = np.ascontiguousarray(trans_batch["g_f"].to_numpy())
+                        denom = np.ascontiguousarray(const_8_pi_c * energy_fi ** 2)
+                        spe_factor = np.ascontiguousarray(energy_fi * const_h_c_on_4_pi)
+                        # Get bin indices per transition.
+                        bin_indices = np.searchsorted(bin_edges, energy_fi, side="right") - 1
+                        bin_indices = np.clip(bin_indices, 0, n_grid - 1, dtype=np.int32)
+                        bin_indices = np.ascontiguousarray(bin_indices)
+
+                        batch_bands = trans_batch.select(["id_agg_f", "id_agg_i"])
+                        if band_registry.height == 0:
+                            new_keys = batch_bands.unique()
+                        else:
+                            new_keys = batch_bands.unique().join(
+                                band_registry, on=["id_agg_f", "id_agg_i"], how="anti"
+                            )
+                        if new_keys.height > 0:
+                            # Generate sequential indices starting right from n_bands_used.
+                            new_keys = (
+                                new_keys
+                                .with_row_index(name="band_idx", offset=n_bands_used)
+                                .with_columns(pl.col("band_idx").cast(pl.Int32))
+                                .select(band_registry_cols)
+                            )
+                            # Update your global counter
+                            n_bands_used += new_keys.height
+                            # Dynamically resize buffer if exceeding bands number threshold.
+                            if n_bands_used > n_bands_max:
+                                # Grow exactly by what you need
+                                needed_extra = max(n_bands_used - n_bands_max, n_bands_max)
+                                extra = np.zeros((3, needed_extra, n_nlte_layers, n_grid), dtype=np.float64)
+                                profile_buffer = np.concatenate([profile_buffer, extra], axis=1)
+                                # n_bands_max *= 2  # Overkill.
+                                buffer_abs = profile_buffer[0]
+                                buffer_ste = profile_buffer[1]
+                                buffer_spe = profile_buffer[2]
+                                n_bands_max += needed_extra
+                            # Update the global registry dataframe
+                            band_registry = pl.concat([band_registry, new_keys])
+                        mapped_batch = batch_bands.join(
+                            band_registry, on=["id_agg_f", "id_agg_i"], how="left"
+                        )
+                        band_indices = np.ascontiguousarray(mapped_batch["band_idx"].to_numpy().copy())
+                        # Write all transitions to respective bins.
+                        _accumulate_batch(
+                            buffer_abs=buffer_abs,
+                            buffer_ste=buffer_ste,
+                            buffer_spe=buffer_spe,
+                            band_indices=band_indices,
+                            bin_indices=bin_indices,
+                            a_fi=a_fi,
+                            g_i=g_i,
+                            g_f=g_f,
+                            denom=denom,
+                            spe_factor=spe_factor,
+                            id_i=id_i,
+                            id_f=id_f,
+                            n_frac_lookup=n_frac_lookup,
+                        )
+                        trans_batch_rates = trans_batch.filter(pl.col("id_agg_f") != pl.col("id_agg_i"))
+                        # Do rates for batch.
+                        if trans_batch_rates.height > 0:
+                            b_fi_vals = calc_einstein_b_fi(
+                                a_fi=trans_batch_rates["A_fi"].to_numpy(),
+                                energy_fi=(trans_batch_rates["energy_fi"].to_numpy() << 1 / u.cm)
+                                .to(u.Hz, equivalencies=u.spectral()).value,
+                            )
+                            b_if_vals = calc_einstein_b_if(
+                                b_fi=b_fi_vals,
+                                g_f=trans_batch_rates["g_f"].to_numpy(),
+                                g_i=trans_batch_rates["g_i"].to_numpy(),
+                            )
+                            agg_batch = (
+                                trans_batch_rates
+                                .with_columns([
+                                    pl.Series("B_fi", b_fi_vals),
+                                    pl.Series("B_if", b_if_vals),
+                                ])
+                                .group_by(["id_agg_f", "id_agg_i"])
+                                .agg([
+                                    pl.col("A_fi").sum(),
+                                    pl.col("B_fi").sum(),
+                                    pl.col("B_if").sum(),
+                                ])
+                            )
+                            rates_list.append(agg_batch)
+            # Finalise the accumulated super-line buffers.
+            # Create band-key lookup.
+            # band_keys = np.empty(
+            #     (n_bands_used, 2),
+            #     dtype=np.int64,
+            # )
+            # for key, idx in band_key_to_idx.items():
+            #     band_keys[idx, 0] = key[0]  # id_f_agg
+            #     band_keys[idx, 1] = key[1]  # id_i_agg
+            band_keys = (
+                band_registry.sort("band_idx")
+                .select(["id_agg_f", "id_agg_i"])
+                .to_numpy()
+            )  # (n_bands_used, 2)
+            # Apply broadening to buffers.
+            broad_n = np.zeros(1, dtype=np.float64)
+            broad_gamma = np.zeros((1, n_nlte_layers), dtype=np.float64)
+            if self.broadening_params is not None:
+                broad_n = self.broadening_params[1]
+                broad_gamma = self.broadening_params[0][:, self.n_lte_layers:]
+
+            buffer_abs, buffer_ste, buffer_spe = _broaden_superline_buffer(
+                buffer_abs=buffer_abs,
+                buffer_ste=buffer_ste,
+                buffer_spe=buffer_spe,
+                wn_grid=wn_grid,
+                temperatures=temperature_profile.value,
+                pressures=pressure_profile.value,
+                broad_n=broad_n,
+                broad_gamma=broad_gamma,
+                species_mass=self.species_mass,
+                n_bands_used=n_bands_used,
+            )
+            self.profile_store.finalise_from_buffer(
+                buffer_abs=buffer_abs,
+                buffer_ste=buffer_ste,
+                buffer_spe=buffer_spe,
+                band_keys=band_keys,
+                save=False,
+                species=self.species,
+            )
+        else:
+            # ------------------------------------------ REGULAR LINE-BY-LINE ------------------------------------------
+            for trans_file in self.trans_files:
+                log.info(f"Processing file {trans_file}.")
+                if str(trans_file).endswith(".parquet"):
+                    with pq.ParquetFile(trans_file) as pq_file:
+                        batch_iter = pq_file.iter_batches(
+                            batch_size=parquet_batch_size,
+                            columns=trans_columns,
+                            use_threads=True,
+                        )
+                        for arrow_batch in batch_iter:
+                            trans_batch = pl.from_arrow(arrow_batch)
+                            trans_batch = (
+                                trans_batch
+                                .with_columns([
+                                    pl.col("id_i").cast(pl.Int32),
+                                    pl.col("id_f").cast(pl.Int32),
+                                ])
+                                .join(states_i, on="id_i", how="inner")
+                                .join(states_f, on="id_f", how="inner")
+                                .with_columns(
+                                    (pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi")
+                                )
+                                .filter(
+                                    (pl.col("energy_fi") >= wn_min)
+                                    & (pl.col("energy_fi") <= wn_max)
+                                )
+                                .sort(["id_agg_f", "id_agg_i"])
+                            )
+                            if trans_batch.height == 0:
+                                log.info("No valid trans in batch.")
+                                continue
+
+                            profile_buffer, band_id_f, band_id_i, agg_batch = _process_trans_batch_layered(
+                                trans_batch=trans_batch,
+                                broadening_params=self.broadening_params,
+                                species_mass=self.species_mass,
+                                wn_grid=wn_grid.value,
+                                n_lte_layers=self.n_lte_layers,
+                                n_layers=self.n_layers,
+                                temperature_profile=temperature_slice,
+                                pressure_profile=pressure_slice,
+                            )
+                            if profile_buffer is not None:
+                                add_batch_time = time.perf_counter()
+                                self.profile_store.add_batch(
+                                    profile_buffer=profile_buffer, band_id_f=band_id_f, band_id_i=band_id_i
+                                )
+                                log.info(f"Add batch time = {time.perf_counter() - add_batch_time:.3f}.")
+
+                            if agg_batch is not None:
+                                rates_list.append(agg_batch)
+                else:
+                    # ExoMol format text files (*.trans files from website).
+                    ddf = dd.read_csv(
+                        trans_file,
+                        sep=r"\s+",
+                        engine="python",
+                        header=None,
+                        names=trans_columns,
+                        usecols=[0, 1, 2],
+                        dtype=dask_dtypes,
+                        blocksize=dask_blocksize,
+                    )
+                    for delayed_batch in ddf.to_delayed():
+                        trans_batch = pl.from_pandas(delayed_batch.compute())
+                        trans_batch = (
+                            trans_batch
+                            .join(states_i, on="id_i", how="inner")
+                            .join(states_f, on="id_f", how="inner")
+                            .with_columns((pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi"))
+                            .filter(
+                                (pl.col("energy_fi") >= wn_min)
                                 & (pl.col("energy_fi") <= wn_max)
                             )
                             .sort(["id_agg_f", "id_agg_i"])
@@ -1434,76 +1954,39 @@ class NLTEProcessor:
                             temperature_profile=temperature_slice,
                             pressure_profile=pressure_slice,
                         )
-                        # if band_profile_data is not None:
-                        #     add_batch_time = time.perf_counter()
-                        #     self._profile_store.add_batch(batch=band_profile_data)
-                        #     log.info(f"Add batch time = {time.perf_counter() - add_batch_time:.3f}.")
                         if profile_buffer is not None:
                             add_batch_time = time.perf_counter()
-                            self._profile_store.add_batch(
+                            self.profile_store.add_batch(
                                 profile_buffer=profile_buffer, band_id_f=band_id_f, band_id_i=band_id_i
                             )
                             log.info(f"Add batch time = {time.perf_counter() - add_batch_time:.3f}.")
 
                         if agg_batch is not None:
-                            self._rates_grid.append(agg_batch)
-            else:
-                # ExoMol format text files (*.trans files from website).
-                ddf = dd.read_csv(
-                    trans_file,
-                    sep=r"\s+",
-                    engine="python",
-                    header=None,
-                    names=trans_columns,
-                    usecols=[0, 1, 2],
-                    dtype=dask_dtypes,
-                    blocksize=dask_blocksize,
-                )
-                for delayed_batch in ddf.to_delayed():
-                    trans_batch = pl.from_pandas(delayed_batch.compute())
-                    trans_batch = (
-                        trans_batch
-                        .join(states_i, on="id_i", how="inner")
-                        .join(states_f, on="id_f", how="inner")
-                        .with_columns((pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi"))
-                        .filter(
-                            (pl.col("energy_f") >= wn_min)
-                            & (pl.col("energy_i") <= wn_max)
-                            & (pl.col("energy_fi") >= wn_min)
-                            & (pl.col("energy_fi") <= wn_max)
-                        )
-                        .sort(["id_agg_f", "id_agg_i"])
-                    )
-                    if trans_batch.height == 0:
-                        continue
-
-                    profile_buffer, band_id_f, band_id_i, agg_batch = _process_trans_batch_layered(
-                        trans_batch=trans_batch,
-                        broadening_params=self.broadening_params,
-                        species_mass=self.species_mass,
-                        wn_grid=wn_grid.value,
-                        n_lte_layers=self.n_lte_layers,
-                        n_layers=self.n_layers,
-                        temperature_profile=temperature_slice,
-                        pressure_profile=pressure_slice,
-                    )
-
-                    # if band_profile_data is not None:
-                    #     self._profile_store.add_batch(batch=band_profile_data)
-                    if profile_buffer is not None:
-                        add_batch_time = time.perf_counter()
-                        self._profile_store.add_batch(
-                            profile_buffer=profile_buffer, band_id_f=band_id_f, band_id_i=band_id_i
-                        )
-                        log.info(f"Add batch time = {time.perf_counter() - add_batch_time:.3f}.")
-
-                    if agg_batch is not None:
-                        self._rates_grid.append(agg_batch)
+                            rates_list.append(agg_batch)
+            # Finalise profile store for line-by-line accumulators.
+            self.profile_store.finalise(save=False, species=self.species)
+        # Done, finalise list of rates chunks.
         log.info(f"DEBUG: new rates/profiles duration = {time.perf_counter() - process_time:.3f}.")
-        self._profile_store.finalise()
-
-        self._rates_grid = (
-            pl.concat(self._rates_grid)
+        # DEBUG!
+        log.info("Doing debug xsecs.")
+        debug_layer_idx = 66 - self.n_lte_layers
+        debug_abs, debug_emi = self.profile_store.build_abs_emi(
+            layer_idx=debug_layer_idx,
+            pop_matrix=self.pop_matrix[-1, debug_layer_idx],
+            wn_grid=wn_grid,
+        )
+        np.save(
+            fr"/mnt/c/PhD/programs/TIRAMISU/tests/outputs/h2o_super_abs.npy",
+            debug_abs
+        )
+        np.save(
+            fr"/mnt/c/PhD/programs/TIRAMISU/tests/outputs/h2o_super_emi.npy",
+            debug_emi
+        )
+        log.info("Debug xsecs done.")
+        ################################################################
+        self.rates_grid = (
+            pl.concat(rates_list)
             .group_by("id_agg_f", "id_agg_i")
             .agg([
                 pl.col("A_fi").sum().alias("A_fi"),
@@ -1512,7 +1995,7 @@ class NLTEProcessor:
             ])
             .sort(["id_agg_i", "id_agg_f"])
         )
-        log.info(f"[I0] Rates = \n{self._rates_grid}")
+        log.info(f"[I0] {self.species} Rates = \n{self.rates_grid}")
 
     def compute_continuum_rates_profiles(
             self,
@@ -1558,7 +2041,7 @@ class NLTEProcessor:
         ))
 
         merge_cols = ["id", "id_agg"]
-        self._cont_states = self._cont_states.join(self._states.select(merge_cols), on="id", how="left")
+        self._cont_states = self._cont_states.join(self.states.select(merge_cols), on="id", how="left")
         # Above is new! Below has not yet been updated to polars.
 
         # self.cont_states = self.cont_states.merge(self.states[merge_cols], on="id", how="left")
@@ -1586,9 +2069,9 @@ class NLTEProcessor:
             )
 
         n_nlte_layers = self.n_layers - self.n_lte_layers
-        self._cont_rates = []
+        cont_rates_list = []
         self._cont_profile_store = ContinuumProfileStore(
-            n_layers=n_nlte_layers, n_agg_states=self._n_agg_states, n_grid=len(wn_grid)
+            n_layers=n_nlte_layers, n_agg_states=self.n_agg_states, n_grid=len(wn_grid)
         )
 
         trans_columns = ["id_f", "id_i", "A_fi"]
@@ -1641,9 +2124,9 @@ class NLTEProcessor:
                             .join(states_f, on="id_f", how="inner")
                             .with_columns((pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi"))
                             .filter(
-                                (pl.col("energy_f") >= wn_min)
-                                & (pl.col("energy_i") <= wn_max)
-                                & (pl.col("energy_fi") >= wn_min)
+                                # (pl.col("energy_f") >= wn_min)
+                                # & (pl.col("energy_i") <= wn_max)
+                                (pl.col("energy_fi") >= wn_min)
                                 & (pl.col("energy_fi") <= wn_max)
                             )
                             .sort(["id_agg_f", "id_agg_i"])
@@ -1667,7 +2150,7 @@ class NLTEProcessor:
                         log.info(f"Add batch time = {time.perf_counter() - add_batch_time:.3f}.")
 
                         if agg_batch is not None:
-                            self._cont_rates.append(agg_batch)
+                            cont_rates_list.append(agg_batch)
             else:
                 # ExoMol format text files (*.trans files from website).
                 ddf = dd.read_csv(
@@ -1688,9 +2171,9 @@ class NLTEProcessor:
                         .join(states_f, on="id_f", how="inner")
                         .with_columns((pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi"))
                         .filter(
-                            (pl.col("energy_f") >= wn_min)
-                            & (pl.col("energy_i") <= wn_max)
-                            & (pl.col("energy_fi") >= wn_min)
+                            # (pl.col("energy_f") >= wn_min)
+                            # & (pl.col("energy_i") <= wn_max)
+                            (pl.col("energy_fi") >= wn_min)
                             & (pl.col("energy_fi") <= wn_max)
                         )
                         .sort(["id_agg_f", "id_agg_i"])
@@ -1714,20 +2197,21 @@ class NLTEProcessor:
                     log.info(f"Add batch time = {time.perf_counter() - add_batch_time:.3f}.")
 
                     if agg_batch is not None:
-                        self._cont_rates.append(agg_batch)
+                        cont_rates_list.append(agg_batch)
         log.info(f"DEBUG: new cont. rates/profiles duration = {time.perf_counter() - process_time:.3f}.")
         self._cont_profile_store.finalise()
 
-        if len(self._cont_rates) > 0:
-            self._cont_rates: pl.DataFrame = pl.concat(self._cont_rates)
+        if len(cont_rates_list) > 0:
+            self._cont_rates = pl.concat(cont_rates_list)
             self._cont_rates = self._cont_rates.group_by("id_agg_i").agg([
                 pl.col("A_fi").sum().alias("A_fi"),
                 pl.col("B_fi").sum().alias("B_fi"),
                 pl.col("B_if").sum().alias("B_if"),
             ])
+            log.info(f"[I0] {self.species} Continuum rates = \n{self._cont_rates}")
         else:
             self._cont_rates = None
-        log.info(f"[I0] Continuum rates = \n{self._cont_rates}")
+            log.info(f"[I0] {self.species} No continuum rates computed on spectral grid.")
         # Done.
 
     def _build_a_ox_vals_cache(self) -> None:
@@ -1742,10 +2226,10 @@ class NLTEProcessor:
         self._a_ox_vals : astropy.units.Quantity, shape (id_agg_cutoff + 1,)
             Sum of A_fi values for all transitions from each upper state.
         """
-        a_ox_vals = np.zeros(self._id_agg_cutoff + 1, dtype=np.float64)
-        for trans in self._rates_grid.iter_rows(named=True):
+        a_ox_vals = np.zeros(self.id_agg_cutoff + 1, dtype=np.float64)
+        for trans in self.rates_grid.iter_rows(named=True):
             o_idx = trans["id_agg_f"]
-            if o_idx <= self._id_agg_cutoff:
+            if o_idx <= self.id_agg_cutoff:
                 a_ox_vals[o_idx] += trans["A_fi"]
         self._a_ox_vals = a_ox_vals << einstein_a_unit
 
@@ -1775,15 +2259,14 @@ class NLTEProcessor:
         temperature_profile : astropy.units.Quantity
             Temperature at each layer, shape (n_layers,).
         """
-        species_str = str(self.species)
-
-        if get_number_of_atoms(species_str) > 3:
+        if self.species.atoms > 3:
             log.warning(f"Col./Chem. rates only implemented for species of 3 or fewer atoms, ({self.species} passed).")
             self._col_chem_c_matrix = None
             self._col_chem_rhs_c = None
             return
 
         n_layers = len(temperature_profile)
+        species_str = str(self.species)
         is_temp_dependent = CollisionalRatesDatabase.is_temperature_dependent(species_str)
 
         # For temperature-independent species, fetch the rates table once.
@@ -1797,7 +2280,7 @@ class NLTEProcessor:
                 self._col_chem_rhs_c = None
                 return
 
-        n_dim = self._id_agg_cutoff + 1
+        n_dim = self.id_agg_cutoff + 1
 
         c_matrix_cache = np.zeros((n_layers, n_dim, n_dim), dtype=np.float64)
         rhs_c_cache = np.zeros((n_layers, n_dim), dtype=np.float64)
@@ -1827,15 +2310,13 @@ class NLTEProcessor:
                 ).to_value(u.cm ** -3)
 
                 for rate in partner_rates:
-                    log.info(f"DEBUG: rate = {rate}")
                     try:
                         upper_id, upper_energy = self._agg_lookup_cache[rate.upper_key]
                         lower_id, lower_energy = self._agg_lookup_cache[rate.lower_key]
-                        log.info(f"DEBUG: found states {upper_id, lower_id}")
                     except KeyError:
                         continue
 
-                    if upper_id > self._id_agg_cutoff or lower_id > self._id_agg_cutoff:
+                    if upper_id > self.id_agg_cutoff or lower_id > self.id_agg_cutoff:
                         # Short circuit for bands above cutoff; adding to RHS biases to fixed distribution above cutoff.
                         continue
 
@@ -1915,31 +2396,34 @@ class NLTEProcessor:
             density_profile: u.Quantity,
             temperature_profile: u.Quantity,
             wn_grid: u.Quantity,
+            wn_dx: u.Quantity,
     ) -> u.Quantity:
-        log.info(f"T_ex calc: id_agg_cutoff = {self._id_agg_cutoff}")
-        rates_filter = (pl.col("id_agg_f") <= self._id_agg_cutoff) & (pl.col("id_agg_i") <= self._id_agg_cutoff)
+        rates_filter = (pl.col("id_agg_f") <= self.id_agg_cutoff) & (pl.col("id_agg_i") <= self.id_agg_cutoff)
 
-        a_fi_approx = self._rates_grid.select(
+        a_fi_approx = self.rates_grid.select(
             pl.col("A_fi").filter(rates_filter).sum()
         ).item() * einstein_a_unit
 
-        b_fi_approx = self._rates_grid.select(
+        b_fi_approx = self.rates_grid.select(
             pl.col("B_fi").filter(rates_filter).sum()
         ).item() * einstein_b_unit
 
-        b_if_approx = self._rates_grid.select(
+        b_if_approx = self.rates_grid.select(
             pl.col("B_if").filter(rates_filter).sum()
         ).item() * einstein_b_unit
 
         if self._cont_rates is not None:
             b_if_approx += self._cont_rates.select(
-                pl.col("B_if").filter(pl.col("id_agg_i") <= self._id_agg_cutoff).sum()
+                pl.col("B_if").filter(pl.col("id_agg_i") <= self.id_agg_cutoff).sum()
             ).item() * einstein_b_unit
-        mol_chi_norm = simpson_normalise_quantity_2d(y_data=self.mol_chi_matrix, x_data=wn_grid)
+        # mol_chi_norm = simpson_normalise_quantity_2d(y_data=self.mol_chi_matrix, x_data=wn_grid)
+        mol_chi_norm = loglinear_normalise_quantity_2d_nonnegative(y_data=self.mol_chi_matrix, dx=wn_dx)
         v_fi_approx = mol_chi_norm * b_fi_approx * i_mean
-        v_fi_rate = simpson_quantity_2d(y_data=v_fi_approx, x_data=wn_grid)
+        # v_fi_rate = simpson_quantity_2d(y_data=v_fi_approx, x_data=wn_grid)
+        v_fi_rate = loglinear_integral_quantity_2d_nonnegative(y_data=v_fi_approx, dx=wn_dx)
         v_if_approx = mol_chi_norm * b_if_approx * i_mean
-        v_if_rate = simpson_quantity_2d(y_data=v_if_approx, x_data=wn_grid)
+        # v_if_rate = simpson_quantity_2d(y_data=v_if_approx, x_data=wn_grid)
+        v_if_rate = loglinear_integral_quantity_2d_nonnegative(y_data=v_if_approx, dx=wn_dx)
 
         # energy_dif_approx = np.mean(np.diff(
         #     self.agg_states.filter(pl.col("energy_agg") <= wn_grid.value.max()).get_column("energy_agg").sort()
@@ -1955,176 +2439,189 @@ class NLTEProcessor:
             chem_profile=chem_profile,
             density_profile=density_profile,
             agg_lookup_cache=self._agg_lookup_cache,
-            id_agg_cutoff=self._id_agg_cutoff,
+            id_agg_cutoff=self.id_agg_cutoff,
         )
-        log.info(f"T_ex DEBUG: C_if = {c_if_approx}, C_fi = {c_fi_approx}, V_if = {v_if_rate}, V_fi = {v_fi_rate},"
-                 f" A_fi = {a_fi_approx}.")
-
+        # log.info(f"T_ex DEBUG: C_if = {c_if_approx}, C_fi = {c_fi_approx}, V_if = {v_if_rate}, V_fi = {v_fi_rate},"
+        #          f" A_fi = {a_fi_approx}.")
         # TODO: Try using ratios between sequential agg states?
         n_ratio = (c_if_approx + v_if_rate) / (c_fi_approx + a_fi_approx + v_fi_rate)
         t_ex_profile = (ac_h_c_on_kB * mean_energy_dif / np.log(1 / n_ratio)).to(u.K)
-        log.info(f"mean_energy_dif={mean_energy_dif} T_ex = {t_ex_profile}")
+        log.info(f"T_ex profile global fit = {t_ex_profile}")
+        # t_ex_profiles = []
+        # Get pairs of valid band keys: chosing adjacent IDs do not always exist, i.e.: in species with distinct
+        # isomers whose states are close in energy.
+        agg_energies = self.agg_states.sort("id_agg")["energy_agg"].to_numpy()
+        max_id = self.id_agg_cutoff + 1
+        num_pairs = max_id if max_id <= 4 else max(1, (max_id + 1) // 2)
+        id_pairs = self.profile_store.get_sorted_band_keys(
+            num_max=num_pairs, id_cutoff=self.id_agg_cutoff, agg_energies=agg_energies,
+        )
+        log.info(f"Num pairs = {num_pairs}, {len(id_pairs)} returned.")
+        t_ex_profiles = np.zeros((len(id_pairs), temperature_profile.shape[0]), dtype=np.float64) << u.K
+        log.info(f"ID pairs for T_ex = {id_pairs}")
+        for pair_idx, (id_agg_f, id_agg_i) in enumerate(id_pairs):
+            id_filter = (pl.col("id_agg_f") == id_agg_f) & (pl.col("id_agg_i") == id_agg_i)
+            a_fi = self.rates_grid.select(
+                pl.col("A_fi").filter(id_filter).sum()
+            ).item() * einstein_a_unit
+            b_fi = self.rates_grid.select(
+                pl.col("B_fi").filter(id_filter).sum()
+            ).item() * einstein_b_unit
+            b_if = self.rates_grid.select(
+                pl.col("B_if").filter(id_filter).sum()
+            ).item() * einstein_b_unit
 
-        g_np = self._states["g"].to_numpy()
-        energy_np = self._states["energy"].to_numpy() << 1 / u.cm
-        id_agg_np = self._states["id_agg"].to_numpy()
+            v_fi = np.zeros(temperature_profile.shape[0]) << 1 / u.s
+            v_if = np.zeros(temperature_profile.shape[0]) << 1 / u.s
+            for layer_idx in range(self.n_lte_layers, temperature_profile.shape[0]):
+                nlte_layer_idx = layer_idx - self.n_lte_layers
+                abs_profile, abs_start_idx = self.profile_store.get_profile(
+                    layer_idx=nlte_layer_idx, key=(id_agg_f, id_agg_i), profile_type="abs"
+                )
+                abs_profile: u.Quantity = abs_profile << u.cm ** 2
+                ste_profile, ste_start_idx = self.profile_store.get_profile(
+                    layer_idx=nlte_layer_idx, key=(id_agg_f, id_agg_i), profile_type="ste"
+                )
+                ste_profile: u.Quantity = ste_profile << u.cm ** 2
+                abs_end_idx = abs_start_idx + len(abs_profile)
+                ste_end_idx = ste_start_idx + len(ste_profile)
+                # abs_profile_norm = simpson_normalise_quantity_1d(
+                #     y_data=abs_profile, x_data=wn_grid[abs_start_idx:abs_end_idx]
+                # )
+                # ste_profile_norm = simpson_normalise_quantity_1d(
+                #     y_data=ste_profile, x_data=wn_grid[ste_start_idx:ste_end_idx]
+                # )
+                # v_fi[layer_idx] = simpson_quantity(
+                #     y_data=ste_profile_norm * b_fi * i_mean[layer_idx, ste_start_idx:ste_end_idx],
+                #     x_data=wn_grid[ste_start_idx:ste_end_idx]
+                # )
+                # v_if[layer_idx] = simpson_quantity(
+                #     y_data=abs_profile_norm * b_if * i_mean[layer_idx, abs_start_idx:abs_end_idx],
+                #     x_data=wn_grid[abs_start_idx:abs_end_idx]
+                # )
+                abs_profile_norm = loglinear_normalise_quantity_1d_nonnegative(
+                    y_data=abs_profile, dx=wn_dx[abs_start_idx:abs_end_idx]
+                )
+                ste_profile_norm = loglinear_normalise_quantity_1d_nonnegative(
+                    y_data=ste_profile, dx=wn_dx[ste_start_idx:ste_end_idx]
+                )
+                v_fi[layer_idx] = loglinear_integral_quantity_1d_nonnegative(
+                    y_data=ste_profile_norm * b_fi * i_mean[layer_idx, ste_start_idx:ste_end_idx],
+                    dx=wn_dx[ste_start_idx:ste_end_idx]
+                )
+                v_if[layer_idx] = loglinear_integral_quantity_1d_nonnegative(
+                    y_data=abs_profile_norm * b_if * i_mean[layer_idx, abs_start_idx:abs_end_idx],
+                    dx=wn_dx[abs_start_idx:abs_end_idx]
+                )
+            c_fi = self._col_chem_c_matrix[:, id_agg_i, id_agg_f] << 1 / u.s
+            c_if = self._col_chem_c_matrix[:, id_agg_f, id_agg_i] << 1 / u.s
+            n_ratio = (c_if + v_if) / (c_fi + a_fi + v_fi)
+            energy_agg_f = self.agg_states.filter(pl.col("id_agg") == id_agg_f).select(pl.col("energy_agg")).item()
+            energy_agg_i = self.agg_states.filter(pl.col("id_agg") == id_agg_i).select(pl.col("energy_agg")).item()
+            energy_dif = (energy_agg_f - energy_agg_i) / u.cm
+            t_ex_profile = (ac_h_c_on_kB * energy_dif / np.log(1 / n_ratio)).to(u.K)
+            if np.any(t_ex_profile < 0):
+                log.warning(f"{self.species} T_ex for ({id_agg_f}-{id_agg_i}) band contains negatives!")
+                t_ex_profile = np.clip(t_ex_profile, a_min=1.0, a_max=20000)  # Failsafe
+            log.info(f"DEBUG: {id_agg_f}-{id_agg_i} T_ex = {t_ex_profile}")
+            # log.info(f"DEBUG: {id_agg_f}-{id_agg_i}: C_if = {c_if}, C_fi = {c_fi}, V_if = {v_if}, V_fi = {v_fi},"
+            #          f" A_fi = {a_fi}.")
+            t_ex_profiles[pair_idx] = t_ex_profile
+        # t_ex_profiles = np.stack(t_ex_profiles)
+        t_ex_profile = t_ex_profiles.mean(axis=0)
+        log.info(f"T_ex = {t_ex_profile}")
+
+        g_np = self.states["g"].to_numpy()
+        energy_np = self.states["energy"].to_numpy() << 1 / u.cm
+        id_agg_np = self.states["id_agg"].to_numpy()
         hcE_on_kB = ac_h_c_on_kB * energy_np
 
-        cutoff_mask = id_agg_np <= self._id_agg_cutoff
+        cutoff_mask = id_agg_np <= self.id_agg_cutoff
 
         nlte_layer_slice = slice(self.n_lte_layers, None)
         t_ex_vals = t_ex_profile[nlte_layer_slice]
-        temp_vals = temperature_profile[nlte_layer_slice]
+        t_k_vals = temperature_profile[nlte_layer_slice]
         n_nlte_layers = self.n_layers - self.n_lte_layers
-
-        t_effective = np.where(cutoff_mask, t_ex_vals[:, None], temp_vals[:, None])
-        q_all = g_np[None, :] * np.exp(-hcE_on_kB[None, :] / t_effective)
-        n_all = q_all / q_all.sum(axis=1, keepdims=True)
-
-        n_agg_all = np.zeros((n_nlte_layers, self._n_agg_states))
-        # Witchcraft (adds each n_all to corresponding id_agg indices in n_agg_al, in place).
-        np.add.at(n_agg_all.T, id_agg_np, n_all.T)
-        # Equivalent to:
-        # n_agg_all = np.stack([
-        #     np.bincount(id_agg_np, weights=row, minlength=self._n_agg_states)
-        #     for row in n_all
-        # ])
-
         nlte_layers = range(self.n_lte_layers, self.n_layers)
 
-        n_lte_per_state = self._states.select(
-            [f"n_L{layer_idx}" for layer_idx in nlte_layers]
-        ).to_numpy().T
-        n_agg_lte_per_state = np.stack([
-            (
-                self._states[f"n_agg_L{layer_idx}"].to_numpy()[:self._n_agg_states]
-                if f"n_agg_L{layer_idx}" in self._states.columns
-                else self._pop_matrix[0, layer_idx]
-            )[id_agg_np]
-            for layer_idx in nlte_layers
-        ])
-        n_agg_tex_per_state = n_agg_all[:, id_agg_np]  # n_agg for every state at every layer.
+        q_lte = g_np[None, :] * np.exp(-hcE_on_kB[None, :] / t_k_vals[:, None])
+        n_lte = q_lte / q_lte.sum(axis=1, keepdims=True)
+        n_agg_lte = np.zeros((n_nlte_layers, self.n_agg_states))
+        np.add.at(n_agg_lte.T, id_agg_np, n_lte.T)
+
+        t_eff = np.where(cutoff_mask, t_ex_vals[:, None], t_k_vals[:, None])
+        q_eff = g_np[None, :] * np.exp(-hcE_on_kB[None, :] / t_eff)
+        n_eff = q_eff / q_eff.sum(axis=1, keepdims=True)
+        # This gives the aggregated populations using T_ex where needed, T_kin otherwise.
+        n_agg_eff = np.zeros((n_nlte_layers, self.n_agg_states))
+        # Witchcraft (adds each n_all to corresponding id_agg indices in n_agg_al, in place).
+        np.add.at(n_agg_eff.T, id_agg_np, n_eff.T)
+        # Equivalent to:
+        # n_agg_all = np.stack([
+        #     np.bincount(id_agg_np, weights=row, minlength=self.n_agg_states)
+        #     for row in n_all
+        # ])
+        # Why the fuck is it done like this?
+        # n_lte = self.states.select(
+        #     [f"n_L{layer_idx}" for layer_idx in nlte_layers]
+        # ).to_numpy().T
+        # n_agg_lte = np.stack([
+        #     (
+        #         self.states[f"n_agg_L{layer_idx}"].to_numpy()[:self.n_agg_states]
+        #         if f"n_agg_L{layer_idx}" in self.states.columns
+        #         else self.pop_matrix[0, layer_idx]
+        #     )[id_agg_np]
+        #     for layer_idx in nlte_layers
+        # ])
+        # n_agg_nlte = n_agg_all[:, id_agg_np]  # n_agg for every state at every layer.
+        # Map agg states back on to each state.
+        n_agg_eff_map = n_agg_eff[:, id_agg_np]
+        n_agg_lte_map = n_agg_lte[:, id_agg_np]
 
         scale_factor = np.divide(
-            n_agg_tex_per_state,
-            n_agg_lte_per_state,
-            out=np.zeros_like(n_agg_tex_per_state),
-            where=n_agg_lte_per_state != 0
+            n_agg_eff_map,
+            n_agg_lte_map,
+            out=np.zeros_like(n_agg_eff_map),
+            where=n_agg_lte_map != 0
         )
-        n_scaled = n_lte_per_state.copy()
-        n_scaled[:, cutoff_mask] *= scale_factor[:, cutoff_mask]
+        # n_scaled = n_lte.copy()
+        # n_scaled[:, cutoff_mask] *= scale_factor[:, cutoff_mask]
+        n_scaled = n_lte * scale_factor
         # The LTE pops have been rescaled here, though the relative strengths in these bands remains the same.
-        n_scaled = n_scaled / n_scaled.sum(axis=1, keepdims=True)
+        n_scaled /= n_scaled.sum(axis=1, keepdims=True)
 
-        self._nlte_pop_frac[nlte_layer_slice] = n_scaled[:, cutoff_mask].sum(axis=1)
+        n_agg_final = np.zeros((n_nlte_layers, self.n_agg_states))
+        np.add.at(n_agg_final.T, id_agg_np, n_scaled.T)
 
-        t_ex_pop_grid = np.zeros((1, self._pop_matrix.shape[1], self._pop_matrix.shape[2]))
-        t_ex_pop_grid[0, :self.n_lte_layers] = self._pop_matrix[0, :self.n_lte_layers]
-        t_ex_pop_grid[0, nlte_layer_slice] = n_agg_all
+        # TODO: This is broken when ther are null states in the grouping!
+        # self._nlte_pop_frac[nlte_layer_slice] = n_scaled[:, cutoff_mask].sum(axis=1)
+        self._nlte_pop_frac[nlte_layer_slice] = n_agg_final[:, :self.id_agg_cutoff + 1].sum(axis=1)
+        log.info(f"NLTE pop frac = {self._nlte_pop_frac}.")
+
+        t_ex_pop_grid = np.zeros((1, self.pop_matrix.shape[1], self.pop_matrix.shape[2]))
+        t_ex_pop_grid[0, :self.n_lte_layers] = self.pop_matrix[0, :self.n_lte_layers]
+        t_ex_pop_grid[0, nlte_layer_slice] = n_agg_final
+        log.info(f"new pop grid sums = {t_ex_pop_grid[0].sum(axis=1)}")
 
         nlte_col_exprs = []
         for idx, layer_idx in enumerate(nlte_layers):
             nlte_col_exprs.extend([
-                pl.Series(f"n_nlte_L{layer_idx}", n_scaled[idx]),
-                pl.Series(f"n_agg_nlte_L{layer_idx}", n_agg_all[idx][id_agg_np]),
+                # pl.Series(f"n_nlte_L{layer_idx}", n_scaled[idx]),
+                # pl.Series(f"n_agg_nlte_L{layer_idx}", n_agg_final[idx, id_agg_np]),
+                # TODO: TEST THIS! Set as new LTE.
+                pl.Series(f"n_L{layer_idx}", n_scaled[idx]),
+                pl.Series(f"n_agg_L{layer_idx}", n_agg_final[idx, id_agg_np]),
             ])
 
-        self._states = self._states.with_columns(nlte_col_exprs)
-        # # Old:
-        # t_ex_pop_grid = np.zeros((1, self._pop_matrix.shape[1], self._pop_matrix.shape[2]))
-        # t_ex_pop_grid[0, :self.n_lte_layers] = self._pop_matrix[0, :self.n_lte_layers]
-        #
-        # for slice_idx, layer_t_ex in enumerate(t_ex_profile[self.n_lte_layers:]):
-        #     layer_idx = slice_idx + self.n_lte_layers
-        #
-        #     q_lev = np.zeros_like(g_np, dtype=np.float64)
-        #     q_lev[cutoff_mask] = g_np[cutoff_mask] * np.exp(-hcE_on_kB[cutoff_mask] / layer_t_ex)
-        #     # pops = q_lev / q_lev[cutoff_mask].sum()
-        #
-        #     layer_temp = temperature_profile[layer_idx]
-        #     q_lev[~cutoff_mask] = g_np[~cutoff_mask] * np.exp(-hcE_on_kB[~cutoff_mask] / layer_temp)
-        #     pops = q_lev / q_lev.sum()
-        #
-        #     # log.info(f"[L{layer_idx}] Pops with separate Q calcs = {pops}, sum = {pops.sum()}")
-        #     # # Alternative
-        #     # pop_above_cutoff = self.states.select(
-        #     #     pl.col(f"n_L{layer_idx}").filter(pl.col("energy") > wn_grid.value.max()).sum()
-        #     # ).item()
-        #     # log.info(f"DEBUG: pop_above_cutoff = {pop_above_cutoff}")
-        #     # q_lev_test = np.zeros_like(g_np, dtype=np.float64)
-        #     # q_lev_test[cutoff_mask] = g_np[cutoff_mask] * np.exp(-hcE_on_kB[cutoff_mask] / layer_t_ex)
-        #     # pop_test = q_lev_test / q_lev_test[cutoff_mask].sum()
-        #     # pop_test /= (1 + pop_above_cutoff)
-        #     # pop_test[~cutoff_mask] = pops[~cutoff_mask]
-        #     # log.info(f"[L{layer_idx}] Pops scaled by LTE above cutoff = {pop_test}, sum = {pop_test.sum()}")
-        #
-        #     n_agg_lte_col = f"n_agg_L{layer_idx}"
-        #     n_lte_col = f"n_L{layer_idx}"
-        #     n_agg_nlte_col = f"n_agg_nlte_L{layer_idx}"
-        #     n_nlte_col = f"n_nlte_L{layer_idx}"
-        #
-        #     # # Treanor distribution? Locks states above cutoff to arbitrary initial guess excitiation, probably wrong.
-        #     # n_agg_lte = (
-        #     #     self.states
-        #     #     .select(["id_agg", n_agg_lte_col])
-        #     #     .unique("id_agg")
-        #     #     .sort("id_agg")
-        #     #     .get_column(n_agg_lte_col)
-        #     #     .to_numpy()
-        #     # )
-        #     # delta_factor = np.ones_like(n_agg_lte)
-        #     # delta_factor[agg_cutoff_mask] = np.exp(-hcE_v_on_kB[agg_cutoff_mask] * (1 / layer_t_ex - 1 / layer_temp))
-        #     #
-        #     # n_agg_nlte = n_agg_lte * delta_factor
-        #     # n_agg_nlte /= n_agg_nlte.sum()
-        #     # log.info(f"DEBUG: N_agg_NLTE new = {n_agg_nlte}")
-        #
-        #     self._states = self._states.with_columns(pl.Series(n_nlte_col, pops))
-        #
-        #     states_agg_n = (
-        #         self._states
-        #         .select(["id_agg", n_nlte_col])
-        #         .group_by("id_agg")
-        #         .agg(pl.col(n_nlte_col).sum().alias(n_agg_nlte_col))
-        #     ).sort("id_agg")
-        #     # log.info(f"DEBUG: N_agg_NLTE old = {states_agg_n}")
-        #     # log.info(f"DIFFS? {(n_agg_nlte - states_agg_n.to_numpy()) / n_agg_nlte}")
-        #     # Join aggregated populations back onto states.
-        #     self._states = self._states.join(states_agg_n, on="id_agg", how="left")
-        #     self._states = self._states.with_columns(
-        #         # Avoid division by 0.
-        #         pl.when(pl.col(n_agg_lte_col) == 0)
-        #         .then(0)
-        #         # If above cutoff, leave the states in LTE.
-        #         .when(pl.col("id_agg") > self._id_agg_cutoff)
-        #         .then(pl.col(n_lte_col))
-        #         # If within energy cutoff, scale aggregated population (frozen rotational distribution).
-        #         .otherwise(pl.col(n_lte_col) * pl.col(n_agg_nlte_col) / pl.col(n_agg_lte_col))
-        #         .alias(n_nlte_col)
-        #     )
-        #     self._states = self._states.with_columns(
-        #         (pl.col(n_nlte_col) / pl.col(n_nlte_col).sum()).alias(n_nlte_col)
-        #     )
-        #     self._nlte_pop_frac[layer_idx] = self._states.select(
-        #         pl.col(n_nlte_col).filter(pl.col("id_agg") <= self._id_agg_cutoff).sum()
-        #     ).item()
-        #     # log.info(f"DEBUG: [L{layer_idx}] NLTE pop sum = {self.states[n_nlte_col].sum()}, {pops.sum()}.")
-        #     # log.info(f"DEBUG: Prenorm: {self.states[n_nlte_col]}")
-        #     # renormed = self.states[n_nlte_col] / self.states[n_nlte_col].sum()
-        #     # log.info(f"DEBUG: {self.states[n_lte_col]} {renormed}, {pops}")
-        #     # log.info(f"DEBUG: Renormed sum = {renormed.sum()}")
-        #     t_ex_pop_grid[0, layer_idx] = states_agg_n.sort("id_agg")[n_agg_nlte_col].to_numpy()
-        # log.info(f"DEBUG: self._states = {self._states}")
-        self._pop_matrix = np.vstack((self._pop_matrix, t_ex_pop_grid))
-        # log.info(f"{self.species}: Approximate T_ex pops. = {t_ex_pop_grid[0]}")
-        # log.info(f"DEBUG: {self.species}: T_ex pop_matrix = {self.pop_matrix[-1]}")
+        self.states = self.states.with_columns(nlte_col_exprs)
+        self.pop_matrix = np.vstack((self.pop_matrix, t_ex_pop_grid))
         return t_ex_profile
 
     def precompute_all_cross_terms(
             self,
             nlte_layer_idx: int,
             wn_grid: u.Quantity,
-    ) -> npt.NDArray[np.float64]:
+    ) -> u.Quantity:
         """
         Pre-compute a_ox_cross for all o_idx values. Called once per build_y_matrix call.
 
@@ -2139,12 +2636,12 @@ class NLTEProcessor:
 
         Returns
         -------
-        a_ox_cross_cache : np.ndarray, shape (n_agg_states, num_grid)
+        a_ox_cross_cache : astropy.units.Quantity, shape (n_agg_states, num_grid)
         """
 
-        spe_profiles_norm = self._profile_store.precompute_normalised_downward_emission_profiles(
+        spe_profiles_norm = self.profile_store.precompute_normalised_downward_emission_profiles(
             layer_idx=nlte_layer_idx,
-            id_agg_cutoff=self._id_agg_cutoff,
+            id_agg_cutoff=self.id_agg_cutoff,
             wn_grid=wn_grid,
         )
         # Normalised profiles have units 1/wn_grid.unit, i.e: u.cm.
@@ -2163,6 +2660,7 @@ class NLTEProcessor:
             global_chi_matrix: u.Quantity,  # u.cm**2
             global_source_func_matrix: u.Quantity,
             wn_grid: u.Quantity,
+            wn_dx: u.Quantity,
             full_prec: bool,
     ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
         """
@@ -2181,7 +2679,7 @@ class NLTEProcessor:
         psi_approx_eta = np.clip(abs(psi_approx_eta), 0, i_layer_grid)
         i_prec: u.Quantity = (i_layer_grid - psi_approx_eta) * 4 * np.pi * u.sr
 
-        n_dim = self._id_agg_cutoff + 1
+        n_dim = self.id_agg_cutoff + 1
         y_matrix = np.zeros((n_dim, n_dim), dtype=np.float64) << (1 / u.s)
         rhs_matrix = np.zeros(n_dim, dtype=np.float64) << (1 / u.s)
         rates_start = time.perf_counter()
@@ -2202,9 +2700,9 @@ class NLTEProcessor:
             # np.save(r"/mnt/c/PhD/NLTE/theory/cross_coupling/psi_approx_cross_abs.npy", psi_approx_cross.value)
             # np.save(r"/mnt/c/PhD/NLTE/theory/cross_coupling/psi_approx_cross_norm.npy", psi_approx_cross.value)
 
-        for trans_row in self._rates_grid.iter_rows(named=False):
+        for trans_row in self.rates_grid.iter_rows(named=False):
             # 0 = id_agg_f, 1 = id_agg_i, 2 = A_fi, 3 = B_fi, 4 = B_if.
-            if trans_row[0] > self._id_agg_cutoff or trans_row[1] > self._id_agg_cutoff:
+            if trans_row[0] > self.id_agg_cutoff or trans_row[1] > self.id_agg_cutoff:
                 # Short-circuit for bands involving states above cutoff; these pops are fixed and including them on RHS
                 # biases towards fixed distribution above cutoff.
                 continue
@@ -2214,26 +2712,32 @@ class NLTEProcessor:
             # log.info(f"[L{layer_idx}] Trans: {trans_row}.")
 
             # These are pop-normalised within the band, but redundant due to normalisation.
-            abs_profile, abs_start_idx = self._profile_store.get_profile(
+            abs_profile, abs_start_idx = self.profile_store.get_profile(
                 layer_idx=nlte_layer_idx, key=(trans_row[0], trans_row[1]), profile_type="abs"
             )
             # abs_profile = abs_profile * self.pop_matrix[-1, layer_idx, trans_row[1]] << u.cm ** 2
-            abs_profile = abs_profile << u.cm ** 2
-            ste_profile, ste_start_idx = self._profile_store.get_profile(
+            abs_profile: u.Quantity = abs_profile << u.cm ** 2
+            ste_profile, ste_start_idx = self.profile_store.get_profile(
                 layer_idx=nlte_layer_idx, key=(trans_row[0], trans_row[1]), profile_type="ste"
             )
             # ste_profile = ste_profile * self.pop_matrix[-1, layer_idx, trans_row[0]] << u.cm ** 2
-            ste_profile = ste_profile << u.cm ** 2
+            ste_profile: u.Quantity = ste_profile << u.cm ** 2
 
             abs_end_idx = abs_start_idx + len(abs_profile)
             ste_end_idx = ste_start_idx + len(ste_profile)
 
             # Normalised profiles with units [cm].
-            abs_profile_norm = simpson_normalise_quantity_1d(
-                y_data=abs_profile, x_data=wn_grid[abs_start_idx:abs_end_idx]
+            # abs_profile_norm = simpson_normalise_quantity_1d(
+            #     y_data=abs_profile, x_data=wn_grid[abs_start_idx:abs_end_idx]
+            # )
+            # ste_profile_norm = simpson_normalise_quantity_1d(
+            #     y_data=ste_profile, x_data=wn_grid[ste_start_idx:ste_end_idx]
+            # )
+            abs_profile_norm = loglinear_normalise_quantity_1d_nonnegative(
+                y_data=abs_profile, dx=wn_dx[abs_start_idx:abs_end_idx]
             )
-            ste_profile_norm = simpson_normalise_quantity_1d(
-                y_data=ste_profile, x_data=wn_grid[ste_start_idx:ste_end_idx]
+            ste_profile_norm = loglinear_normalise_quantity_1d_nonnegative(
+                y_data=ste_profile, dx=wn_dx[ste_start_idx:ste_end_idx]
             )
 
             # U_fi is the integral of A_fi*phi_fi; phi_fi is integral normalised, so we can skip this.
@@ -2254,11 +2758,11 @@ class NLTEProcessor:
             # )
             chi_if: u.Quantity = np.zeros(num_grid) << abs_profile.unit
             chi_if[abs_start_idx: abs_end_idx] += (
-                    self._pop_matrix[-1, layer_idx, trans_row[1]]
+                    self.pop_matrix[-1, layer_idx, trans_row[1]]
                     * abs_profile
             )
             chi_if[ste_start_idx: ste_end_idx] -= (
-                    self._pop_matrix[-1, layer_idx, trans_row[0]]
+                    self.pop_matrix[-1, layer_idx, trans_row[0]]
                     * ste_profile
             )
             chi_if *= chem_profile[self.species][layer_idx]
@@ -2267,7 +2771,8 @@ class NLTEProcessor:
             if full_prec:
                 # psi_approx_cross_if = np.abs(chi_if[None, :] * psi_approx_cross) * 4 * np.pi * u.sr  # Abs. profiles.
                 psi_approx_cross_if = np.abs(chi_if[None, :] * psi_approx_cross)  # Normalised profiles.
-                psi_integrals = simpson_quantity_2d(y_data=psi_approx_cross_if, x_data=wn_grid)  # .decompose()
+                # psi_integrals = simpson_quantity_2d(y_data=psi_approx_cross_if, x_data=wn_grid)  # .decompose()
+                psi_integrals = loglinear_integral_quantity_2d_nonnegative(y_data=psi_approx_cross_if, dx=wn_dx)
 
                 # np.save(fr"/mnt/c/PhD/NLTE/theory/cross_coupling/psi_approx_cross_{trans_row[1]}{trans_row[0]}_abs.npy", psi_approx_cross_if.value)
                 # np.save(fr"/mnt/c/PhD/NLTE/theory/cross_coupling/psi_approx_cross_{trans_row[1]}{trans_row[0]}_norm.npy", psi_approx_cross_if.value)
@@ -2301,13 +2806,16 @@ class NLTEProcessor:
                 # term has a wavenumber dependence however, so we compute Lambda^{*}[Chi_if/Chi_nu]*phi_fi. The Lambda
                 # operator is dimensionless here and the normalised spontaneous emission profile has units of [cm];
                 # taking the yields the desired dimensionless factor to reduce A_fi by.
-                spe_profile, spe_start_idx = self._profile_store.get_profile(
+                spe_profile, spe_start_idx = self.profile_store.get_profile(
                     layer_idx=nlte_layer_idx, key=(trans_row[0], trans_row[1]), profile_type="ste"
                 )
                 spe_profile = spe_profile << u.erg * u.cm / (u.s * u.sr)
                 spe_end_idx = spe_start_idx + len(spe_profile)
-                spe_profile_norm = simpson_normalise_quantity_1d(
-                    y_data=spe_profile, x_data=wn_grid[spe_start_idx:spe_end_idx]
+                # spe_profile_norm = simpson_normalise_quantity_1d(
+                #     y_data=spe_profile, x_data=wn_grid[spe_start_idx:spe_end_idx]
+                # )
+                spe_profile_norm = loglinear_normalise_1d_nonnegative(
+                    y_data=spe_profile, dx=wn_dx[spe_start_idx:spe_end_idx]
                 )
                 self_prec = np.zeros(num_grid)
                 self_prec[chi_mask] = (
@@ -2317,21 +2825,30 @@ class NLTEProcessor:
                         / global_chi[chi_mask]
                 )
                 self_prec = self_prec[spe_start_idx:spe_end_idx] * spe_profile_norm
-                self_prec = simpson_quantity(y_data=self_prec, x_data=wn_grid[spe_start_idx:spe_end_idx])
+                # self_prec = simpson_quantity(y_data=self_prec, x_data=wn_grid[spe_start_idx:spe_end_idx])
+                self_prec = loglinear_integral_quantity_1d(y_data=self_prec, dx=wn_dx[spe_start_idx:spe_end_idx])
                 u_fi *= 1 - self_prec
             # End cross.
             # log.info(f"[L{layer_idx}] U_{trans_row[0], trans_row[1]} = {u_fi}")
 
-            v_fi_prec = simpson_quantity(
+            # v_fi_prec = simpson_quantity(
+            #     y_data=ste_profile_norm * i_prec[ste_start_idx: ste_end_idx],
+            #     x_data=wn_grid[ste_start_idx: ste_end_idx]
+            # ) * b_fi
+            v_fi_prec = loglinear_integral_quantity_1d(
                 y_data=ste_profile_norm * i_prec[ste_start_idx: ste_end_idx],
-                x_data=wn_grid[ste_start_idx: ste_end_idx]
+                dx=wn_dx[ste_start_idx: ste_end_idx]
             ) * b_fi
             v_fi_prec = v_fi_prec.decompose()
             # log.info(f"[L{layer_idx}] V_{trans_row[0], trans_row[1]}_prec = {v_fi_prec}")
 
-            v_if_prec = simpson_quantity(
+            # v_if_prec = simpson_quantity(
+            #     y_data=abs_profile_norm * i_prec[abs_start_idx: abs_end_idx],
+            #     x_data=wn_grid[abs_start_idx: abs_end_idx]
+            # ) * b_if
+            v_if_prec = loglinear_integral_quantity_1d(
                 y_data=abs_profile_norm * i_prec[abs_start_idx: abs_end_idx],
-                x_data=wn_grid[abs_start_idx: abs_end_idx]
+                dx=wn_dx[abs_start_idx: abs_end_idx]
             ) * b_if
             v_if_prec = v_if_prec.decompose()
             # log.info(f"[L{layer_idx}] V_{trans_row[1], trans_row[0]}_prec = {v_if_prec}")
@@ -2364,7 +2881,7 @@ class NLTEProcessor:
             #     f"{self.cont_profile_store.get_keys(layer_idx=nlte_layer_idx, profile_type="abs")}"
             # ))
             for cont_trans_row in self._cont_rates.iter_rows(named=False):
-                if cont_trans_row[0] > self._id_agg_cutoff:
+                if cont_trans_row[0] > self.id_agg_cutoff:
                     # Short-circuit for bands involving states above cutoff; these pops are fixed and including them on
                     # RHS biases towards fixed distribution above cutoff.
                     continue
@@ -2379,11 +2896,14 @@ class NLTEProcessor:
                     layer_idx=nlte_layer_idx, key=cont_trans_row[0], profile_type="abs"
                 )
                 # cont_abs_profile = cont_abs_profile * self.pop_matrix[-1, layer_idx, cont_trans_row[0]] << u.cm ** 2
-                cont_abs_profile = cont_abs_profile << u.cm ** 2
+                cont_abs_profile: u.Quantity = cont_abs_profile << u.cm ** 2
                 cont_abs_end_idx = cont_abs_start_idx + len(cont_abs_profile)
 
-                cont_abs_profile_norm = simpson_normalise_quantity_1d(
-                    y_data=cont_abs_profile, x_data=wn_grid[cont_abs_start_idx:cont_abs_end_idx]
+                # cont_abs_profile_norm = simpson_normalise_quantity_1d(
+                #     y_data=cont_abs_profile, x_data=wn_grid[cont_abs_start_idx:cont_abs_end_idx]
+                # )
+                cont_abs_profile_norm = loglinear_normalise_quantity_1d_nonnegative(
+                    y_data=cont_abs_profile, dx=wn_dx[cont_abs_start_idx:cont_abs_end_idx]
                 )
 
                 # Cross terms:
@@ -2397,7 +2917,7 @@ class NLTEProcessor:
                 # chi_ic = np.where(chi_ic < 0, 0, chi_ic)
                 chi_ic: u.Quantity = np.zeros(num_grid) << cont_abs_profile.unit
                 chi_ic[cont_abs_start_idx: cont_abs_end_idx] += (
-                        self._pop_matrix[-1, layer_idx, cont_trans_row[0]]
+                        self.pop_matrix[-1, layer_idx, cont_trans_row[0]]
                         * cont_abs_profile
                         * chem_profile[self.species][layer_idx]
                 )
@@ -2406,7 +2926,8 @@ class NLTEProcessor:
                 if full_prec:
                     # psi_approx_cross_ic = np.abs(chi_ic[None, :] * psi_approx_cross) * 4 * np.pi * u.sr
                     psi_approx_cross_ic = np.abs(chi_ic[None, :] * psi_approx_cross)
-                    psi_integrals = simpson_quantity_2d(y_data=psi_approx_cross_ic, x_data=wn_grid).decompose()
+                    # psi_integrals = simpson_quantity_2d(y_data=psi_approx_cross_ic, x_data=wn_grid).decompose()
+                    psi_integrals = loglinear_integral_quantity_2d_nonnegative(y_data=psi_approx_cross_ic, dx=wn_dx)
 
                     # log.info(f"[L{layer_idx}] chi_psi_{cont_trans_row[0]}c = {psi_integrals}")
 
@@ -2427,9 +2948,13 @@ class NLTEProcessor:
                     #     # rhs_matrix[cont_trans_row[0]] -= np.sum(psi_integrals[above_mask] * o_pops[above_mask])
                     #     y_matrix[cont_trans_row[0], below_mask] += psi_integrals[below_mask]
                 # End cross.
-                v_ic_prec = simpson_quantity(
+                # v_ic_prec = simpson_quantity(
+                #     y_data=cont_abs_profile_norm * i_prec[cont_abs_start_idx: cont_abs_end_idx],
+                #     x_data=wn_grid[cont_abs_start_idx: cont_abs_end_idx]
+                # ) * b_ic
+                v_ic_prec = loglinear_integral_quantity_1d(
                     y_data=cont_abs_profile_norm * i_prec[cont_abs_start_idx: cont_abs_end_idx],
-                    x_data=wn_grid[cont_abs_start_idx: cont_abs_end_idx]
+                    dx=wn_dx[cont_abs_start_idx: cont_abs_end_idx]
                 ) * b_ic
                 v_ic_prec = v_ic_prec.decompose()
                 # log.info(f"[L{layer_idx}] V_{cont_trans_row[0]}c_prec = {v_ic_prec}")
@@ -2450,7 +2975,7 @@ class NLTEProcessor:
                     limiting_scale_factor = 0
                 else:
                     mol_num_dens = chem_profile[self.species][layer_idx]
-                    i_pop = self._pop_matrix[-1, layer_idx, cont_trans_row[0]]
+                    i_pop = self.pop_matrix[-1, layer_idx, cont_trans_row[0]]
                     limiting_scale_factor = i_pop * mol_num_dens / limiting_species_num_dens
 
                 y_matrix[cont_trans_row[0], cont_trans_row[0]] -= v_ic_prec
@@ -2466,7 +2991,7 @@ class NLTEProcessor:
             # chem_profile=chem_profile,
             # density_profile=density_profile,
         )
-        log.info(f"[L{layer_idx}] Y matrix construction duration = {time.perf_counter() - rates_start}")
+        log.info(f"[L{layer_idx}] {self.species} Y matrix construction duration = {time.perf_counter() - rates_start}")
         return y_matrix.value, rhs_matrix.value
 
     def add_col_chem_rates(
@@ -2572,7 +3097,7 @@ class NLTEProcessor:
             pop_matrix = nppinv_pops
 
         nlte_layer_idx = layer_idx - self.n_lte_layers
-        pop_old_norm = self._pop_matrix[-1, layer_idx, y_reduced_idx_map] / self._pop_matrix[
+        pop_old_norm = self.pop_matrix[-1, layer_idx, y_reduced_idx_map] / self.pop_matrix[
             -1, layer_idx, y_reduced_idx_map].sum()
         pop_matrix = self.accelerator.update(
             pop_new=pop_matrix,
@@ -2587,16 +3112,16 @@ class NLTEProcessor:
         pop_matrix = self._nlte_pop_frac[layer_idx] * pop_matrix / pop_matrix.sum()
         log.info(f"[L{layer_idx}] DEBUG: Pops. sum = {pop_matrix.sum()} (should be {self._nlte_pop_frac[layer_idx]})")
 
-        log.info(f"[L{layer_idx}] New pops.:")
+        log.info(f"[L{layer_idx}] {self.species} New pops.:")
         for idx, y_idx in enumerate(y_reduced_idx_map):
             log.info((
                 f"[L{layer_idx}]"
-                f" n{self._agg_states.filter(pl.col("id_agg") == y_idx).select(self.agg_col_names).row(0)}"
+                f" n{self.agg_states.filter(pl.col("id_agg") == y_idx).select(self.agg_col_names).row(0)}"
                 f" = {pop_matrix[idx]}"
             ))
-        full_pops = np.zeros(self._n_agg_states)
+        full_pops = np.zeros(self.n_agg_states)
         full_pops[y_reduced_idx_map] = pop_matrix
-        full_pops[self._id_agg_cutoff + 1:] = self._pop_matrix[-1, layer_idx, self._id_agg_cutoff + 1:]  # TEST!
+        full_pops[self.id_agg_cutoff + 1:] = self.pop_matrix[-1, layer_idx, self.id_agg_cutoff + 1:]  # TEST!
         pop_grid_update[layer_idx] = full_pops
         log.info(f"[L{layer_idx}] DEBUG: full_pops sum = {full_pops.sum()}")
 
@@ -2604,17 +3129,17 @@ class NLTEProcessor:
         n_lte_col = f"n_L{layer_idx}"
         n_agg_nlte_col = f"n_agg_nlte_L{layer_idx}"
         n_nlte_col = f"n_nlte_L{layer_idx}"
-        self._states = self._states.with_columns(
-            pl.Series(full_pops).gather(self._states["id_agg"]).alias(n_agg_nlte_col)
+        self.states = self.states.with_columns(
+            pl.Series(full_pops).gather(self.states["id_agg"]).alias(n_agg_nlte_col)
         )
         # TODO: In the case where T_ex has been approximated, the LTE pops above the cutoff have been rescaled! Use
         #  those somehow - in non-T_ex runs, n_nlte_col doesn't exist the first iteration to pull from - rebalance in
         #  the n_lte_col directly?
-        self._states = self._states.with_columns(
+        self.states = self.states.with_columns(
             pl.when(pl.col(n_agg_lte_col) == 0)
             .then(0)
             # If above cutoff, leave the states in LTE.
-            .when(pl.col("id_agg") > self._id_agg_cutoff)
+            .when(pl.col("id_agg") > self.id_agg_cutoff)
             .then(pl.col(n_lte_col))
             # TODO: These need to be rebalanced as they're normalised to 1. Probably also need to modify y-matrix
             #  construction to use fixed coded pops for states above the cutoff. If they are not multiplying by
@@ -2626,11 +3151,12 @@ class NLTEProcessor:
         # self.states = self.states.with_columns(
         #     (pl.col(n_nlte_col) / pl.col(n_nlte_col).sum()).alias(n_nlte_col)
         # )
-        log_col_names = ["id", "energy", "g", "tau"] + self.agg_col_names + [n_agg_lte_col, n_agg_nlte_col, n_nlte_col]
+        # log_col_names = ["id", "energy", "g", "tau"] + self.agg_col_names + [n_agg_lte_col, n_agg_nlte_col, n_nlte_col]
+        log_col_names = ["id", "energy", "g", "tau", n_lte_col, n_agg_lte_col, n_agg_nlte_col, n_nlte_col]
         log.info((
-            f"[L{layer_idx}] NLTE States = \n{self._states.select(log_col_names)}\n"
-            f"[L{layer_idx}] Sum of LTE populations = {self._states[n_lte_col].sum()}.\n"
-            f"[L{layer_idx}] Sum of non-LTE populations = {self._states[n_nlte_col].sum()}."
+            f"[L{layer_idx}] {self.species} NLTE States = \n{self.states.select(log_col_names)}\n"
+            f"[L{layer_idx}] Sum of LTE populations = {self.states[n_lte_col].sum()}.\n"
+            f"[L{layer_idx}] Sum of non-LTE populations = {self.states[n_nlte_col].sum()}."
         ))
         return pop_grid_update
 
@@ -2646,13 +3172,13 @@ class NLTEProcessor:
     ) -> t.Tuple[u.Quantity, u.Quantity]:
         if layer_pop_grid is None:
             # Use for T_ex approximation when all new popualtions stored internally.
-            layer_pop_grid = self._pop_matrix[-1, layer_idx]
+            layer_pop_grid = self.pop_matrix[-1, layer_idx]
 
         start_time = time.perf_counter()
-        abs_xsec, emi_xsec = self._profile_store.build_abs_emi(
+        abs_xsec, emi_xsec = self.profile_store.build_abs_emi(
             layer_idx=nlte_layer_idx, pop_matrix=layer_pop_grid, wn_grid=wn_grid.value,
         )
-        log.info(f"[L{layer_idx}] CBP duration = {time.perf_counter() - start_time:.6f}")
+        log.info(f"[L{layer_idx}] {self.species} CBP duration = {time.perf_counter() - start_time:.6f}")
         ################### DEBUG
         # import matplotlib.pyplot as plt
         # plt.figure(figsize=(8, 4), dpi=300)
@@ -2693,9 +3219,10 @@ class NLTEProcessor:
         #     )
         #     exit()
         ################### DEBUG END
-
         if np.any(abs_xsec < 0):
-            log.warn(f"[L{layer_idx}] Negative contribution in absorption (stimulated emission dominates)")
+            log.warning(
+                f"[L{layer_idx}] {self.species} Negative contribution in absorption (stimulated emission dominates)"
+            )
 
         if self._cont_states is not None and self.cont_trans_files is not None:
             # for key in self.cont_profile_grid[nlte_layer_idx].keys():
@@ -2729,12 +3256,12 @@ class NLTEProcessor:
             pop_grid_updated: npt.NDArray[np.float64],
             n_iter: int
     ) -> bool:
-        self._pop_matrix = np.vstack((
-            self._pop_matrix, pop_grid_updated.reshape((1, self._pop_matrix.shape[1], self._pop_matrix.shape[2]))
+        self.pop_matrix = np.vstack((
+            self.pop_matrix, pop_grid_updated.reshape((1, self.pop_matrix.shape[1], self.pop_matrix.shape[2]))
         ))
         # TEMP!
         with open((output_dir / f"{self.species}_pop_matrix.pickle").resolve(), "wb") as pickle_file:
-            pickle.dump(self._pop_matrix, pickle_file, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(self.pop_matrix, pickle_file, protocol=pickle.HIGHEST_PROTOCOL)
 
         # TODO: Flag when levels oscillate between 0 and extremely small values, blocking convergence, fix to 0?
         max_pop_change = self.accelerator.get_max_change()
@@ -2762,13 +3289,17 @@ class NLTEProcessor:
 
         """
         with open((output_dir / f"{self.species}_pop_matrix.pickle").resolve(), "wb") as pickle_file:
-            pickle.dump(self._pop_matrix, pickle_file, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(self.pop_matrix, pickle_file, protocol=pickle.HIGHEST_PROTOCOL)
         # self.mol_chi_matrix = super().opacity(temperature, pressure, spectral_grid)
         # self.mol_source_func_matrix = blackbody(spectral_grid=spectral_grid, temperature=temperature)
         # self.mol_eta_matrix = self.mol_source_func_matrix * self.mol_chi_matrix * ac.c
+        # Clean up large, no longer needed properties?
+        self.profile_store = None
+        self._cont_profile_store = None
+        # Layered calculations.
         n_nlte_layers = self.n_layers - self.n_lte_layers
         abs_xsec, emi_xsec = abs_emi_xsec(
-            states=self._states,
+            states=self.states,
             trans_files=self.trans_files,
             n_lte_layers=self.n_lte_layers,
             n_nlte_layers=n_nlte_layers,
@@ -2780,7 +3311,7 @@ class NLTEProcessor:
         )
         if self._cont_states is not None:
             cont_xsec = continuum_xsec(
-                states=self._states,
+                states=self.states,
                 continuum_states=self._cont_states,
                 continuum_trans_files=self.cont_trans_files,
                 n_lte_layers=self.n_lte_layers,
@@ -2804,10 +3335,10 @@ class NLTEProcessor:
         #     n_lte_col = f"n_L{layer_idx}"
         #     n_agg_nlte_col = f"n_agg_nlte_L{layer_idx}"
         #     n_nlte_col = f"n_nlte_L{layer_idx}"
-        #     self._states = self._states.with_columns(
-        #         pl.Series(self._pop_matrix[-1, layer_idx]).gather(self._states["id_agg"]).alias(n_agg_nlte_col)
+        #     self.states = self.states.with_columns(
+        #         pl.Series(self.pop_matrix[-1, layer_idx]).gather(self.states["id_agg"]).alias(n_agg_nlte_col)
         #     )
-        #     self._states = self._states.with_columns(
+        #     self.states = self.states.with_columns(
         #         pl.when(pl.col(n_agg_lte_col) == 0)
         #         .then(0)
         #         .otherwise(pl.col(n_lte_col) * pl.col(n_agg_nlte_col) / pl.col(n_agg_lte_col))
@@ -2815,7 +3346,7 @@ class NLTEProcessor:
         #     )
         #
         #     abs_xsec, emi_xsec = abs_emi_xsec(
-        #         states=self._states,
+        #         states=self.states,
         #         trans_files=self.trans_files,
         #         temperature_profile=temperature_profile,
         #         pressure_profile=pressure_profile,
@@ -2825,7 +3356,7 @@ class NLTEProcessor:
         #     )
         #     if self._cont_states is not None:
         #         nlte_select_cols = [pl.col("id"), pl.col(n_nlte_col)]
-        #         nlte_cont_states = self._cont_states.join(self._states.select(nlte_select_cols), on="id", how="left")
+        #         nlte_cont_states = self._cont_states.join(self.states.select(nlte_select_cols), on="id", how="left")
         #         cont_xsec = continuum_xsec(
         #             continuum_states=nlte_cont_states,
         #             continuum_trans_files=self.cont_trans_files,
@@ -2846,7 +3377,7 @@ class NLTEProcessor:
         #         # )
         #         # # LTE Comparison
         #         # lte_select_cols = [pl.col("id"), pl.col(n_lte_col)]
-        #         # lte_cont_states = self._cont_states.join(self._states.select(lte_select_cols), on="id", how="left")
+        #         # lte_cont_states = self._cont_states.join(self.states.select(lte_select_cols), on="id", how="left")
         #         # # lte_cont_states = self.cont_states.merge(nlte_states[["id", "n"]], on="id", how="left")
         #         # # Fudge for how continuum_xsec() picks column.
         #         # lte_cont_states = lte_cont_states.with_columns(pl.col(n_lte_col).alias(n_nlte_col))

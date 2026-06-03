@@ -901,13 +901,13 @@ class CollisionalRatesDatabase:
             One entry per (upper, lower, isomer) combination.
         """
         # Temperature grid shared by both isomers (K)
-        h2o_t_list = np.array([200.0, 400.0, 800.0, 1200.0, 1600.0, 2000.0, 2500.0, 3000.0, 3500.0, 4000.0, 5000.0])
+        h2o_h2_t_list = np.array([200.0, 400.0, 800.0, 1200.0, 1600.0, 2000.0, 2500.0, 3000.0, 3500.0, 4000.0, 5000.0])
 
         # Data from A. Faure & E. Josselin (2008), doi:10.1051/0004-6361:200810717
         # Limited up to 5000 cm-1.
 
         # --- ortho-H2O + H2 ---
-        h2o_ortho_rates: t.Dict[t.Tuple, npt.NDArray[np.float64]] = {
+        h2o_h2_ortho_rates: t.Dict[t.Tuple, npt.NDArray[np.float64]] = {
             # (v1u, v2u, v3u, v1l, v2l, v3l)
             (0, 1, 0, 0, 0, 0): np.array(
                 [1.5622153387014665e-10, 1.6629794504010064e-10, 3.6344339971400234e-10, 7.301591647700061e-10,
@@ -992,7 +992,7 @@ class CollisionalRatesDatabase:
         }
 
         # --- para-H2O + H2 ---
-        h2o_para_rates: t.Dict[t.Tuple, npt.NDArray[np.float64]] = {
+        h2o_h2_para_rates: t.Dict[t.Tuple, npt.NDArray[np.float64]] = {
             (0, 1, 0, 0, 0, 0): np.array(
                 [1.4468296578463645e-10, 1.6033103477657013e-10, 3.6159723919134315e-10, 7.228202533186276e-10,
                  1.2721070833720107e-09, 1.9974421300334366e-09, 3.202128296862668e-09, 4.704551969605054e-09,
@@ -1076,21 +1076,167 @@ class CollisionalRatesDatabase:
         }
 
         rates = []
-        isomer_datasets: t.List[t.Tuple[str, t.Dict]] = [
-            ("o", h2o_ortho_rates),
-            ("p", h2o_para_rates),
+        h2o_h2_isomer_datasets: t.List[t.Tuple[str, t.Dict]] = [
+            ("o", h2o_h2_ortho_rates),
+            ("p", h2o_h2_para_rates),
         ]
 
-        for isomer_label, rate_dict in isomer_datasets:
+        for isomer_label, rate_dict in h2o_h2_isomer_datasets:
             for (v1u, v2u, v3u, v1l, v2l, v3l), rate_array in rate_dict.items():
                 interpolated_rate = CollisionalRatesDatabase._interp_rate(
-                    layer_temp, h2o_t_list, rate_array
+                    layer_temp, h2o_h2_t_list, rate_array
                 )
                 rates.append(RateTransition(
                     upper_key=(v1u, v2u, v3u, isomer_label),
                     lower_key=(v1l, v2l, v3l, isomer_label),
                     rate=interpolated_rate,
                     mol_depend="H2",
+                ))
+
+        # Data from P. F. Zittel & D. E. Masturzo (1998), doi:10.1063/1.456122
+        # Temperature grid shared by both isomers (K)
+        h2o_h2o_stretch_t_list = np.array([295.0, 410.0, 518.0, 648.0, 772.0, 922.0, 1020.0])
+
+        # --- H2O(nu_1/nu_3) + H2O ---
+        # Table 1; assumed same data for nu_1 and nu_3, stated to relax together due to fast equilibrium.
+        h2o_h2o_stretch_t_depend_rates: t.Dict[t.Tuple, npt.NDArray[np.float64]] = {
+            (1, 0, 0, 0, 0, 0): np.array([3.0e-11, 2.4e-11, 2.4e-11, 2.4e-11, 2.5e-11, 2.4e-11, 2.1e-11]),
+            (0, 0, 1, 0, 0, 0): np.array([3.0e-11, 2.4e-11, 2.4e-11, 2.4e-11, 2.5e-11, 2.4e-11, 2.1e-11]),
+        }
+
+        h2o_h2o_bend_t_list = np.array([295.0, 514.0, 730.0, 947.0])
+
+        # --- H2O(nu_2) + H2O ---
+        # D. L. Huestis (2006), 10.1021/jp054889n, also quotes the specific reaction (i.e.: state specific for collider)
+        # (0,1,0)+(0,0,0)->(0,0,0)+(0,0,0) as k(T=300K)= 5.1e-11 and k(200K)=5.0e-11.
+        h2o_h2o_bend_t_depend_rates: t.Dict[t.Tuple, npt.NDArray[np.float64]] = {
+            (0, 1, 0, 0, 0, 0): np.array([5.4e-11, 5.0e-11, 5.4e-11, 6.0e-11]),  # Table 3
+            (0, 2, 0, 0, 0, 0): np.array([12.1e-11, 10.9e-11, 10.9e-11, 11.6e-11]),  # Table 2
+        }
+        # nu2 relaxation probability is known to increase by factor ~2 at 2500 K, see Zittel & Masturzo discussion.
+
+        # --- H2O(nu_1/nu_3) + H2O ---
+        # Table 1; assumed same data for nu_1 and nu_3, stated to relax together due to fast equilibrium.
+        h2o_he_stretch_t_list = np.array([295.0, 410.0, 518.0, 648.0, 770.0, 924.0])
+
+        # Rates are given as upper bounds - scale by some factor?
+        h2o_he_scale_factor = 0.5
+        h2o_he_stretch_t_depend_rates: t.Dict[t.Tuple, npt.NDArray[np.float64]] = {
+            (1, 0, 0, 0, 0, 0): np.array([0.4e-12, 0.6e-12, 0.7e-12, 0.8e-12, 1.0e-12, 1.2e-12]) * h2o_he_scale_factor,
+            (0, 0, 1, 0, 0, 0): np.array([0.4e-12, 0.6e-12, 0.7e-12, 0.8e-12, 1.0e-12, 1.2e-12]) * h2o_he_scale_factor,
+        }
+        h2o_he_bend_t_list = np.array([295.0, 514.0, 730.0, 947.0])
+        # Assumed to be roughly equal to Ar collisions (same for stretch data in Table 1).
+        h2o_he_bend_t_depend_rates: t.Dict[t.Tuple, npt.NDArray[np.float64]] = {
+            (0, 1, 0, 0, 0, 0): np.array([1.2e-12, 0.9e-12, 1.1e-12, 2.9e-12]) * h2o_he_scale_factor,  # Table 3
+            (0, 2, 0, 0, 0, 0): np.array([0.6e-12, 1.3e-12, 3.4e-12, 5.1e-12]),  # Table 2
+        }
+
+        # Data from P. W. Barnes et al. (1999), doi:10.1039/A902348H
+        # All taken at 295K.
+        # H2O + H2O, Table 1 column 3.
+        # Mixed, assume can't distinguish |12> as (1,0,2) or (2,0,1) so use both.
+        # h2o_h2o_rates: t.Dict[t.Tuple, float] = {
+        #     (2, 2, 0, 0, 0, 0): 1.5e-10,
+        #     (0, 2, 2, 0, 0, 0): 1.5e-10,
+        #     (3, 0, 0, 0, 0, 0): 3.7e-10,
+        #     (0, 0, 3, 0, 0, 0): 3.7e-10,
+        #     (4, 0, 0, 0, 0, 0): 2.0e-10,
+        #     (0, 0, 4, 0, 0, 0): 2.0e-10,
+        #     (1, 0, 2, 0, 0, 0): 1.7e-10,
+        #     (2, 0, 1, 0, 0, 0): 1.7e-10,
+        #     (1, 0, 3, 0, 0, 0): 1.7e-10,
+        #     (3, 0, 1, 0, 0, 0): 1.7e-10,
+        # }
+        # H2O + H, Table 1 column 2.
+        lower_bound_rate = 1e-12
+        h2o_h_rates: t.Dict[t.Tuple, float] = {
+            (2, 2, 0, 0, 0, 0): 0.8e-10,
+            (0, 2, 2, 0, 0, 0): 0.8e-10,
+            (3, 0, 0, 0, 0, 0): 3.0e-10,
+            (0, 0, 3, 0, 0, 0): 3.0e-10,
+            (4, 0, 0, 0, 0, 0): 4.3e-10,
+            (0, 0, 4, 0, 0, 0): 4.3e-10,
+            (1, 0, 2, 0, 0, 0): 0.48e-10,
+            (2, 0, 1, 0, 0, 0): 0.48e-10,
+            (1, 0, 3, 0, 0, 0): 3.0e-10,
+            (3, 0, 1, 0, 0, 0): 3.0e-10,
+            # Spoof, lower-bound estimates for lower missing states.
+            (0, 1, 0, 0, 0, 0): lower_bound_rate,
+            (0, 2, 0, 0, 0, 0): lower_bound_rate,
+            (1, 0, 0, 0, 0, 0): lower_bound_rate,
+            (0, 0, 1, 0, 0, 0): lower_bound_rate,
+            (0, 3, 0, 0, 0, 0): lower_bound_rate,
+            (1, 1, 0, 0, 0, 0): lower_bound_rate,
+            (0, 1, 1, 0, 0, 0): lower_bound_rate,
+            (0, 4, 0, 0, 0, 0): lower_bound_rate,
+            (1, 2, 0, 0, 0, 0): lower_bound_rate,
+            (0, 2, 1, 0, 0, 0): lower_bound_rate,
+            (2, 0, 0, 0, 0, 0): lower_bound_rate,
+            (0, 0, 2, 0, 0, 0): lower_bound_rate,
+            (0, 5, 0, 0, 0, 0): lower_bound_rate,
+            (1, 3, 0, 0, 0, 0): lower_bound_rate,
+            (0, 3, 1, 0, 0, 0): lower_bound_rate,
+            (2, 1, 0, 0, 0, 0): lower_bound_rate,
+            (0, 1, 2, 0, 0, 0): lower_bound_rate,
+            (0, 6, 0, 0, 0, 0): lower_bound_rate,
+            (1, 4, 0, 0, 0, 0): lower_bound_rate,
+            (0, 4, 1, 0, 0, 0): lower_bound_rate,
+            (0, 7, 0, 0, 0, 0): lower_bound_rate,
+            # (2,2,0),(0,2,2) is next, get into actual data.
+        }
+
+        for isomer_label in ("o", "p"):
+            for (v1u, v2u, v3u, v1l, v2l, v3l), rate_array in h2o_h2o_stretch_t_depend_rates.items():
+                interpolated_rate = CollisionalRatesDatabase._interp_rate(
+                    layer_temp, h2o_h2o_stretch_t_list, rate_array
+                )
+                rates.append(RateTransition(
+                    upper_key=(v1u, v2u, v3u, isomer_label),
+                    lower_key=(v1l, v2l, v3l, isomer_label),
+                    rate=interpolated_rate,
+                    mol_depend="H2O",
+                ))
+
+            for (v1u, v2u, v3u, v1l, v2l, v3l), rate_array in h2o_h2o_bend_t_depend_rates.items():
+                interpolated_rate = CollisionalRatesDatabase._interp_rate(
+                    layer_temp, h2o_h2o_bend_t_list, rate_array
+                )
+                rates.append(RateTransition(
+                    upper_key=(v1u, v2u, v3u, isomer_label),
+                    lower_key=(v1l, v2l, v3l, isomer_label),
+                    rate=interpolated_rate,
+                    mol_depend="H2O",
+                ))
+
+            for (v1u, v2u, v3u, v1l, v2l, v3l), rate_array in h2o_he_stretch_t_depend_rates.items():
+                interpolated_rate = CollisionalRatesDatabase._interp_rate(
+                    layer_temp, h2o_he_stretch_t_list, rate_array
+                )
+                rates.append(RateTransition(
+                    upper_key=(v1u, v2u, v3u, isomer_label),
+                    lower_key=(v1l, v2l, v3l, isomer_label),
+                    rate=interpolated_rate,
+                    mol_depend="He",
+                ))
+
+            for (v1u, v2u, v3u, v1l, v2l, v3l), rate_array in h2o_he_bend_t_depend_rates.items():
+                interpolated_rate = CollisionalRatesDatabase._interp_rate(
+                    layer_temp, h2o_he_bend_t_list, rate_array
+                )
+                rates.append(RateTransition(
+                    upper_key=(v1u, v2u, v3u, isomer_label),
+                    lower_key=(v1l, v2l, v3l, isomer_label),
+                    rate=interpolated_rate,
+                    mol_depend="He",
+                ))
+
+            for (v1u, v2u, v3u, v1l, v2l, v3l), rate in h2o_h_rates.items():
+                rates.append(RateTransition(
+                    upper_key=(v1u, v2u, v3u, isomer_label),
+                    lower_key=(v1l, v2l, v3l, isomer_label),
+                    rate=rate,
+                    mol_depend="H",
                 ))
 
         return rates

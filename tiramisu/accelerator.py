@@ -9,8 +9,8 @@ log = logging.getLogger(__name__)
 @dataclass
 class AccelerationConfig:
     """Configuration for acceleration methods."""
-    # Startup behavior
-    warmup_iterations: int = 5  # No acceleration for first N iterations
+    # Startup behaviour.
+    warmup_iterations: int = 5  # No acceleration for first N iterations.
 
     # Adaptive damping
     omega_start: float = 1.0
@@ -21,11 +21,20 @@ class AccelerationConfig:
 
     # Ng acceleration
     ng_history_length: int = 4
-    ng_enable_threshold: float = 0.02  # 2% - turn on when converging smoothly.
-    ng_disable_iterations: int = 3  # Disable for N iters after failure
+    ng_enable_threshold: float = 5e-3  # 0.5% - turn on when converging smoothly.
+    ng_disable_iterations: int = 5  # Disable for N iters after failure.
+
+    ng_regularization: float = 1e-6
+    ng_max_condition: float = 1e10
+    ng_max_alpha: float = 3.0
+    ng_step_limit: float = 2.0
+    ng_worsening_factor: float = 1.2
+    min_relative_pop: float = 1e-70
+    ng_mix: float = 0.5
+    ng_omega_cap = 0.8
 
     # Convergence
-    convergence_threshold: float = 1e-3  # 0.1%
+    convergence_threshold: float = 1e-3  # 0.1%.
 
     # Safety
     check_max_jump: bool = True
@@ -41,7 +50,7 @@ class LayerAccelerator:
     """
 
     __slots__ = ["layer_idx", "config", "change_history", "ng_history", "omega", "ng_disabled_until_iter",
-                 "last_iteration", ]
+                 "last_iteration", "residual_history"]
 
     def __init__(self, layer_idx: int, config: AccelerationConfig):
         self.layer_idx = layer_idx
@@ -53,138 +62,410 @@ class LayerAccelerator:
 
         # Ng history - stores population arrays
         self.ng_history = []  # List of arrays, one per iteration
+        self.residual_history = []
 
         # State
         self.omega = config.omega_start
         self.ng_disabled_until_iter = -1
-        self.last_iteration = -1
+        self.last_iteration = 0
 
     def update(
-            self,
-            pop_new: npt.NDArray[np.float64],
-            pop_old: npt.NDArray[np.float64],
-            iteration: int,
+            self, pop_new: npt.NDArray[np.float64], pop_old: npt.NDArray[np.float64], iteration: int
     ) -> npt.NDArray[np.float64]:
         """
-        Apply acceleration/damping for this layer.
+        Apply Ng/DIIS acceleration or damping for this layer, dependent on several convergence criteria checks.
 
-        Parameters:
-            pop_new: Newly solved populations
-            pop_old: Previous iteration populations
-            iteration: Current iteration number (0-indexed)
+        Parameters
+        ----------
+        pop_new : ndarray
+            Newly solved populations.
+        pop_old : ndarray
+            Previous iteration populations.
+        iteration : int
+            Current iteration number (0-indexed).
 
-        Returns:
-            Accelerated/damped populations
+        Returns
+        -------
+            Accelerated/damped populations.
         """
+        residual = pop_new - pop_old
+        max_change = self._compute_change(pop_new, pop_old)
 
-        # Check iteration sequence
-        if iteration != self.last_iteration + 1 and iteration != self.last_iteration:
-            log.warning(f"[nL{self.layer_idx}] Non-sequential iteration (I{self.last_iteration}->{iteration})")
-
-        # Calculate change
-        with np.errstate(divide='ignore', invalid='ignore'):
-            max_change = np.max(np.abs((pop_new - pop_old) / (pop_old + 1e-30)))
-
-        # Store change history (extend if new iteration)
+        # Store convergence history only.
         if iteration >= len(self.change_history):
             self.change_history.append(max_change)
         else:
             self.change_history[iteration] = max_change
 
-        # Store Ng history
-        if iteration >= len(self.ng_history):
-            self.ng_history.append(pop_new.copy())
-        else:
-            self.ng_history[iteration] = pop_new.copy()
-
+        # Warmup phase.
         if iteration < self.config.warmup_iterations:
-            log.debug(f"[nL{self.layer_idx}] Warmup - no acceleration (max. change={max_change:.4e})")
-            self.last_iteration = iteration
-            return pop_new
+            accepted = pop_new.copy()
 
-        # Try Ng acceleration first (if conditions met)
+            self._store_iteration(accepted, residual)
+            self.last_iteration = iteration
+
+            return accepted
+
+        # Always compute damped baseline first.
+        pop_damped = self._apply_damping(pop_new, pop_old)
+        accepted = pop_damped
+
+        # Attempt Ng/DIIS.
         if self._should_use_ng(iteration):
             try:
-                pop_ng = self._apply_ng()
+                pop_ng_raw = self._apply_ng(pop_new)
+                # Ng damping.
+                pop_ng = (
+                        self.config.ng_mix * pop_ng_raw
+                        + (1.0 - self.config.ng_mix) * pop_damped
+                )
+                pop_ng /= pop_ng.sum()
 
-                if self._ng_is_safe(pop_ng, pop_old):
-                    log.info(f"[nL{self.layer_idx}] Ng acceleration (max. change={max_change:.4e})")
-
-                    self.last_iteration = iteration
-                    return pop_ng
+                if self._accept_ng(
+                        pop_ng=pop_ng,
+                        pop_damped=pop_damped,
+                        pop_old=pop_old,
+                ):
+                    accepted = pop_ng
+                    log.info(f"[nL{self.layer_idx}] Accepted Ng acceleration.")
                 else:
-                    log.warning(f"[nL{self.layer_idx}] Ng unsafe, falling back to damping")
-
+                    log.debug(f"[nL{self.layer_idx}] Rejected Ng acceleration.")
                     self.ng_disabled_until_iter = iteration + self.config.ng_disable_iterations
 
             except RuntimeError as e:
-                log.warning(f"[nL{self.layer_idx}] Ng failed: {e}, using damping.")
+                log.warning(f"[nL{self.layer_idx}] Ng failed: {e}.")
                 self.ng_disabled_until_iter = iteration + self.config.ng_disable_iterations
 
-        pop_damped = self._apply_damping(pop_new, pop_old)
+        # Store ACCEPTED iterate only (default is damped unless Ng meets all criteria).
+        accepted_residual = accepted - pop_old
 
-        log.debug(f"[nL{self.layer_idx}] Damping omega={self.omega:.3f} (max. change={max_change:.4e})")
-
+        self._store_iteration(accepted, accepted_residual)
         self.last_iteration = iteration
-        return pop_damped
+
+        return accepted
+
+    def _compute_change(self, pop_new: npt.NDArray[np.float64], pop_old: npt.NDArray[np.float64]) -> float:
+
+        floor = self.config.min_relative_pop
+
+        denom = np.maximum(np.abs(pop_old), floor)
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rel = np.abs(pop_new - pop_old) / denom
+
+        return np.max(rel)
+
+    def _store_iteration(self, pop: npt.NDArray[np.float64], residual: npt.NDArray[np.float64]) -> None:
+
+        self.ng_history.append(pop.copy())
+        self.residual_history.append(residual.copy())
+
+        # Truncate histories
+        max_hist = self.config.ng_history_length + 1
+
+        if len(self.ng_history) > max_hist:
+            self.ng_history.pop(0)
+
+        if len(self.residual_history) > max_hist:
+            self.residual_history.pop(0)
+
+    # def update_old(
+    #         self,
+    #         pop_new: npt.NDArray[np.float64],
+    #         pop_old: npt.NDArray[np.float64],
+    #         iteration: int,
+    # ) -> npt.NDArray[np.float64]:
+    #     """
+    #     Apply acceleration/damping for this layer.
+    #
+    #     Parameters:
+    #         pop_new: Newly solved populations
+    #         pop_old: Previous iteration populations
+    #         iteration: Current iteration number (0-indexed)
+    #
+    #     Returns:
+    #         Accelerated/damped populations
+    #     """
+    #
+    #     # Check iteration sequence
+    #     if iteration != self.last_iteration + 1 and iteration != self.last_iteration:
+    #         log.warning(f"[nL{self.layer_idx}] Non-sequential iteration (I{self.last_iteration}->{iteration})")
+    #
+    #     # Calculate change
+    #     with np.errstate(divide='ignore', invalid='ignore'):
+    #         max_change = np.max(np.abs((pop_new - pop_old) / (pop_old + 1e-30)))
+    #
+    #     # Store change history (extend if new iteration)
+    #     if iteration >= len(self.change_history):
+    #         self.change_history.append(max_change)
+    #     else:
+    #         self.change_history[iteration] = max_change
+    #
+    #     # Store Ng history
+    #     if iteration >= len(self.ng_history):
+    #         self.ng_history.append(pop_new.copy())
+    #     else:
+    #         self.ng_history[iteration] = pop_new.copy()
+    #
+    #     if iteration < self.config.warmup_iterations:
+    #         log.debug(f"[nL{self.layer_idx}] Warmup - no acceleration (max. change={max_change:.4e})")
+    #         self.last_iteration = iteration
+    #         return pop_new
+    #
+    #     # Try Ng acceleration first (if conditions met)
+    #     if self._should_use_ng_old(iteration):
+    #         try:
+    #             pop_ng = self._apply_ng_old()
+    #
+    #             if self._ng_is_safe(pop_ng, pop_old):
+    #                 log.info(f"[nL{self.layer_idx}] Ng acceleration (max. change={max_change:.4e})")
+    #
+    #                 self.last_iteration = iteration
+    #                 return pop_ng
+    #             else:
+    #                 log.warning(f"[nL{self.layer_idx}] Ng unsafe, falling back to damping")
+    #
+    #                 self.ng_disabled_until_iter = iteration + self.config.ng_disable_iterations
+    #
+    #         except RuntimeError as e:
+    #             log.warning(f"[nL{self.layer_idx}] Ng failed: {e}, using damping.")
+    #             self.ng_disabled_until_iter = iteration + self.config.ng_disable_iterations
+    #
+    #     pop_damped = self._apply_damping(pop_new, pop_old)
+    #
+    #     log.debug(f"[nL{self.layer_idx}] Damping omega={self.omega:.3f} (max. change={max_change:.4e})")
+    #
+    #     self.last_iteration = iteration
+    #     return pop_damped
 
     def _should_use_ng(self, iteration: int) -> bool:
-        """Check if Ng should be attempted."""
-        # Disabled temporarily?
+
         if iteration <= self.ng_disabled_until_iter:
             return False
 
-        # Need enough history
-        if len(self.ng_history) < self.config.ng_history_length + 1:
+        if len(self.ng_history) < self.config.ng_history_length:
             return False
 
-        # Need to be in smooth convergence regime
-        if len(self.change_history) < 3:
+        if len(self.change_history) < 4:
             return False
 
-        current_change = self.change_history[-1]
-        if current_change > self.config.ng_enable_threshold:
+        current = self.change_history[-1]
+
+        if current > self.config.ng_enable_threshold:
             return False
 
-        # Check for monotonic decrease (smooth convergence)
-        recent = self.change_history[-3:]
+        recent = self.change_history[-4:]
+
+        # Strict monotonic convergence
         monotonic = all(recent[i] > recent[i + 1] for i in range(len(recent) - 1))
 
-        return monotonic
+        if not monotonic:
+            return False
 
-    def _apply_ng(self) -> npt.NDArray[np.float64]:
-        """Apply Ng acceleration."""
-        n = self.config.ng_history_length
+        # Require roughly linear convergence
+        ratios = [recent[i + 1] / recent[i] for i in range(len(recent) - 1)]
+        ratio_spread = max(ratios) - min(ratios)
 
-        # Extract last n+1 iterates
-        pops = np.array(self.ng_history[-(n + 1):])
+        if ratio_spread > 0.3:
+            return False
 
-        # Calculate differences
-        deltas = np.diff(pops, axis=0)
+        return True
 
-        # Build matrix A_ij = delta_n^i · delta_n^j
-        a_matrix = np.zeros((n, n))
-        for i in range(n):
-            for j in range(n):
-                a_matrix[i, j] = np.dot(deltas[i], deltas[j])
+    # def _should_use_ng_old(self, iteration: int) -> bool:
+    #     """Check if Ng should be attempted."""
+    #     # Disabled temporarily?
+    #     if iteration <= self.ng_disabled_until_iter:
+    #         return False
+    #
+    #     # Need enough history
+    #     if len(self.ng_history) < self.config.ng_history_length + 1:
+    #         return False
+    #
+    #     # Need to be in smooth convergence regime
+    #     if len(self.change_history) < 3:
+    #         return False
+    #
+    #     current_change = self.change_history[-1]
+    #     if current_change > self.config.ng_enable_threshold:
+    #         return False
+    #
+    #     # Check for monotonic decrease (smooth convergence)
+    #     recent = self.change_history[-3:]
+    #     monotonic = all(recent[i] > recent[i + 1] for i in range(len(recent) - 1))
+    #
+    #     return monotonic
 
-        # Solve for weights
-        ones = np.ones(n)
-        reg = 1e-12 * np.trace(a_matrix)
-        alpha = np.linalg.solve(a_matrix + reg * np.eye(n), ones)
+    def _apply_ng(self, pop_new: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+        """
+        Apply Ng acceleration in logarithmic population space using the current nonlinear iteration together with a
+        history of previously accepted iterates.
+
+        The method constructs an accelerated population vector from the most recent :math:`m+1` iterates, where
+        :math:`m` = self.config.ng_history_length. The current nonlinear solution (pop_new) is temporarily appended to
+        the stored history before constructing the acceleration system.
+
+        The acceleration is performed in logarithmic population space:
+
+        .. math::
+            y_k = log(max(n_k, \\epsilon)),
+
+        where :math:`n_k` is the population vector for iteration :math:`k`, and :math:`\\epsilon` is a small floor value
+        to avoid singularities for very small populations.
+
+        Ng differences are then constructed as:
+
+        .. math::
+            d_k = y_{k+1} - y_k.
+
+        These differences define the Ng matrix:
+
+        .. math::
+            B_{ij} = d_i \\cdot d_j,
+
+        where the dot product is taken over all population states. A small diagonal regularization term is added to
+        improve numerical stability:
+
+        .. math::
+            B \\rightarrow B + \\lambda I.
+
+        The Ng coefficients are obtained from:
+
+        .. math::
+            B \\alpha = 1,
+
+        and normalized such that:
+
+        .. math::
+            \\sum_i \\alpha_i = 1.
+
+        The accelerated logarithmic population vector is constructed by extrapolating from the current nonlinear
+        solution:
+
+        .. math::
+            y_{Ng} = y_m + \\sum_i \\alpha_i d_i,
+
+        where :math:`y_m` corresponds to the logarithm of the current nonlinear iterate.
+
+        Finally, the accelerated populations are recovered via exponentiation and normalization:
+
+        .. math::
+            n_{Ng} = \\exp(y_{Ng}) / \\sum\\exp(y_{Ng}).
+
+        Performing the extrapolation in logarithmic space improves robustness for NLTE population problems where state
+        populations may span many orders of magnitude. The logarithmic formulation naturally preserves positivity and
+        treats multiplicative population changes more uniformly than linear population-space extrapolation.
+
+        Parameters
+        ----------
+        pop_new : np.ndarray
+            Newly computed population vector for the current nonlinear iteration prior to damping or acceleration
+            acceptance.
+
+        Returns
+        -------
+        pop_ng : np.ndarray
+            Ng-accelerated population vector normalized to unity.
+
+        Raises
+        -------
+        RuntimeError
+            Raises if any of these conditions are satisfied: the Ng matrix is ill-conditioned; extrapolation
+            coefficients become excessively large; non-finite values are produced; normalization fails.
+        """
+        num_ng = self.config.ng_history_length + 1
+        floor = self.config.min_relative_pop
+        # pops = np.array(self.ng_history[-num_ng:])
+        history = self.ng_history.copy()
+        history.append(pop_new.copy())  # Crucial or current step info is lost.
+        pops = np.array(history[-num_ng:])
+
+        # Transform to log-space.
+        log_pops = np.log(np.maximum(pops, floor))
+        # Residuals in log-space
+        deltas = np.diff(log_pops, axis=0)
+        # deltas = deltas[-num_ng:]  # Enforced by pops slicing.
+        # deltas = np.array(self.residual_history[-num_ng:])
+
+        # Build DIIS matrix.
+        mat_dim = num_ng - 1
+        b_matrix = np.empty((mat_dim, mat_dim))
+
+        for i in range(mat_dim):
+            for j in range(mat_dim):
+                b_matrix[i, j] = np.dot(
+                    deltas[i],
+                    deltas[j],
+                )
+
+        cond = np.linalg.cond(b_matrix)
+
+        if cond > self.config.ng_max_condition:
+            raise RuntimeError(f"Ill-conditioned DIIS matrix: {cond:.2e}.")
+
+        reg = self.config.ng_regularization * np.trace(b_matrix) / mat_dim
+
+        b_matrix += reg * np.eye(mat_dim)
+        rhs = np.ones(mat_dim)
+
+        alpha = np.linalg.solve(b_matrix, rhs)
         alpha /= alpha.sum()
 
-        # Extrapolate
-        n_new = np.sum([alpha[i] * pops[i] for i in range(n)], axis=0)
+        # Coefficient safety check.
+        if np.any(np.abs(alpha) > self.config.ng_max_alpha):
+            raise RuntimeError(f"Large DIIS coefficients: {alpha}.")
 
-        if not np.isfinite(n_new).all():
-            raise RuntimeError("Ng produced non-finite values")
+        # Extrapolate populations from alpha coefficients and differences.
+        log_ng = log_pops[-1].copy()  # This is the log of pop_new.
 
-        # Clamp and normalize
-        n_new = np.maximum(n_new, 0.0)
-        n_new /= n_new.sum()
+        for a, log_dif in zip(alpha, deltas):
+            log_ng += a * log_dif
 
-        return n_new
+        # Enforce positivity and re-normalise.
+        pop_ng = np.maximum(np.exp(log_ng), 0.0)
+        total = pop_ng.sum()
+
+        if total <= 0:
+            raise RuntimeError("Invalid Ng normalization.")
+
+        pop_ng /= total
+        if not np.isfinite(pop_ng).all():
+            raise RuntimeError("Ng produced non-finite populations.")
+
+        return pop_ng
+
+    # def _apply_ng_old(self) -> npt.NDArray[np.float64]:
+    #     """Apply Ng acceleration."""
+    #     n = self.config.ng_history_length
+    #
+    #     # Extract last n+1 iterates
+    #     pops = np.array(self.ng_history[-(n + 1):])
+    #
+    #     # Calculate differences
+    #     deltas = np.diff(pops, axis=0)
+    #
+    #     # Build matrix A_ij = delta_n^i · delta_n^j
+    #     a_matrix = np.zeros((n, n))
+    #     for i in range(n):
+    #         for j in range(n):
+    #             a_matrix[i, j] = np.dot(deltas[i], deltas[j])
+    #
+    #     # Solve for weights
+    #     ones = np.ones(n)
+    #     reg = 1e-12 * np.trace(a_matrix)
+    #     alpha = np.linalg.solve(a_matrix + reg * np.eye(n), ones)
+    #     alpha /= alpha.sum()
+    #
+    #     # Extrapolate
+    #     n_new = np.sum([alpha[i] * pops[i] for i in range(n)], axis=0)
+    #
+    #     if not np.isfinite(n_new).all():
+    #         raise RuntimeError("Ng produced non-finite values")
+    #
+    #     # Clamp and normalize
+    #     n_new = np.maximum(n_new, 0.0)
+    #     n_new /= n_new.sum()
+    #
+    #     return n_new
 
     def _apply_damping(
             self,
@@ -223,11 +504,22 @@ class LayerAccelerator:
                     log.info(f"[nL{self.layer_idx}] Oscillating - omega={old_omega:.2f}->{self.omega:.2f}")
             else:
                 # Monotonic - reduce damping (approach omega=1).
-                if self.omega < self.config.omega_max:
+                omega_max = (
+                    self.config.ng_omega_cap if self._should_use_ng(self.last_iteration) else self.config.omega_max
+                )
+
+                # Enforce cap if already above (only when Ng enabled).
+                if self.omega > omega_max:
                     old_omega = self.omega
+                    self.omega = omega_max
+
+                    log.debug(f"[nL{self.layer_idx}] Reducing omega for Ng: {old_omega:.2f}->{self.omega:.2f}.")
+                if self.omega < omega_max:
+                    old_omega = self.omega
+
                     self.omega = min(
                         self.omega * self.config.omega_increase_factor,
-                        self.config.omega_max
+                        omega_max
                     )
                     if self.omega > old_omega:
                         log.debug(f"[nL{self.layer_idx}] Smooth - omega={old_omega:.2f}->{self.omega:.2f}")
@@ -242,6 +534,36 @@ class LayerAccelerator:
 
         return pop_damped
 
+    def _accept_ng(
+            self,
+            pop_ng: npt.NDArray[np.float64],
+            pop_damped: npt.NDArray[np.float64],
+            pop_old: npt.NDArray[np.float64],
+    ) -> bool:
+
+        if np.any(~np.isfinite(pop_ng)):
+            return False
+
+        if np.any(pop_ng < 0):
+            return False
+
+        # Compare Ng and damped step sizes.
+        ng_step = np.linalg.norm(pop_ng - pop_old)
+        damped_step = np.linalg.norm(pop_damped - pop_old)
+
+        if ng_step > self.config.ng_step_limit * damped_step:
+            # Reject if Ng step is larger (less convergent) than damping.
+            return False
+
+        # Reject if predicted convergence worsens.
+        ng_change = self._compute_change(pop_ng, pop_old)
+        damped_change = self._compute_change(pop_damped, pop_old)
+
+        if ng_change > self.config.ng_worsening_factor * damped_change:
+            return False
+
+        return True
+
     def _ng_is_safe(
             self,
             pop_accel: npt.NDArray[np.float64],
@@ -250,7 +572,6 @@ class LayerAccelerator:
         """Check if Ng accelerated populations are safe."""
         if np.any(pop_accel < 0):
             return False
-
         if not np.isfinite(pop_accel).all():
             return False
 
@@ -264,6 +585,9 @@ class LayerAccelerator:
                     jump = pop_accel[sig_mask] / pop_old[sig_mask]
 
                 if np.any(jump > self.config.max_jump_factor):
+                    return False
+
+                if np.any(jump < 1.0 / self.config.max_jump_factor):
                     return False
 
         return True
