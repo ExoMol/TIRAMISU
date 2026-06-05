@@ -3,7 +3,6 @@ import abc
 import pathlib
 import pickle
 import time
-import itertools
 import typing as t
 from concurrent.futures import ThreadPoolExecutor
 
@@ -17,7 +16,7 @@ from numpy import typing as npt
 from phoenix4all import get_spectrum
 
 from astropy import units as u, constants as ac
-from pyarrow import parquet as pq
+from pyarrow import parquet as pq, dataset as ds
 
 from scipy.integrate import cumulative_simpson
 from scipy.optimize import least_squares
@@ -31,8 +30,8 @@ from .numerics import (loglinear_normalise_1d_nonnegative, loglinear_normalise_q
                        loglinear_integral_quantity_1d_nonnegative, loglinear_integral_quantity_2d_nonnegative)
 from .profiles import (ProfileStore, ContinuumProfileStore, _process_trans_batch_layered,
                        _process_continuum_trans_batch_layered, abs_emi_xsec, continuum_xsec, const_8_pi_c,
-                       calc_einstein_b_fi, calc_einstein_b_if, _accumulate_batch, const_h_c_on_4_pi,
-                       _broaden_superline_buffer)
+                       calc_einstein_b_fi, calc_einstein_b_if, _accumulate_superline_band_batch, const_h_c_on_4_pi,
+                       _broaden_superline_band_buffer, calc_einstein_bs)
 
 log = logging.getLogger(__name__)
 
@@ -1505,7 +1504,6 @@ class NLTEProcessor:
         temperature_slice = temperature_profile[self.n_lte_layers:].to_value(u.K)  # (n_nlte_layers,)
         pressure_slice = pressure_profile[self.n_lte_layers:].to_value(u.bar)  # (n_nlte_layers,)
 
-        # TODO: Move states_f, states_i, states_frac here! They don't change so don't need to be recomputed.
         n_frac_cols = [f"n_frac_nL{nlte_idx}" for nlte_idx in range(n_nlte_layers)]
         states_frac = self.states.with_columns(
             (
@@ -1513,19 +1511,25 @@ class NLTEProcessor:
             ).alias(f"n_frac_nL{nlte_idx}")
             for nlte_idx in range(n_nlte_layers)
         )
-        invariant_cols_i = ["id", "energy", "g", "id_agg"] + n_frac_cols
-        invariant_cols_f = ["id", "energy", "g", "id_agg", "tau"] + n_frac_cols
+        # invariant_cols_i = ["id", "energy", "g", "id_agg"] + n_frac_cols
+        # invariant_cols_f = ["id", "energy", "g", "id_agg", "tau"] + n_frac_cols
+        invariant_cols = ["id", "energy", "id_agg"]
         states_i = (
             states_frac
-            .select(invariant_cols_i)
-            .rename({col: f"{col}_i" for col in invariant_cols_i})
+            .select(invariant_cols)
+            .rename({col: f"{col}_i" for col in invariant_cols})
         )
         states_f = (
             states_frac
-            .select(invariant_cols_f)
-            .rename({col: f"{col}_f" for col in invariant_cols_f})
+            .select(invariant_cols)
+            .rename({col: f"{col}_f" for col in invariant_cols})
         )
-        # States lookup
+
+        # Grid parameters and buffers.
+        wn_min = wn_grid[0]
+        wn_max = wn_grid[-1]
+
+        # States lookup - much more memory efficient than duplicating it all with polars joins!
         state_ids = states_frac["id"].to_numpy()
         max_state_id = int(state_ids.max())
         # State ID lookup offset by 1 as IDs are 1-indexed!
@@ -1537,38 +1541,50 @@ class NLTEProcessor:
             n_frac_lookup[state_ids, l] = states_frac[f"n_frac_nL{l}"].to_numpy()
         n_frac_lookup = np.ascontiguousarray(n_frac_lookup)
 
-        # Grid parameters and buffers.
-        wn_min = wn_grid[0]
-        wn_max = wn_grid[-1]
-        # Before the batch loop, pre-allocate once.
-        n_bands_max = min(100, self.n_agg_states ** 2)
-        n_grid = wn_grid.shape[0]
+        g_lookup = np.zeros(max_state_id + 1, dtype=np.float64)
+        g_lookup[state_ids] = states_frac["g"].to_numpy()
+        g_lookup = np.ascontiguousarray(g_lookup)
 
-        # profile_buffer[0] = abs, profile_buffer[1] = ste, profile_buffer[2] = spe.
-        profile_buffer = np.zeros((3, n_bands_max, n_nlte_layers, n_grid), dtype=np.float64)
-        profile_buffer = np.ascontiguousarray(profile_buffer)
-        # band_key_to_idx: dict[tuple[int, int], int] = {}
-        n_bands_used = 0
-        band_registry = pl.DataFrame(
-            schema={"id_agg_f": pl.Int32, "id_agg_i": pl.Int32, "band_idx": pl.Int32}
-        )
-        band_registry_cols = band_registry.columns
-        buffer_abs = profile_buffer[0]
-        buffer_ste = profile_buffer[1]
-        buffer_spe = profile_buffer[2]
+        tau_lookup = np.zeros(max_state_id + 1, dtype=np.float64)
+        tau_lookup[state_ids] = states_frac["tau"].to_numpy()
+        tau_lookup = np.ascontiguousarray(tau_lookup)
 
-        # Bin edges for finding trans bins.
-        wn_arr = wn_grid.value
-        bin_edges = np.empty(n_grid + 1, dtype=np.float64)
-        bin_edges[0] = wn_arr[0] - (wn_arr[1] - wn_arr[0]) * 0.5
-        for j in range(1, n_grid):
-            bin_edges[j] = (wn_arr[j - 1] + wn_arr[j]) * 0.5
-        bin_edges[-1] = wn_arr[-1] + (wn_arr[-1] - wn_arr[-2]) * 0.5
+        # Expand out broadening parameters.
+        broad_n = np.zeros(1, dtype=np.float64)
+        broad_gamma = np.zeros((1, n_nlte_layers), dtype=np.float64)
+        if self.broadening_params is not None:
+            broad_n = self.broadening_params[1]
+            broad_gamma = self.broadening_params[0][:, self.n_lte_layers:]
 
         process_time = time.perf_counter()
-        parquet_batch_size = 20_000_000
+        parquet_batch_size = 200_000_000
         if self.do_super_lines:
             # ---------------------------------------------- SUPER-LINES ----------------------------------------------
+
+            # Before the batch loop, pre-allocate once.
+            n_bands_max = min(100, self.n_agg_states ** 2)
+            n_grid = wn_grid.shape[0]
+
+            # profile_buffer[0] = abs, profile_buffer[1] = ste, profile_buffer[2] = spe.
+            profile_buffer = np.zeros((3, n_bands_max, n_nlte_layers, n_grid), dtype=np.float64)
+            profile_buffer = np.ascontiguousarray(profile_buffer)
+            # band_key_to_idx: dict[tuple[int, int], int] = {}
+            n_bands_used = 0
+            band_registry = pl.DataFrame(
+                schema={"id_agg_f": pl.Int32, "id_agg_i": pl.Int32, "band_idx": pl.Int32}
+            )
+            band_registry_cols = band_registry.columns
+            buffer_abs = profile_buffer[0]
+            buffer_ste = profile_buffer[1]
+            buffer_spe = profile_buffer[2]
+
+            # Bin edges for finding trans bins.
+            wn_arr = wn_grid.value
+            bin_edges = np.empty(n_grid + 1, dtype=np.float64)
+            bin_edges[0] = wn_arr[0] - (wn_arr[1] - wn_arr[0]) * 0.5
+            for j in range(1, n_grid):
+                bin_edges[j] = (wn_arr[j - 1] + wn_arr[j]) * 0.5
+            bin_edges[-1] = wn_arr[-1] + (wn_arr[-1] - wn_arr[-2]) * 0.5
             for trans_file in self.trans_files:
                 log.info(f"Processing file {trans_file}.")
                 # Preprocessed Parquet files (MUCH faster).
@@ -1597,7 +1613,7 @@ class NLTEProcessor:
                                     (pl.col("energy_fi") >= wn_min)
                                     & (pl.col("energy_fi") <= wn_max)
                                 )
-                                .sort(["id_agg_f", "id_agg_i"])
+                                # .sort(["id_agg_f", "id_agg_i"])
                             )
                             log.info(f"Polars duration = {time.perf_counter() - start_time}.")
                             if trans_batch.height == 0:
@@ -1610,10 +1626,8 @@ class NLTEProcessor:
                             a_fi = np.ascontiguousarray(trans_batch["A_fi"].to_numpy())
 
                             energy_fi = trans_batch["energy_fi"].to_numpy()
-                            g_i = np.ascontiguousarray(trans_batch["g_i"].to_numpy())
-                            g_f = np.ascontiguousarray(trans_batch["g_f"].to_numpy())
-                            denom = np.ascontiguousarray(const_8_pi_c * energy_fi ** 2)
-                            spe_factor = np.ascontiguousarray(energy_fi * const_h_c_on_4_pi)
+                            abs_ste_prefactor = np.ascontiguousarray(a_fi / (const_8_pi_c * energy_fi ** 2))
+                            spe_prefactor = np.ascontiguousarray(a_fi * energy_fi * const_h_c_on_4_pi)
 
                             log.info(f"Extraction duration = {time.perf_counter() - start_time}.")
                             # Get bin indices per transition.
@@ -1660,17 +1674,15 @@ class NLTEProcessor:
                             log.info(f"Accumulating {trans_batch.height} transitions.")
                             # Write all transitions to respective bins.
                             start_time = time.perf_counter()
-                            _accumulate_batch(
+                            _accumulate_superline_band_batch(
                                 buffer_abs=buffer_abs,
                                 buffer_ste=buffer_ste,
                                 buffer_spe=buffer_spe,
                                 band_indices=band_indices,
                                 bin_indices=bin_indices,
-                                a_fi=a_fi,
-                                g_i=g_i,
-                                g_f=g_f,
-                                denom=denom,
-                                spe_factor=spe_factor,
+                                g_lookup=g_lookup,
+                                abs_ste_prefactor=abs_ste_prefactor,
+                                spe_prefactor=spe_prefactor,
                                 id_i=id_i,
                                 id_f=id_f,
                                 n_frac_lookup=n_frac_lookup,
@@ -1679,21 +1691,33 @@ class NLTEProcessor:
                             # Do rates for batch.
                             trans_batch_rates = trans_batch.filter(pl.col("id_agg_f") != pl.col("id_agg_i"))
                             if trans_batch_rates.height > 0:
-                                b_fi_vals = calc_einstein_b_fi(
-                                    a_fi=trans_batch_rates["A_fi"].to_numpy(),
-                                    energy_fi=(trans_batch_rates["energy_fi"].to_numpy() << 1 / u.cm)
-                                    .to(u.Hz, equivalencies=u.spectral()).value,
-                                )
-                                b_if_vals = calc_einstein_b_if(
-                                    b_fi=b_fi_vals,
-                                    g_f=trans_batch_rates["g_f"].to_numpy(),
-                                    g_i=trans_batch_rates["g_i"].to_numpy(),
+                                # b_fi_vals = calc_einstein_b_fi(
+                                #     a_fi=np.ascontiguousarray(trans_batch_rates["A_fi"].to_numpy()),
+                                #     energy_fi=np.ascontiguousarray(
+                                #         (trans_batch_rates["energy_fi"].to_numpy() << 1 / u.cm)
+                                #         .to(u.Hz, equivalencies=u.spectral()).value
+                                #     ),
+                                # )
+                                # b_if_vals = calc_einstein_b_if(
+                                #     b_fi=b_fi_vals,
+                                #     g_f=trans_batch_rates["g_f"].to_numpy(),
+                                #     g_i=trans_batch_rates["g_i"].to_numpy(),
+                                # )
+                                b_fi, b_if = calc_einstein_bs(
+                                    id_i=np.ascontiguousarray(trans_batch_rates["id_i"].to_numpy()),
+                                    id_f=np.ascontiguousarray(trans_batch_rates["id_f"].to_numpy()),
+                                    a_fi=np.ascontiguousarray(trans_batch_rates["A_fi"].to_numpy()),
+                                    energy_fi=np.ascontiguousarray(
+                                        (trans_batch_rates["energy_fi"].to_numpy() << 1 / u.cm)
+                                        .to(u.Hz, equivalencies=u.spectral()).value
+                                    ),
+                                    g_lookup=g_lookup
                                 )
                                 agg_batch = (
                                     trans_batch_rates
                                     .with_columns([
-                                        pl.Series("B_fi", b_fi_vals),
-                                        pl.Series("B_if", b_if_vals),
+                                        pl.Series("B_fi", b_fi),
+                                        pl.Series("B_if", b_if),
                                     ])
                                     .group_by(["id_agg_f", "id_agg_i"])
                                     .agg([
@@ -1726,20 +1750,19 @@ class NLTEProcessor:
                                 (pl.col("energy_fi") >= wn_min)
                                 & (pl.col("energy_fi") <= wn_max)
                             )
-                            .sort(["id_agg_f", "id_agg_i"])
+                            # .sort(["id_agg_f", "id_agg_i"])
                         )
                         if trans_batch.height == 0:
                             continue
                         # Extract numpy arrays.
                         id_i = np.ascontiguousarray(trans_batch["id_i"].to_numpy())
                         id_f = np.ascontiguousarray(trans_batch["id_f"].to_numpy())
-                        a_fi = np.ascontiguousarray(trans_batch["A_fi"].to_numpy())
+                        a_fi = trans_batch["A_fi"].to_numpy()
 
                         energy_fi = trans_batch["energy_fi"].to_numpy()
-                        g_i = np.ascontiguousarray(trans_batch["g_i"].to_numpy())
-                        g_f = np.ascontiguousarray(trans_batch["g_f"].to_numpy())
-                        denom = np.ascontiguousarray(const_8_pi_c * energy_fi ** 2)
-                        spe_factor = np.ascontiguousarray(energy_fi * const_h_c_on_4_pi)
+                        abs_ste_prefactor = np.ascontiguousarray(a_fi / (const_8_pi_c * energy_fi ** 2))
+                        spe_prefactor = np.ascontiguousarray(a_fi * energy_fi * const_h_c_on_4_pi)
+
                         # Get bin indices per transition.
                         bin_indices = np.searchsorted(bin_edges, energy_fi, side="right") - 1
                         bin_indices = np.clip(bin_indices, 0, n_grid - 1, dtype=np.int32)
@@ -1780,17 +1803,15 @@ class NLTEProcessor:
                         )
                         band_indices = np.ascontiguousarray(mapped_batch["band_idx"].to_numpy().copy())
                         # Write all transitions to respective bins.
-                        _accumulate_batch(
+                        _accumulate_superline_band_batch(
                             buffer_abs=buffer_abs,
                             buffer_ste=buffer_ste,
                             buffer_spe=buffer_spe,
                             band_indices=band_indices,
                             bin_indices=bin_indices,
-                            a_fi=a_fi,
-                            g_i=g_i,
-                            g_f=g_f,
-                            denom=denom,
-                            spe_factor=spe_factor,
+                            g_lookup=g_lookup,
+                            abs_ste_prefactor=abs_ste_prefactor,
+                            spe_prefactor=spe_prefactor,
                             id_i=id_i,
                             id_f=id_f,
                             n_frac_lookup=n_frac_lookup,
@@ -1798,21 +1819,31 @@ class NLTEProcessor:
                         trans_batch_rates = trans_batch.filter(pl.col("id_agg_f") != pl.col("id_agg_i"))
                         # Do rates for batch.
                         if trans_batch_rates.height > 0:
-                            b_fi_vals = calc_einstein_b_fi(
-                                a_fi=trans_batch_rates["A_fi"].to_numpy(),
-                                energy_fi=(trans_batch_rates["energy_fi"].to_numpy() << 1 / u.cm)
-                                .to(u.Hz, equivalencies=u.spectral()).value,
-                            )
-                            b_if_vals = calc_einstein_b_if(
-                                b_fi=b_fi_vals,
-                                g_f=trans_batch_rates["g_f"].to_numpy(),
-                                g_i=trans_batch_rates["g_i"].to_numpy(),
+                            # b_fi_vals = calc_einstein_b_fi(
+                            #     a_fi=trans_batch_rates["A_fi"].to_numpy(),
+                            #     energy_fi=(trans_batch_rates["energy_fi"].to_numpy() << 1 / u.cm)
+                            #     .to(u.Hz, equivalencies=u.spectral()).value,
+                            # )
+                            # b_if_vals = calc_einstein_b_if(
+                            #     b_fi=b_fi_vals,
+                            #     g_f=trans_batch_rates["g_f"].to_numpy(),
+                            #     g_i=trans_batch_rates["g_i"].to_numpy(),
+                            # )
+                            b_fi, b_if = calc_einstein_bs(
+                                id_i=np.ascontiguousarray(trans_batch_rates["id_i"].to_numpy()),
+                                id_f=np.ascontiguousarray(trans_batch_rates["id_f"].to_numpy()),
+                                a_fi=np.ascontiguousarray(trans_batch_rates["A_fi"].to_numpy()),
+                                energy_fi=np.ascontiguousarray(
+                                    (trans_batch_rates["energy_fi"].to_numpy() << 1 / u.cm)
+                                    .to(u.Hz, equivalencies=u.spectral()).value
+                                ),
+                                g_lookup=g_lookup
                             )
                             agg_batch = (
                                 trans_batch_rates
                                 .with_columns([
-                                    pl.Series("B_fi", b_fi_vals),
-                                    pl.Series("B_if", b_if_vals),
+                                    pl.Series("B_fi", b_fi),
+                                    pl.Series("B_if", b_if),
                                 ])
                                 .group_by(["id_agg_f", "id_agg_i"])
                                 .agg([
@@ -1824,26 +1855,13 @@ class NLTEProcessor:
                             rates_list.append(agg_batch)
             # Finalise the accumulated super-line buffers.
             # Create band-key lookup.
-            # band_keys = np.empty(
-            #     (n_bands_used, 2),
-            #     dtype=np.int64,
-            # )
-            # for key, idx in band_key_to_idx.items():
-            #     band_keys[idx, 0] = key[0]  # id_f_agg
-            #     band_keys[idx, 1] = key[1]  # id_i_agg
             band_keys = (
                 band_registry.sort("band_idx")
                 .select(["id_agg_f", "id_agg_i"])
                 .to_numpy()
             )  # (n_bands_used, 2)
             # Apply broadening to buffers.
-            broad_n = np.zeros(1, dtype=np.float64)
-            broad_gamma = np.zeros((1, n_nlte_layers), dtype=np.float64)
-            if self.broadening_params is not None:
-                broad_n = self.broadening_params[1]
-                broad_gamma = self.broadening_params[0][:, self.n_lte_layers:]
-
-            buffer_abs, buffer_ste, buffer_spe = _broaden_superline_buffer(
+            buffer_abs, buffer_ste, buffer_spe = _broaden_superline_band_buffer(
                 buffer_abs=buffer_abs,
                 buffer_ste=buffer_ste,
                 buffer_spe=buffer_spe,
@@ -1892,6 +1910,7 @@ class NLTEProcessor:
                                     & (pl.col("energy_fi") <= wn_max)
                                 )
                                 .sort(["id_agg_f", "id_agg_i"])
+                                .fill_null(strategy="zero")
                             )
                             if trans_batch.height == 0:
                                 log.info("No valid trans in batch.")
@@ -1899,7 +1918,11 @@ class NLTEProcessor:
 
                             profile_buffer, band_id_f, band_id_i, agg_batch = _process_trans_batch_layered(
                                 trans_batch=trans_batch,
-                                broadening_params=self.broadening_params,
+                                n_frac_lookup=n_frac_lookup,
+                                g_lookup=g_lookup,
+                                tau_lookup=tau_lookup,
+                                broad_n=broad_n,
+                                broad_gamma=broad_gamma,
                                 species_mass=self.species_mass,
                                 wn_grid=wn_grid.value,
                                 n_lte_layers=self.n_lte_layers,
@@ -1932,6 +1955,10 @@ class NLTEProcessor:
                         trans_batch = pl.from_pandas(delayed_batch.compute())
                         trans_batch = (
                             trans_batch
+                            .with_columns([
+                                pl.col("id_i").cast(pl.Int32),
+                                pl.col("id_f").cast(pl.Int32),
+                            ])
                             .join(states_i, on="id_i", how="inner")
                             .join(states_f, on="id_f", how="inner")
                             .with_columns((pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi"))
@@ -1940,13 +1967,18 @@ class NLTEProcessor:
                                 & (pl.col("energy_fi") <= wn_max)
                             )
                             .sort(["id_agg_f", "id_agg_i"])
+                            .fill_null(strategy="zero")
                         )
                         if trans_batch.height == 0:
                             continue
 
                         profile_buffer, band_id_f, band_id_i, agg_batch = _process_trans_batch_layered(
                             trans_batch=trans_batch,
-                            broadening_params=self.broadening_params,
+                            n_frac_lookup=n_frac_lookup,
+                            g_lookup=g_lookup,
+                            tau_lookup=tau_lookup,
+                            broad_n=broad_n,
+                            broad_gamma=broad_gamma,
                             species_mass=self.species_mass,
                             wn_grid=wn_grid.value,
                             n_lte_layers=self.n_lte_layers,
@@ -2042,7 +2074,7 @@ class NLTEProcessor:
 
         merge_cols = ["id", "id_agg"]
         self._cont_states = self._cont_states.join(self.states.select(merge_cols), on="id", how="left")
-        # Above is new! Below has not yet been updated to polars.
+        self._cont_states = self._cont_states.with_columns(pl.col("id_agg").fill_null(-1))
 
         # self.cont_states = self.cont_states.merge(self.states[merge_cols], on="id", how="left")
         # self.cont_states["id_agg"] = self.cont_states["id_agg"].astype("Int64")
@@ -2081,61 +2113,81 @@ class NLTEProcessor:
         # Plain float arrays — no astropy units — passed directly to Numba.
         temperature_slice = temperature_profile[self.n_lte_layers:].to_value(u.K)  # (n_nlte_layers,)
 
-        n_frac_cols = [f"n_frac_nL{nlte_idx}" for nlte_idx in range(n_nlte_layers)]
-        invariant_cols_i = ["id", "energy", "g", "id_agg"] + n_frac_cols
-        invariant_cols_f = ["id", "energy", "g", "id_agg", "v"]
+        # n_frac_cols = [f"n_frac_nL{nlte_idx}" for nlte_idx in range(n_nlte_layers)]
+        # invariant_cols_i = ["id", "energy", "g", "id_agg"] + n_frac_cols
+        # invariant_cols_f = ["id", "energy", "g", "id_agg", "v"]
+        invariant_cols = ["id", "energy", "id_agg"]
         states_i = (
             states_frac
-            .select(invariant_cols_i)
-            .rename({col: f"{col}_i" for col in invariant_cols_i})
+            .select(invariant_cols)
+            .rename({col: f"{col}_i" for col in invariant_cols})
         )
         states_f = (
             states_frac
-            .select(invariant_cols_f)
-            .rename({col: f"{col}_f" for col in invariant_cols_f})
+            .select(invariant_cols)
+            .rename({col: f"{col}_f" for col in invariant_cols})
         )
         wn_min = wn_grid[0]
         wn_max = wn_grid[-1]
 
-        def read_rg(idx):
-            return pl.from_arrow(
-                pq_file.read_row_group(idx, columns=trans_columns, use_threads=True)
-            )
+        # States lookup - much more memory efficient than duplicating it all with polars joins!
+        state_ids = states_frac["id"].to_numpy()
+        max_state_id = int(state_ids.max())
+        # State ID lookup offset by 1 as IDs are 1-indexed!
+        n_frac_lookup = np.zeros(
+            (max_state_id + 1, n_nlte_layers),
+            dtype=np.float64,
+        )
+        for l in range(n_nlte_layers):
+            n_frac_lookup[state_ids, l] = states_frac[f"n_frac_nL{l}"].to_numpy()
+        n_frac_lookup = np.ascontiguousarray(n_frac_lookup)
+
+        g_lookup = np.zeros(max_state_id + 1, dtype=np.float64)
+        g_lookup[state_ids] = states_frac["g"].to_numpy()
+        g_lookup = np.ascontiguousarray(g_lookup)
+
+        v_lookup = np.zeros(max_state_id + 1, dtype=np.float64)
+        v_lookup[state_ids] = states_frac["v"].to_numpy()
+        v_lookup = np.ascontiguousarray(v_lookup)
 
         process_time = time.perf_counter()
+        parquet_batch_size = 200_000_000
         for cont_trans_file in self.cont_trans_files:
             log.info(f"Processing file {cont_trans_file}.")
             # Preprocessed Parquet files (MUCH faster).
             if str(cont_trans_file).endswith(".parquet"):
                 with pq.ParquetFile(cont_trans_file) as pq_file, ThreadPoolExecutor(max_workers=1) as executor:
-                    num_rg = pq_file.num_row_groups
-
-                    future = executor.submit(read_rg, 0)
-
-                    for rg_idx in range(num_rg):
-                        trans_batch = future.result()
-                        # Prefetch next batch.
-                        if rg_idx + 1 < num_rg:
-                            future = executor.submit(read_rg, rg_idx + 1)
-
+                    batch_iter = pq_file.iter_batches(
+                        batch_size=parquet_batch_size,
+                        columns=trans_columns,
+                        use_threads=True,
+                    )
+                    for arrow_batch in batch_iter:
+                        trans_batch = pl.from_arrow(arrow_batch)
                         trans_batch = (
                             trans_batch
+                            .with_columns([
+                                pl.col("id_i").cast(pl.Int32),
+                                pl.col("id_f").cast(pl.Int32),
+                            ])
                             .join(states_i, on="id_i", how="inner")
                             .join(states_f, on="id_f", how="inner")
                             .with_columns((pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi"))
                             .filter(
-                                # (pl.col("energy_f") >= wn_min)
-                                # & (pl.col("energy_i") <= wn_max)
                                 (pl.col("energy_fi") >= wn_min)
                                 & (pl.col("energy_fi") <= wn_max)
                             )
                             .sort(["id_agg_f", "id_agg_i"])
+                            # .fill_null(strategy="zero")
                         )
                         if trans_batch.height == 0:
                             continue
 
                         profile_buffer, band_id_f, band_id_i, agg_batch = _process_continuum_trans_batch_layered(
                             trans_batch=trans_batch,
+                            n_frac_lookup=n_frac_lookup,
+                            g_lookup=g_lookup,
+                            v_lookup=v_lookup,
                             species_mass=self.species_mass,
                             wn_grid=wn_grid.value,
                             n_lte_layers=self.n_lte_layers,
@@ -2143,11 +2195,12 @@ class NLTEProcessor:
                             cont_box_length=self.cont_box_length,
                             temperature_profile=temperature_slice,
                         )
-                        add_batch_time = time.perf_counter()
-                        self._cont_profile_store.add_batch(
-                            profile_buffer=profile_buffer, band_id_f=band_id_f, band_id_i=band_id_i
-                        )
-                        log.info(f"Add batch time = {time.perf_counter() - add_batch_time:.3f}.")
+                        if profile_buffer is not None:
+                            add_batch_time = time.perf_counter()
+                            self._cont_profile_store.add_batch(
+                                profile_buffer=profile_buffer, band_id_f=band_id_f, band_id_i=band_id_i
+                            )
+                            log.info(f"Add batch time = {time.perf_counter() - add_batch_time:.3f}.")
 
                         if agg_batch is not None:
                             cont_rates_list.append(agg_batch)
@@ -2167,22 +2220,28 @@ class NLTEProcessor:
                     trans_batch = pl.from_pandas(delayed_batch.compute())
                     trans_batch = (
                         trans_batch
+                        .with_columns([
+                            pl.col("id_i").cast(pl.Int32),
+                            pl.col("id_f").cast(pl.Int32),
+                        ])
                         .join(states_i, on="id_i", how="inner")
                         .join(states_f, on="id_f", how="inner")
                         .with_columns((pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi"))
                         .filter(
-                            # (pl.col("energy_f") >= wn_min)
-                            # & (pl.col("energy_i") <= wn_max)
                             (pl.col("energy_fi") >= wn_min)
                             & (pl.col("energy_fi") <= wn_max)
                         )
                         .sort(["id_agg_f", "id_agg_i"])
+                        # .fill_null(strategy="zero")
                     )
                     if trans_batch.height == 0:
                         continue
 
                     profile_buffer, band_id_f, band_id_i, agg_batch = _process_continuum_trans_batch_layered(
                         trans_batch=trans_batch,
+                        n_frac_lookup=n_frac_lookup,
+                        g_lookup=g_lookup,
+                        v_lookup=v_lookup,
                         species_mass=self.species_mass,
                         wn_grid=wn_grid.value,
                         n_lte_layers=self.n_lte_layers,
@@ -2190,11 +2249,12 @@ class NLTEProcessor:
                         cont_box_length=self.cont_box_length,
                         temperature_profile=temperature_slice,
                     )
-                    add_batch_time = time.perf_counter()
-                    self._cont_profile_store.add_batch(
-                        profile_buffer=profile_buffer, band_id_f=band_id_f, band_id_i=band_id_i
-                    )
-                    log.info(f"Add batch time = {time.perf_counter() - add_batch_time:.3f}.")
+                    if profile_buffer is not None:
+                        add_batch_time = time.perf_counter()
+                        self._cont_profile_store.add_batch(
+                            profile_buffer=profile_buffer, band_id_f=band_id_f, band_id_i=band_id_i
+                        )
+                        log.info(f"Add batch time = {time.perf_counter() - add_batch_time:.3f}.")
 
                     if agg_batch is not None:
                         cont_rates_list.append(agg_batch)
@@ -2398,6 +2458,8 @@ class NLTEProcessor:
             wn_grid: u.Quantity,
             wn_dx: u.Quantity,
     ) -> u.Quantity:
+        n_layers = temperature_profile.shape[0]
+
         rates_filter = (pl.col("id_agg_f") <= self.id_agg_cutoff) & (pl.col("id_agg_i") <= self.id_agg_cutoff)
 
         a_fi_approx = self.rates_grid.select(
@@ -2448,16 +2510,16 @@ class NLTEProcessor:
         t_ex_profile = (ac_h_c_on_kB * mean_energy_dif / np.log(1 / n_ratio)).to(u.K)
         log.info(f"T_ex profile global fit = {t_ex_profile}")
         # t_ex_profiles = []
-        # Get pairs of valid band keys: chosing adjacent IDs do not always exist, i.e.: in species with distinct
+        # Get pairs of valid band keys: choosing adjacent IDs do not always exist, i.e.: in species with distinct
         # isomers whose states are close in energy.
         agg_energies = self.agg_states.sort("id_agg")["energy_agg"].to_numpy()
         max_id = self.id_agg_cutoff + 1
-        num_pairs = max_id if max_id <= 4 else max(1, (max_id + 1) // 2)
+        num_pairs = max_id if max_id <= 10 else max(11, (max_id + 1) // 2)
         id_pairs = self.profile_store.get_sorted_band_keys(
             num_max=num_pairs, id_cutoff=self.id_agg_cutoff, agg_energies=agg_energies,
         )
         log.info(f"Num pairs = {num_pairs}, {len(id_pairs)} returned.")
-        t_ex_profiles = np.zeros((len(id_pairs), temperature_profile.shape[0]), dtype=np.float64) << u.K
+        t_ex_profiles = np.zeros((len(id_pairs), n_layers), dtype=np.float64) << u.K
         log.info(f"ID pairs for T_ex = {id_pairs}")
         for pair_idx, (id_agg_f, id_agg_i) in enumerate(id_pairs):
             id_filter = (pl.col("id_agg_f") == id_agg_f) & (pl.col("id_agg_i") == id_agg_i)
@@ -2471,8 +2533,9 @@ class NLTEProcessor:
                 pl.col("B_if").filter(id_filter).sum()
             ).item() * einstein_b_unit
 
-            v_fi = np.zeros(temperature_profile.shape[0]) << 1 / u.s
-            v_if = np.zeros(temperature_profile.shape[0]) << 1 / u.s
+            v_fi = np.zeros(n_layers) << 1 / u.s
+            v_if = np.zeros(n_layers) << 1 / u.s
+            energy_dif_wmean = np.zeros(n_layers)
             for layer_idx in range(self.n_lte_layers, temperature_profile.shape[0]):
                 nlte_layer_idx = layer_idx - self.n_lte_layers
                 abs_profile, abs_start_idx = self.profile_store.get_profile(
@@ -2513,16 +2576,22 @@ class NLTEProcessor:
                     y_data=abs_profile_norm * b_if * i_mean[layer_idx, abs_start_idx:abs_end_idx],
                     dx=wn_dx[abs_start_idx:abs_end_idx]
                 )
+                # TODO: TEST THIS!
+                energy_dif_wmean[layer_idx] = np.average(
+                    wn_grid[abs_start_idx:abs_end_idx].value,
+                    weights=abs_profile[abs_start_idx:abs_end_idx]
+                )
             c_fi = self._col_chem_c_matrix[:, id_agg_i, id_agg_f] << 1 / u.s
             c_if = self._col_chem_c_matrix[:, id_agg_f, id_agg_i] << 1 / u.s
             n_ratio = (c_if + v_if) / (c_fi + a_fi + v_fi)
             energy_agg_f = self.agg_states.filter(pl.col("id_agg") == id_agg_f).select(pl.col("energy_agg")).item()
             energy_agg_i = self.agg_states.filter(pl.col("id_agg") == id_agg_i).select(pl.col("energy_agg")).item()
             energy_dif = (energy_agg_f - energy_agg_i) / u.cm
+            log.info(f"DEBUG: energy_dif = {energy_dif}, WMean = {energy_f_wmean}.")
             t_ex_profile = (ac_h_c_on_kB * energy_dif / np.log(1 / n_ratio)).to(u.K)
             if np.any(t_ex_profile < 0):
                 log.warning(f"{self.species} T_ex for ({id_agg_f}-{id_agg_i}) band contains negatives!")
-                t_ex_profile = np.clip(t_ex_profile, a_min=1.0, a_max=20000)  # Failsafe
+                t_ex_profile = np.clip(t_ex_profile.value, a_min=1.0, a_max=20000) << u.K  # Failsafe
             log.info(f"DEBUG: {id_agg_f}-{id_agg_i} T_ex = {t_ex_profile}")
             # log.info(f"DEBUG: {id_agg_f}-{id_agg_i}: C_if = {c_if}, C_fi = {c_fi}, V_if = {v_if}, V_fi = {v_fi},"
             #          f" A_fi = {a_fi}.")

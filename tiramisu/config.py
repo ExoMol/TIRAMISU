@@ -20,10 +20,10 @@ if numba.get_num_threads() != _DEFAULT_NUM_THREADS:
     # logging.info(f"Numba defaulting to {numba.get_num_threads()} threads: setting to {_DEFAULT_NUM_THREADS}.")
     numba.set_num_threads(_DEFAULT_NUM_THREADS)
 
-
 # Configure spawn context for logging in ProcessPools.
 ctx = mp.get_context("spawn")
 log_queue = ctx.Queue()
+
 
 def setup_logging_main(logfile: str = "nlte.log"):
     root = logging.getLogger()
