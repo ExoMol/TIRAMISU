@@ -22,6 +22,7 @@ from scipy.integrate import cumulative_simpson
 from scipy.optimize import least_squares
 
 from .accelerator import HybridAccelerator
+from .atomic_nuclear_data import get_reduced_mass
 from .chemistry import SpeciesFormula, ChemicalProfile
 from .colchem import CollisionalRatesDatabase, RateTransition
 from .config import output_dir
@@ -30,8 +31,9 @@ from .numerics import (loglinear_normalise_1d_nonnegative, loglinear_normalise_q
                        loglinear_integral_quantity_1d_nonnegative, loglinear_integral_quantity_2d_nonnegative)
 from .profiles import (ProfileStore, ContinuumProfileStore, _process_trans_batch_layered,
                        _process_continuum_trans_batch_layered, abs_emi_xsec, continuum_xsec, const_8_pi_c,
-                       calc_einstein_b_fi, calc_einstein_b_if, _accumulate_superline_band_batch, const_h_c_on_4_pi,
-                       _broaden_superline_band_buffer, calc_einstein_bs)
+                       _accumulate_superline_band_batch, const_h_c_on_4_pi, _broaden_superline_band_buffer,
+                       calc_einstein_bs, _accumulate_continuum_superline_band_batch,
+                       _broaden_continuum_superline_band_buffer)
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +63,191 @@ const_2_pi_c_kB = (2 * np.pi * ac.c.cgs * ac.k_B.cgs).value
 # TODO: For NANs in state lifetimes; treat as inf? They imply inf but often they exist because of transition energy
 #  cutoffs during computation and not because the state has no deexcitation pathways.
 
+
+# ----------------------------------------- Rates & Profiles Parser Functions -----------------------------------------
+def _iter_trans_batches(
+        trans_file: pathlib.Path,
+        trans_columns: list[str],
+        states_i: pl.DataFrame,
+        states_f: pl.DataFrame,
+        wn_min: float,
+        wn_max: float,
+        parquet_batch_size: int,
+        dask_blocksize: str,
+        dask_dtypes: dict,
+) -> t.Iterator[pl.DataFrame]:
+    """
+    Yields filtered, joined trans batches regardless of file format.
+
+    Called by :func:`~xsec.NLTEProcessor.compute_rates_profiles`.
+
+    Parameters
+    ----------
+    trans_file
+    trans_columns
+    states_i
+    states_f
+    wn_min
+    wn_max
+    parquet_batch_size
+    dask_blocksize
+    dask_dtypes
+
+    Returns
+    -------
+
+    """
+
+    def _process(raw: pl.DataFrame) -> pl.DataFrame:
+        return (
+            raw
+            .with_columns([
+                pl.col("id_i").cast(pl.Int32),
+                pl.col("id_f").cast(pl.Int32),
+            ])
+            .join(states_i, on="id_i", how="inner")
+            .join(states_f, on="id_f", how="inner")
+            .with_columns(
+                (pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi")
+            )
+            .filter(
+                (pl.col("energy_fi") >= wn_min)
+                & (pl.col("energy_fi") <= wn_max)
+            )
+        )
+
+    if str(trans_file).endswith(".parquet"):
+        with pq.ParquetFile(trans_file) as pq_file:
+            for arrow_batch in pq_file.iter_batches(
+                    batch_size=parquet_batch_size,
+                    columns=trans_columns,
+                    use_threads=True,
+            ):
+                yield _process(pl.from_arrow(arrow_batch))
+    else:
+        ddf = dd.read_csv(
+            trans_file,
+            sep=r"\s+",
+            engine="python",
+            header=None,
+            names=trans_columns,
+            usecols=[0, 1, 2],
+            dtype=dask_dtypes,
+            blocksize=dask_blocksize,
+        )
+        for delayed_batch in ddf.to_delayed():
+            yield _process(pl.from_pandas(delayed_batch.compute()))
+
+
+def _update_band_registry(
+        trans_batch: pl.DataFrame,
+        band_registry: pl.DataFrame,
+        band_registry_cols: t.List[str],
+        profile_buffer: npt.NDArray[np.float64],
+        n_bands_used: int,
+        n_bands_max: int,
+) -> t.Tuple[pl.DataFrame, npt.NDArray[np.float64], int, int, npt.NDArray[np.int64]]:
+    """
+    Updates the band registry with any new (id_agg_f, id_agg_i) pairs found in trans_batch, grows profile_buffer if
+    needed, and returns per-transition band indices.
+
+    Called by :func:`~xsec.NLTEProcessor.compute_rates_profiles`.
+
+    Parameters
+    ----------
+    trans_batch : pl.DataFrame
+    band_registry : pl.DataFrame
+    band_registry_cols : List
+    profile_buffer : ndarray, shape (x, n_bands, n_layers, n_grid)
+        Buffer for writing profiles to. "x" here varies depending on whether bound-bound or bound-free transitions are
+        being processed.
+    n_bands_used : int
+    n_bands_max : int
+
+    Returns
+    -------
+    band_registry : pl.DataFrame
+    profile_buffer : ndarray, shape (x, n_bands, n_layers, n_grid)
+    n_bands_used : int
+    n_bands_max : int
+    band_indices : ndarray, shape (n_trans)
+
+    """
+    batch_bands = trans_batch.select(["id_agg_f", "id_agg_i"])
+    new_keys = (
+        batch_bands.unique() if band_registry.height == 0
+        else batch_bands.unique().join(band_registry, on=["id_agg_f", "id_agg_i"], how="anti")
+    )
+    if new_keys.height > 0:
+        new_keys = (
+            new_keys
+            .with_row_index(name="band_idx", offset=n_bands_used)
+            .with_columns(pl.col("band_idx").cast(pl.Int32))
+            .select(band_registry_cols)
+        )
+        # Update global counter.
+        n_bands_used += new_keys.height
+        if n_bands_used > n_bands_max:
+            needed_extra = max(n_bands_used - n_bands_max, n_bands_max)
+            extra = np.zeros(
+                (profile_buffer.shape[0], needed_extra, profile_buffer.shape[2], profile_buffer.shape[3]),
+                dtype=np.float64
+            )
+            profile_buffer = np.concatenate([profile_buffer, extra], axis=1)
+            n_bands_max += needed_extra
+        band_registry = pl.concat([band_registry, new_keys])
+
+    band_indices = np.ascontiguousarray(
+        batch_bands.join(band_registry, on=["id_agg_f", "id_agg_i"], how="left")
+        ["band_idx"].to_numpy().copy()
+    )
+    return band_registry, profile_buffer, n_bands_used, n_bands_max, band_indices
+
+
+def _compute_agg_rates(
+        trans_batch: pl.DataFrame,
+        g_lookup: npt.NDArray[np.float64],
+) -> t.Optional[pl.DataFrame]:
+    """
+    Computes the radiative (Einstein) rate coefficients for the batch of transitions.
+
+    Called by :func:`~xsec.NLTEProcessor.compute_rates_profiles`.
+
+    Parameters
+    ----------
+    trans_batch : pl.DataFrame
+    g_lookup : ndarray, shape (n_states + 1, )
+
+    Returns
+    -------
+    trans_batch_rates : pl.DataFrame
+
+    """
+    trans_batch_rates = trans_batch.filter(pl.col("id_agg_f") != pl.col("id_agg_i"))
+    if trans_batch_rates.height == 0:
+        return None
+    b_fi, b_if = calc_einstein_bs(
+        id_i=np.ascontiguousarray(trans_batch_rates["id_i"].to_numpy()),
+        id_f=np.ascontiguousarray(trans_batch_rates["id_f"].to_numpy()),
+        a_fi=np.ascontiguousarray(trans_batch_rates["A_fi"].to_numpy()),
+        energy_fi=np.ascontiguousarray(
+            (trans_batch_rates["energy_fi"].to_numpy() << 1 / u.cm)
+            .to(u.Hz, equivalencies=u.spectral()).value
+        ),
+        g_lookup=g_lookup,
+    )
+    return (
+        trans_batch_rates
+        .with_columns(
+            [pl.Series("B_fi", b_fi), pl.Series("B_if", b_if)]
+        )
+        .group_by(["id_agg_f", "id_agg_i"])
+        .agg(
+            [pl.col("A_fi").sum(), pl.col("B_fi").sum(), pl.col("B_if").sum()]
+        )
+    )
+
+# -------------------------------------------- Bezier Coefficients & Setup --------------------------------------------
 
 def effective_source_tau_mu(
         global_source_func_matrix: u.Quantity,
@@ -119,7 +306,6 @@ def effective_source_tau_mu(
     return effective_source_func_matrix, tau_mu
 
 
-############ NEW
 @numba.njit(parallel=True, cache=True, error_model="numpy")
 def _compute_coefficients_core(
         delta_tau: npt.NDArray[np.float64],
@@ -1084,9 +1270,10 @@ class NLTEProcessor:
 
     __slots__ = [
         # Public:
-        "species", "states_file", "trans_files", "agg_col_nums", "agg_col_names", "species_mass", "broadening_params",
-        "cont_states_file", "cont_trans_files", "cont_box_length", "cont_broad_col_num", "dissociation_products",
-        "do_super_lines", "approximate_t_ex", "debug", "debug_pop_matrix",
+        "species", "states_file", "trans_files", "agg_col_nums", "agg_col_names", "species_mass", "reduced_mass",
+        "broadening_params", "cont_states_file", "cont_trans_files", "cont_box_length", "cont_broad_col_num",
+        "dissociation_products", "do_super_lines", "cont_do_super_lines", "approximate_t_ex", "debug",
+        "debug_pop_matrix",
         # Private:
         "_states", "_n_agg_states", "_agg_states", "_id_agg_cutoff", "_rates_grid", "_profile_store", "_pop_matrix",
         "_mol_chi_matrix", "_mol_eta_matrix", "_cont_states", "_cont_rates", "_cont_profile_store", "_accelerator",
@@ -1107,6 +1294,7 @@ class NLTEProcessor:
             cont_broad_col_num: int | None = None,
             dissociation_products: t.Tuple[str] | None = None,
             do_super_lines: bool = False,
+            cont_do_super_lines: bool = True,
             approximate_t_ex: bool = True,
             debug: bool = False,
             debug_pop_matrix: npt.NDArray[np.float64] = None,
@@ -1133,6 +1321,7 @@ class NLTEProcessor:
 
         # self.species_mass: float = get_molecular_mass(species)
         self.species_mass: float = self.species.mass
+        self.reduced_mass: float = get_reduced_mass(species)
         self.broadening_params = broadening_params
 
         # Required, set during runtime/setup.
@@ -1178,6 +1367,7 @@ class NLTEProcessor:
         self.dissociation_products: t.Tuple = dissociation_products
 
         self.do_super_lines = do_super_lines
+        self.cont_do_super_lines = cont_do_super_lines
         self.approximate_t_ex = approximate_t_ex
         self.debug: bool = debug
         self.debug_pop_matrix: npt.NDArray[np.float64] | None = debug_pop_matrix
@@ -1492,9 +1682,7 @@ class NLTEProcessor:
 
         n_nlte_layers = self.n_layers - self.n_lte_layers
         rates_list = []
-        self.profile_store = ProfileStore(
-            n_layers=n_nlte_layers, n_agg_states=self.n_agg_states, n_grid=wn_grid.shape[0]
-        )
+        self.profile_store = ProfileStore(n_layers=n_nlte_layers)
 
         trans_columns = ["id_f", "id_i", "A_fi"]
         dask_dtypes = {"id_f": "int32", "id_i": "int32", "A_fi": "float64"}
@@ -1504,7 +1692,7 @@ class NLTEProcessor:
         temperature_slice = temperature_profile[self.n_lte_layers:].to_value(u.K)  # (n_nlte_layers,)
         pressure_slice = pressure_profile[self.n_lte_layers:].to_value(u.bar)  # (n_nlte_layers,)
 
-        n_frac_cols = [f"n_frac_nL{nlte_idx}" for nlte_idx in range(n_nlte_layers)]
+        # n_frac_cols = [f"n_frac_nL{nlte_idx}" for nlte_idx in range(n_nlte_layers)]
         states_frac = self.states.with_columns(
             (
                     pl.col(f"n_L{self.n_lte_layers + nlte_idx}") / pl.col(f"n_agg_L{self.n_lte_layers + nlte_idx}")
@@ -1528,6 +1716,14 @@ class NLTEProcessor:
         # Grid parameters and buffers.
         wn_min = wn_grid[0]
         wn_max = wn_grid[-1]
+        n_grid = wn_grid.shape[0]
+        # Bin edges for finding trans bins.
+        wn_arr = wn_grid.value
+        bin_edges = np.empty(n_grid + 1, dtype=np.float64)
+        bin_edges[0] = wn_arr[0] - (wn_arr[1] - wn_arr[0]) * 0.5
+        for j in range(1, n_grid):
+            bin_edges[j] = (wn_arr[j - 1] + wn_arr[j]) * 0.5
+        bin_edges[-1] = wn_arr[-1] + (wn_arr[-1] - wn_arr[-2]) * 0.5
 
         # States lookup - much more memory efficient than duplicating it all with polars joins!
         state_ids = states_frac["id"].to_numpy()
@@ -1556,447 +1752,555 @@ class NLTEProcessor:
             broad_n = self.broadening_params[1]
             broad_gamma = self.broadening_params[0][:, self.n_lte_layers:]
 
+        # Before the batch loop, pre-allocate once.
+        n_bands_max = min(100, self.n_agg_states ** 2)
+
+        # profile_buffer[0] = abs, profile_buffer[1] = ste, profile_buffer[2] = spe.
+        profile_buffer = np.zeros((3, n_bands_max, n_nlte_layers, n_grid), dtype=np.float64)
+        profile_buffer = np.ascontiguousarray(profile_buffer)
+        # band_key_to_idx: dict[tuple[int, int], int] = {}
+        n_bands_used = 0
+        band_registry = pl.DataFrame(
+            schema={"id_agg_f": pl.Int32, "id_agg_i": pl.Int32, "band_idx": pl.Int32}
+        )
+        band_registry_cols = band_registry.columns
+
         process_time = time.perf_counter()
         parquet_batch_size = 200_000_000
-        if self.do_super_lines:
-            # ---------------------------------------------- SUPER-LINES ----------------------------------------------
-
-            # Before the batch loop, pre-allocate once.
-            n_bands_max = min(100, self.n_agg_states ** 2)
-            n_grid = wn_grid.shape[0]
-
-            # profile_buffer[0] = abs, profile_buffer[1] = ste, profile_buffer[2] = spe.
-            profile_buffer = np.zeros((3, n_bands_max, n_nlte_layers, n_grid), dtype=np.float64)
-            profile_buffer = np.ascontiguousarray(profile_buffer)
-            # band_key_to_idx: dict[tuple[int, int], int] = {}
-            n_bands_used = 0
-            band_registry = pl.DataFrame(
-                schema={"id_agg_f": pl.Int32, "id_agg_i": pl.Int32, "band_idx": pl.Int32}
-            )
-            band_registry_cols = band_registry.columns
-            buffer_abs = profile_buffer[0]
-            buffer_ste = profile_buffer[1]
-            buffer_spe = profile_buffer[2]
-
-            # Bin edges for finding trans bins.
-            wn_arr = wn_grid.value
-            bin_edges = np.empty(n_grid + 1, dtype=np.float64)
-            bin_edges[0] = wn_arr[0] - (wn_arr[1] - wn_arr[0]) * 0.5
-            for j in range(1, n_grid):
-                bin_edges[j] = (wn_arr[j - 1] + wn_arr[j]) * 0.5
-            bin_edges[-1] = wn_arr[-1] + (wn_arr[-1] - wn_arr[-2]) * 0.5
-            for trans_file in self.trans_files:
-                log.info(f"Processing file {trans_file}.")
-                # Preprocessed Parquet files (MUCH faster).
-                if str(trans_file).endswith(".parquet"):
-                    with pq.ParquetFile(trans_file) as pq_file:
-                        batch_iter = pq_file.iter_batches(
-                            batch_size=parquet_batch_size,
-                            columns=trans_columns,
-                            use_threads=True,
-                        )
-                        for arrow_batch in batch_iter:
-                            trans_batch = pl.from_arrow(arrow_batch)
-                            start_time = time.perf_counter()
-                            trans_batch = (
-                                trans_batch
-                                .with_columns([
-                                    pl.col("id_i").cast(pl.Int32),
-                                    pl.col("id_f").cast(pl.Int32),
-                                ])
-                                .join(states_i, on="id_i", how="inner")
-                                .join(states_f, on="id_f", how="inner")
-                                .with_columns(
-                                    (pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi")
-                                )
-                                .filter(
-                                    (pl.col("energy_fi") >= wn_min)
-                                    & (pl.col("energy_fi") <= wn_max)
-                                )
-                                # .sort(["id_agg_f", "id_agg_i"])
-                            )
-                            log.info(f"Polars duration = {time.perf_counter() - start_time}.")
-                            if trans_batch.height == 0:
-                                log.info("No valid trans in batch.")
-                                continue
-                            # Extract numpy arrays.
-                            start_time = time.perf_counter()
-                            id_i = np.ascontiguousarray(trans_batch["id_i"].to_numpy())
-                            id_f = np.ascontiguousarray(trans_batch["id_f"].to_numpy())
-                            a_fi = np.ascontiguousarray(trans_batch["A_fi"].to_numpy())
-
-                            energy_fi = trans_batch["energy_fi"].to_numpy()
-                            abs_ste_prefactor = np.ascontiguousarray(a_fi / (const_8_pi_c * energy_fi ** 2))
-                            spe_prefactor = np.ascontiguousarray(a_fi * energy_fi * const_h_c_on_4_pi)
-
-                            log.info(f"Extraction duration = {time.perf_counter() - start_time}.")
-                            # Get bin indices per transition.
-                            bin_indices = np.searchsorted(bin_edges, energy_fi, side="right") - 1
-                            bin_indices = np.clip(bin_indices, 0, n_grid - 1, dtype=np.int32)
-                            bin_indices = np.ascontiguousarray(bin_indices)
-
-                            start_time = time.perf_counter()
-                            batch_bands = trans_batch.select(["id_agg_f", "id_agg_i"])
-                            if band_registry.height == 0:
-                                new_keys = batch_bands.unique()
-                            else:
-                                new_keys = batch_bands.unique().join(
-                                    band_registry, on=["id_agg_f", "id_agg_i"], how="anti"
-                                )
-                            if new_keys.height > 0:
-                                # Generate sequential indices starting right from n_bands_used.
-                                new_keys = (
-                                    new_keys
-                                    .with_row_index(name="band_idx", offset=n_bands_used)
-                                    .with_columns(pl.col("band_idx").cast(pl.Int32))
-                                    .select(band_registry_cols)
-                                )
-                                # Update your global counter
-                                n_bands_used += new_keys.height
-                                # Dynamically resize buffer if exceeding bands number threshold.
-                                if n_bands_used > n_bands_max:
-                                    # Grow exactly by what you need
-                                    needed_extra = max(n_bands_used - n_bands_max, n_bands_max)
-                                    extra = np.zeros((3, needed_extra, n_nlte_layers, n_grid), dtype=np.float64)
-                                    profile_buffer = np.concatenate([profile_buffer, extra], axis=1)
-                                    # n_bands_max *= 2  # Overkill.
-                                    buffer_abs = profile_buffer[0]
-                                    buffer_ste = profile_buffer[1]
-                                    buffer_spe = profile_buffer[2]
-                                    n_bands_max += needed_extra
-                                # Update the global registry dataframe
-                                band_registry = pl.concat([band_registry, new_keys])
-                            mapped_batch = batch_bands.join(
-                                band_registry, on=["id_agg_f", "id_agg_i"], how="left"
-                            )
-                            band_indices = np.ascontiguousarray(mapped_batch["band_idx"].to_numpy().copy())
-                            log.info(f"Band indices duration = {time.perf_counter() - start_time}.")
-                            log.info(f"Accumulating {trans_batch.height} transitions.")
-                            # Write all transitions to respective bins.
-                            start_time = time.perf_counter()
-                            _accumulate_superline_band_batch(
-                                buffer_abs=buffer_abs,
-                                buffer_ste=buffer_ste,
-                                buffer_spe=buffer_spe,
-                                band_indices=band_indices,
-                                bin_indices=bin_indices,
-                                g_lookup=g_lookup,
-                                abs_ste_prefactor=abs_ste_prefactor,
-                                spe_prefactor=spe_prefactor,
-                                id_i=id_i,
-                                id_f=id_f,
-                                n_frac_lookup=n_frac_lookup,
-                            )
-                            log.info(f"Accumulate duration = {time.perf_counter() - start_time}.")
-                            # Do rates for batch.
-                            trans_batch_rates = trans_batch.filter(pl.col("id_agg_f") != pl.col("id_agg_i"))
-                            if trans_batch_rates.height > 0:
-                                # b_fi_vals = calc_einstein_b_fi(
-                                #     a_fi=np.ascontiguousarray(trans_batch_rates["A_fi"].to_numpy()),
-                                #     energy_fi=np.ascontiguousarray(
-                                #         (trans_batch_rates["energy_fi"].to_numpy() << 1 / u.cm)
-                                #         .to(u.Hz, equivalencies=u.spectral()).value
-                                #     ),
-                                # )
-                                # b_if_vals = calc_einstein_b_if(
-                                #     b_fi=b_fi_vals,
-                                #     g_f=trans_batch_rates["g_f"].to_numpy(),
-                                #     g_i=trans_batch_rates["g_i"].to_numpy(),
-                                # )
-                                b_fi, b_if = calc_einstein_bs(
-                                    id_i=np.ascontiguousarray(trans_batch_rates["id_i"].to_numpy()),
-                                    id_f=np.ascontiguousarray(trans_batch_rates["id_f"].to_numpy()),
-                                    a_fi=np.ascontiguousarray(trans_batch_rates["A_fi"].to_numpy()),
-                                    energy_fi=np.ascontiguousarray(
-                                        (trans_batch_rates["energy_fi"].to_numpy() << 1 / u.cm)
-                                        .to(u.Hz, equivalencies=u.spectral()).value
-                                    ),
-                                    g_lookup=g_lookup
-                                )
-                                agg_batch = (
-                                    trans_batch_rates
-                                    .with_columns([
-                                        pl.Series("B_fi", b_fi),
-                                        pl.Series("B_if", b_if),
-                                    ])
-                                    .group_by(["id_agg_f", "id_agg_i"])
-                                    .agg([
-                                        pl.col("A_fi").sum(),
-                                        pl.col("B_fi").sum(),
-                                        pl.col("B_if").sum(),
-                                    ])
-                                )
-                                rates_list.append(agg_batch)
-                else:
-                    # ExoMol format text files (*.trans files from website).
-                    ddf = dd.read_csv(
-                        trans_file,
-                        sep=r"\s+",
-                        engine="python",
-                        header=None,
-                        names=trans_columns,
-                        usecols=[0, 1, 2],
-                        dtype=dask_dtypes,
-                        blocksize=dask_blocksize,
+        # New
+        for trans_file in self.trans_files:
+            log.info(f"Processing file {trans_file}.")
+            for trans_batch in _iter_trans_batches(
+                    trans_file=trans_file,
+                    trans_columns=trans_columns,
+                    states_i=states_i,
+                    states_f=states_f,
+                    wn_min=wn_min,
+                    wn_max=wn_max,
+                    parquet_batch_size=parquet_batch_size,
+                    dask_blocksize=dask_blocksize,
+                    dask_dtypes=dask_dtypes,
+            ):
+                if trans_batch.height == 0:
+                    log.info("No valid trans in batch.")
+                    continue
+                # Assign new band indices to any new bands; extend profile buffer if needed.
+                band_registry, profile_buffer, n_bands_used, n_bands_max, band_indices = _update_band_registry(
+                    trans_batch=trans_batch,
+                    band_registry=band_registry,
+                    band_registry_cols=band_registry_cols,
+                    profile_buffer=profile_buffer,
+                    n_bands_used=n_bands_used,
+                    n_bands_max=n_bands_max,
+                )
+                if self.do_super_lines:
+                    energy_fi = trans_batch["energy_fi"].to_numpy()
+                    a_fi = np.ascontiguousarray(trans_batch["A_fi"].to_numpy())
+                    bin_indices = np.ascontiguousarray(np.clip(
+                            np.searchsorted(bin_edges, energy_fi, side="right") - 1,
+                            0,
+                            n_grid - 1,
+                            dtype=np.int32
+                    ))
+                    _accumulate_superline_band_batch(
+                        profile_buffer=profile_buffer,
+                        band_indices=band_indices,
+                        bin_indices=bin_indices,
+                        g_lookup=g_lookup,
+                        abs_ste_prefactor=np.ascontiguousarray(a_fi / (const_8_pi_c * energy_fi ** 2)),
+                        spe_prefactor=np.ascontiguousarray(a_fi * energy_fi * const_h_c_on_4_pi),
+                        id_i=np.ascontiguousarray(trans_batch["id_i"].to_numpy()),
+                        id_f=np.ascontiguousarray(trans_batch["id_f"].to_numpy()),
+                        n_frac_lookup=n_frac_lookup,
                     )
-                    for delayed_batch in ddf.to_delayed():
-                        trans_batch = pl.from_pandas(delayed_batch.compute())
-                        trans_batch = (
-                            trans_batch
-                            .join(states_i, on="id_i", how="inner")
-                            .join(states_f, on="id_f", how="inner")
-                            .with_columns((pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi"))
-                            .filter(
-                                (pl.col("energy_fi") >= wn_min)
-                                & (pl.col("energy_fi") <= wn_max)
-                            )
-                            # .sort(["id_agg_f", "id_agg_i"])
-                        )
-                        if trans_batch.height == 0:
-                            continue
-                        # Extract numpy arrays.
-                        id_i = np.ascontiguousarray(trans_batch["id_i"].to_numpy())
-                        id_f = np.ascontiguousarray(trans_batch["id_f"].to_numpy())
-                        a_fi = trans_batch["A_fi"].to_numpy()
-
-                        energy_fi = trans_batch["energy_fi"].to_numpy()
-                        abs_ste_prefactor = np.ascontiguousarray(a_fi / (const_8_pi_c * energy_fi ** 2))
-                        spe_prefactor = np.ascontiguousarray(a_fi * energy_fi * const_h_c_on_4_pi)
-
-                        # Get bin indices per transition.
-                        bin_indices = np.searchsorted(bin_edges, energy_fi, side="right") - 1
-                        bin_indices = np.clip(bin_indices, 0, n_grid - 1, dtype=np.int32)
-                        bin_indices = np.ascontiguousarray(bin_indices)
-
-                        batch_bands = trans_batch.select(["id_agg_f", "id_agg_i"])
-                        if band_registry.height == 0:
-                            new_keys = batch_bands.unique()
-                        else:
-                            new_keys = batch_bands.unique().join(
-                                band_registry, on=["id_agg_f", "id_agg_i"], how="anti"
-                            )
-                        if new_keys.height > 0:
-                            # Generate sequential indices starting right from n_bands_used.
-                            new_keys = (
-                                new_keys
-                                .with_row_index(name="band_idx", offset=n_bands_used)
-                                .with_columns(pl.col("band_idx").cast(pl.Int32))
-                                .select(band_registry_cols)
-                            )
-                            # Update your global counter
-                            n_bands_used += new_keys.height
-                            # Dynamically resize buffer if exceeding bands number threshold.
-                            if n_bands_used > n_bands_max:
-                                # Grow exactly by what you need
-                                needed_extra = max(n_bands_used - n_bands_max, n_bands_max)
-                                extra = np.zeros((3, needed_extra, n_nlte_layers, n_grid), dtype=np.float64)
-                                profile_buffer = np.concatenate([profile_buffer, extra], axis=1)
-                                # n_bands_max *= 2  # Overkill.
-                                buffer_abs = profile_buffer[0]
-                                buffer_ste = profile_buffer[1]
-                                buffer_spe = profile_buffer[2]
-                                n_bands_max += needed_extra
-                            # Update the global registry dataframe
-                            band_registry = pl.concat([band_registry, new_keys])
-                        mapped_batch = batch_bands.join(
-                            band_registry, on=["id_agg_f", "id_agg_i"], how="left"
-                        )
-                        band_indices = np.ascontiguousarray(mapped_batch["band_idx"].to_numpy().copy())
-                        # Write all transitions to respective bins.
-                        _accumulate_superline_band_batch(
-                            buffer_abs=buffer_abs,
-                            buffer_ste=buffer_ste,
-                            buffer_spe=buffer_spe,
-                            band_indices=band_indices,
-                            bin_indices=bin_indices,
-                            g_lookup=g_lookup,
-                            abs_ste_prefactor=abs_ste_prefactor,
-                            spe_prefactor=spe_prefactor,
-                            id_i=id_i,
-                            id_f=id_f,
-                            n_frac_lookup=n_frac_lookup,
-                        )
-                        trans_batch_rates = trans_batch.filter(pl.col("id_agg_f") != pl.col("id_agg_i"))
-                        # Do rates for batch.
-                        if trans_batch_rates.height > 0:
-                            # b_fi_vals = calc_einstein_b_fi(
-                            #     a_fi=trans_batch_rates["A_fi"].to_numpy(),
-                            #     energy_fi=(trans_batch_rates["energy_fi"].to_numpy() << 1 / u.cm)
-                            #     .to(u.Hz, equivalencies=u.spectral()).value,
-                            # )
-                            # b_if_vals = calc_einstein_b_if(
-                            #     b_fi=b_fi_vals,
-                            #     g_f=trans_batch_rates["g_f"].to_numpy(),
-                            #     g_i=trans_batch_rates["g_i"].to_numpy(),
-                            # )
-                            b_fi, b_if = calc_einstein_bs(
-                                id_i=np.ascontiguousarray(trans_batch_rates["id_i"].to_numpy()),
-                                id_f=np.ascontiguousarray(trans_batch_rates["id_f"].to_numpy()),
-                                a_fi=np.ascontiguousarray(trans_batch_rates["A_fi"].to_numpy()),
-                                energy_fi=np.ascontiguousarray(
-                                    (trans_batch_rates["energy_fi"].to_numpy() << 1 / u.cm)
-                                    .to(u.Hz, equivalencies=u.spectral()).value
-                                ),
-                                g_lookup=g_lookup
-                            )
-                            agg_batch = (
-                                trans_batch_rates
-                                .with_columns([
-                                    pl.Series("B_fi", b_fi),
-                                    pl.Series("B_if", b_if),
-                                ])
-                                .group_by(["id_agg_f", "id_agg_i"])
-                                .agg([
-                                    pl.col("A_fi").sum(),
-                                    pl.col("B_fi").sum(),
-                                    pl.col("B_if").sum(),
-                                ])
-                            )
-                            rates_list.append(agg_batch)
-            # Finalise the accumulated super-line buffers.
-            # Create band-key lookup.
-            band_keys = (
-                band_registry.sort("band_idx")
-                .select(["id_agg_f", "id_agg_i"])
-                .to_numpy()
-            )  # (n_bands_used, 2)
-            # Apply broadening to buffers.
-            buffer_abs, buffer_ste, buffer_spe = _broaden_superline_band_buffer(
-                buffer_abs=buffer_abs,
-                buffer_ste=buffer_ste,
-                buffer_spe=buffer_spe,
+                else:
+                    _process_trans_batch_layered(
+                        trans_batch=trans_batch,
+                        profile_buffer=profile_buffer,
+                        band_indices=band_indices,
+                        n_frac_lookup=n_frac_lookup,
+                        g_lookup=g_lookup,
+                        tau_lookup=tau_lookup,
+                        broad_n=broad_n,
+                        broad_gamma=broad_gamma,
+                        species_mass=self.species_mass,
+                        wn_grid=wn_grid.value,
+                        temperature_profile=temperature_slice,
+                        pressure_profile=pressure_slice,
+                    )
+                # Do rates for batch - same regardless of line processing strategy.
+                agg_batch = _compute_agg_rates(trans_batch, g_lookup)
+                if agg_batch is not None:
+                    rates_list.append(agg_batch)
+        # Contract the buffer based on n_bands_used, drop superfluous rows.
+        profile_buffer = profile_buffer[:, :n_bands_used, :, :]
+        if self.do_super_lines:
+            profile_buffer = _broaden_superline_band_buffer(
+                profile_buffer=profile_buffer,
                 wn_grid=wn_grid,
                 temperatures=temperature_profile.value,
                 pressures=pressure_profile.value,
                 broad_n=broad_n,
                 broad_gamma=broad_gamma,
                 species_mass=self.species_mass,
-                n_bands_used=n_bands_used,
             )
-            self.profile_store.finalise_from_buffer(
-                buffer_abs=buffer_abs,
-                buffer_ste=buffer_ste,
-                buffer_spe=buffer_spe,
-                band_keys=band_keys,
-                save=False,
-                species=self.species,
-            )
-        else:
-            # ------------------------------------------ REGULAR LINE-BY-LINE ------------------------------------------
-            for trans_file in self.trans_files:
-                log.info(f"Processing file {trans_file}.")
-                if str(trans_file).endswith(".parquet"):
-                    with pq.ParquetFile(trans_file) as pq_file:
-                        batch_iter = pq_file.iter_batches(
-                            batch_size=parquet_batch_size,
-                            columns=trans_columns,
-                            use_threads=True,
-                        )
-                        for arrow_batch in batch_iter:
-                            trans_batch = pl.from_arrow(arrow_batch)
-                            trans_batch = (
-                                trans_batch
-                                .with_columns([
-                                    pl.col("id_i").cast(pl.Int32),
-                                    pl.col("id_f").cast(pl.Int32),
-                                ])
-                                .join(states_i, on="id_i", how="inner")
-                                .join(states_f, on="id_f", how="inner")
-                                .with_columns(
-                                    (pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi")
-                                )
-                                .filter(
-                                    (pl.col("energy_fi") >= wn_min)
-                                    & (pl.col("energy_fi") <= wn_max)
-                                )
-                                .sort(["id_agg_f", "id_agg_i"])
-                                .fill_null(strategy="zero")
-                            )
-                            if trans_batch.height == 0:
-                                log.info("No valid trans in batch.")
-                                continue
-
-                            profile_buffer, band_id_f, band_id_i, agg_batch = _process_trans_batch_layered(
-                                trans_batch=trans_batch,
-                                n_frac_lookup=n_frac_lookup,
-                                g_lookup=g_lookup,
-                                tau_lookup=tau_lookup,
-                                broad_n=broad_n,
-                                broad_gamma=broad_gamma,
-                                species_mass=self.species_mass,
-                                wn_grid=wn_grid.value,
-                                n_lte_layers=self.n_lte_layers,
-                                n_layers=self.n_layers,
-                                temperature_profile=temperature_slice,
-                                pressure_profile=pressure_slice,
-                            )
-                            if profile_buffer is not None:
-                                add_batch_time = time.perf_counter()
-                                self.profile_store.add_batch(
-                                    profile_buffer=profile_buffer, band_id_f=band_id_f, band_id_i=band_id_i
-                                )
-                                log.info(f"Add batch time = {time.perf_counter() - add_batch_time:.3f}.")
-
-                            if agg_batch is not None:
-                                rates_list.append(agg_batch)
-                else:
-                    # ExoMol format text files (*.trans files from website).
-                    ddf = dd.read_csv(
-                        trans_file,
-                        sep=r"\s+",
-                        engine="python",
-                        header=None,
-                        names=trans_columns,
-                        usecols=[0, 1, 2],
-                        dtype=dask_dtypes,
-                        blocksize=dask_blocksize,
-                    )
-                    for delayed_batch in ddf.to_delayed():
-                        trans_batch = pl.from_pandas(delayed_batch.compute())
-                        trans_batch = (
-                            trans_batch
-                            .with_columns([
-                                pl.col("id_i").cast(pl.Int32),
-                                pl.col("id_f").cast(pl.Int32),
-                            ])
-                            .join(states_i, on="id_i", how="inner")
-                            .join(states_f, on="id_f", how="inner")
-                            .with_columns((pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi"))
-                            .filter(
-                                (pl.col("energy_fi") >= wn_min)
-                                & (pl.col("energy_fi") <= wn_max)
-                            )
-                            .sort(["id_agg_f", "id_agg_i"])
-                            .fill_null(strategy="zero")
-                        )
-                        if trans_batch.height == 0:
-                            continue
-
-                        profile_buffer, band_id_f, band_id_i, agg_batch = _process_trans_batch_layered(
-                            trans_batch=trans_batch,
-                            n_frac_lookup=n_frac_lookup,
-                            g_lookup=g_lookup,
-                            tau_lookup=tau_lookup,
-                            broad_n=broad_n,
-                            broad_gamma=broad_gamma,
-                            species_mass=self.species_mass,
-                            wn_grid=wn_grid.value,
-                            n_lte_layers=self.n_lte_layers,
-                            n_layers=self.n_layers,
-                            temperature_profile=temperature_slice,
-                            pressure_profile=pressure_slice,
-                        )
-                        if profile_buffer is not None:
-                            add_batch_time = time.perf_counter()
-                            self.profile_store.add_batch(
-                                profile_buffer=profile_buffer, band_id_f=band_id_f, band_id_i=band_id_i
-                            )
-                            log.info(f"Add batch time = {time.perf_counter() - add_batch_time:.3f}.")
-
-                        if agg_batch is not None:
-                            rates_list.append(agg_batch)
-            # Finalise profile store for line-by-line accumulators.
-            self.profile_store.finalise(save=False, species=self.species)
+        # Old
+        # if self.do_super_lines:
+        #     # ---------------------------------------------- SUPER-LINES ----------------------------------------------
+        #     # Bin edges for finding trans bins.
+        #     wn_arr = wn_grid.value
+        #     bin_edges = np.empty(n_grid + 1, dtype=np.float64)
+        #     bin_edges[0] = wn_arr[0] - (wn_arr[1] - wn_arr[0]) * 0.5
+        #     for j in range(1, n_grid):
+        #         bin_edges[j] = (wn_arr[j - 1] + wn_arr[j]) * 0.5
+        #     bin_edges[-1] = wn_arr[-1] + (wn_arr[-1] - wn_arr[-2]) * 0.5
+        #     for trans_file in self.trans_files:
+        #         log.info(f"Processing file {trans_file}.")
+        #         # Preprocessed Parquet files (MUCH faster).
+        #         if str(trans_file).endswith(".parquet"):
+        #             with pq.ParquetFile(trans_file) as pq_file:
+        #                 batch_iter = pq_file.iter_batches(
+        #                     batch_size=parquet_batch_size,
+        #                     columns=trans_columns,
+        #                     use_threads=True,
+        #                 )
+        #                 for arrow_batch in batch_iter:
+        #                     trans_batch = pl.from_arrow(arrow_batch)
+        #                     start_time = time.perf_counter()
+        #                     trans_batch = (
+        #                         trans_batch
+        #                         .with_columns([
+        #                             pl.col("id_i").cast(pl.Int32),
+        #                             pl.col("id_f").cast(pl.Int32),
+        #                         ])
+        #                         .join(states_i, on="id_i", how="inner")
+        #                         .join(states_f, on="id_f", how="inner")
+        #                         .with_columns(
+        #                             (pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi")
+        #                         )
+        #                         .filter(
+        #                             (pl.col("energy_fi") >= wn_min)
+        #                             & (pl.col("energy_fi") <= wn_max)
+        #                         )
+        #                         # .sort(["id_agg_f", "id_agg_i"])
+        #                     )
+        #                     log.info(f"Polars duration = {time.perf_counter() - start_time}.")
+        #                     if trans_batch.height == 0:
+        #                         log.info("No valid trans in batch.")
+        #                         continue
+        #                     # Extract numpy arrays.
+        #                     start_time = time.perf_counter()
+        #                     id_i = np.ascontiguousarray(trans_batch["id_i"].to_numpy())
+        #                     id_f = np.ascontiguousarray(trans_batch["id_f"].to_numpy())
+        #                     a_fi = np.ascontiguousarray(trans_batch["A_fi"].to_numpy())
+        #
+        #                     energy_fi = trans_batch["energy_fi"].to_numpy()
+        #                     abs_ste_prefactor = np.ascontiguousarray(a_fi / (const_8_pi_c * energy_fi ** 2))
+        #                     spe_prefactor = np.ascontiguousarray(a_fi * energy_fi * const_h_c_on_4_pi)
+        #
+        #                     log.info(f"Extraction duration = {time.perf_counter() - start_time}.")
+        #                     # Get bin indices per transition.
+        #                     bin_indices = np.searchsorted(bin_edges, energy_fi, side="right") - 1
+        #                     bin_indices = np.clip(bin_indices, 0, n_grid - 1, dtype=np.int32)
+        #                     bin_indices = np.ascontiguousarray(bin_indices)
+        #
+        #                     start_time = time.perf_counter()
+        #                     batch_bands = trans_batch.select(["id_agg_f", "id_agg_i"])
+        #                     if band_registry.height == 0:
+        #                         new_keys = batch_bands.unique()
+        #                     else:
+        #                         new_keys = batch_bands.unique().join(
+        #                             band_registry, on=["id_agg_f", "id_agg_i"], how="anti"
+        #                         )
+        #                     if new_keys.height > 0:
+        #                         # Generate sequential indices starting right from n_bands_used.
+        #                         new_keys = (
+        #                             new_keys
+        #                             .with_row_index(name="band_idx", offset=n_bands_used)
+        #                             .with_columns(pl.col("band_idx").cast(pl.Int32))
+        #                             .select(band_registry_cols)
+        #                         )
+        #                         # Update global counter.
+        #                         n_bands_used += new_keys.height
+        #                         # Dynamically resize buffer if exceeding bands number threshold.
+        #                         if n_bands_used > n_bands_max:
+        #                             # Grow exactly by what you need
+        #                             needed_extra = max(n_bands_used - n_bands_max, n_bands_max)
+        #                             extra = np.zeros((3, needed_extra, n_nlte_layers, n_grid), dtype=np.float64)
+        #                             profile_buffer = np.concatenate([profile_buffer, extra], axis=1)
+        #                             # n_bands_max *= 2  # Overkill.
+        #                             n_bands_max += needed_extra
+        #                         # Update the global registry dataframe
+        #                         band_registry = pl.concat([band_registry, new_keys])
+        #                     mapped_batch = batch_bands.join(
+        #                         band_registry, on=["id_agg_f", "id_agg_i"], how="left"
+        #                     )
+        #                     band_indices = np.ascontiguousarray(mapped_batch["band_idx"].to_numpy().copy())
+        #                     log.info(f"Band indices duration = {time.perf_counter() - start_time}.")
+        #                     log.info(f"Accumulating {trans_batch.height} transitions.")
+        #                     # Write all transitions to respective bins.
+        #                     start_time = time.perf_counter()
+        #                     _accumulate_superline_band_batch(
+        #                         profile_buffer=profile_buffer,
+        #                         band_indices=band_indices,
+        #                         bin_indices=bin_indices,
+        #                         g_lookup=g_lookup,
+        #                         abs_ste_prefactor=abs_ste_prefactor,
+        #                         spe_prefactor=spe_prefactor,
+        #                         id_i=id_i,
+        #                         id_f=id_f,
+        #                         n_frac_lookup=n_frac_lookup,
+        #                     )
+        #                     log.info(f"Accumulate duration = {time.perf_counter() - start_time}.")
+        #                     # Do rates for batch.
+        #                     trans_batch_rates = trans_batch.filter(pl.col("id_agg_f") != pl.col("id_agg_i"))
+        #                     if trans_batch_rates.height > 0:
+        #                         b_fi, b_if = calc_einstein_bs(
+        #                             id_i=np.ascontiguousarray(trans_batch_rates["id_i"].to_numpy()),
+        #                             id_f=np.ascontiguousarray(trans_batch_rates["id_f"].to_numpy()),
+        #                             a_fi=np.ascontiguousarray(trans_batch_rates["A_fi"].to_numpy()),
+        #                             energy_fi=np.ascontiguousarray(
+        #                                 (trans_batch_rates["energy_fi"].to_numpy() << 1 / u.cm)
+        #                                 .to(u.Hz, equivalencies=u.spectral()).value
+        #                             ),
+        #                             g_lookup=g_lookup
+        #                         )
+        #                         agg_batch = (
+        #                             trans_batch_rates
+        #                             .with_columns([
+        #                                 pl.Series("B_fi", b_fi),
+        #                                 pl.Series("B_if", b_if),
+        #                             ])
+        #                             .group_by(["id_agg_f", "id_agg_i"])
+        #                             .agg([
+        #                                 pl.col("A_fi").sum(),
+        #                                 pl.col("B_fi").sum(),
+        #                                 pl.col("B_if").sum(),
+        #                             ])
+        #                         )
+        #                         rates_list.append(agg_batch)
+        #         else:
+        #             # ExoMol format text files (*.trans files from website).
+        #             ddf = dd.read_csv(
+        #                 trans_file,
+        #                 sep=r"\s+",
+        #                 engine="python",
+        #                 header=None,
+        #                 names=trans_columns,
+        #                 usecols=[0, 1, 2],
+        #                 dtype=dask_dtypes,
+        #                 blocksize=dask_blocksize,
+        #             )
+        #             for delayed_batch in ddf.to_delayed():
+        #                 trans_batch = pl.from_pandas(delayed_batch.compute())
+        #                 trans_batch = (
+        #                     trans_batch
+        #                     .with_columns([
+        #                         pl.col("id_i").cast(pl.Int32),
+        #                         pl.col("id_f").cast(pl.Int32),
+        #                     ])
+        #                     .join(states_i, on="id_i", how="inner")
+        #                     .join(states_f, on="id_f", how="inner")
+        #                     .with_columns(
+        #                         (pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi")
+        #                     )
+        #                     .filter(
+        #                         (pl.col("energy_fi") >= wn_min)
+        #                         & (pl.col("energy_fi") <= wn_max)
+        #                     )
+        #                     # .sort(["id_agg_f", "id_agg_i"])
+        #                 )
+        #                 if trans_batch.height == 0:
+        #                     continue
+        #                 # Extract numpy arrays.
+        #                 id_i = np.ascontiguousarray(trans_batch["id_i"].to_numpy())
+        #                 id_f = np.ascontiguousarray(trans_batch["id_f"].to_numpy())
+        #                 a_fi = trans_batch["A_fi"].to_numpy()
+        #
+        #                 energy_fi = trans_batch["energy_fi"].to_numpy()
+        #                 abs_ste_prefactor = np.ascontiguousarray(a_fi / (const_8_pi_c * energy_fi ** 2))
+        #                 spe_prefactor = np.ascontiguousarray(a_fi * energy_fi * const_h_c_on_4_pi)
+        #
+        #                 # Get bin indices per transition.
+        #                 bin_indices = np.searchsorted(bin_edges, energy_fi, side="right") - 1
+        #                 bin_indices = np.clip(bin_indices, 0, n_grid - 1, dtype=np.int32)
+        #                 bin_indices = np.ascontiguousarray(bin_indices)
+        #
+        #                 batch_bands = trans_batch.select(["id_agg_f", "id_agg_i"])
+        #                 if band_registry.height == 0:
+        #                     new_keys = batch_bands.unique()
+        #                 else:
+        #                     new_keys = batch_bands.unique().join(
+        #                         band_registry, on=["id_agg_f", "id_agg_i"], how="anti"
+        #                     )
+        #                 if new_keys.height > 0:
+        #                     # Generate sequential indices starting right from n_bands_used.
+        #                     new_keys = (
+        #                         new_keys
+        #                         .with_row_index(name="band_idx", offset=n_bands_used)
+        #                         .with_columns(pl.col("band_idx").cast(pl.Int32))
+        #                         .select(band_registry_cols)
+        #                     )
+        #                     # Update your global counter
+        #                     n_bands_used += new_keys.height
+        #                     # Dynamically resize buffer if exceeding bands number threshold.
+        #                     if n_bands_used > n_bands_max:
+        #                         # Grow exactly by what you need
+        #                         needed_extra = max(n_bands_used - n_bands_max, n_bands_max)
+        #                         extra = np.zeros((3, needed_extra, n_nlte_layers, n_grid), dtype=np.float64)
+        #                         profile_buffer = np.concatenate([profile_buffer, extra], axis=1)
+        #                         # n_bands_max *= 2  # Overkill.
+        #                         n_bands_max += needed_extra
+        #                     # Update the global registry dataframe
+        #                     band_registry = pl.concat([band_registry, new_keys])
+        #                 mapped_batch = batch_bands.join(
+        #                     band_registry, on=["id_agg_f", "id_agg_i"], how="left"
+        #                 )
+        #                 band_indices = np.ascontiguousarray(mapped_batch["band_idx"].to_numpy().copy())
+        #                 # Write all transitions to respective bins.
+        #                 _accumulate_superline_band_batch(
+        #                     profile_buffer=profile_buffer,
+        #                     band_indices=band_indices,
+        #                     bin_indices=bin_indices,
+        #                     g_lookup=g_lookup,
+        #                     abs_ste_prefactor=abs_ste_prefactor,
+        #                     spe_prefactor=spe_prefactor,
+        #                     id_i=id_i,
+        #                     id_f=id_f,
+        #                     n_frac_lookup=n_frac_lookup,
+        #                 )
+        #                 trans_batch_rates = trans_batch.filter(pl.col("id_agg_f") != pl.col("id_agg_i"))
+        #                 # Do rates for batch.
+        #                 if trans_batch_rates.height > 0:
+        #                     b_fi, b_if = calc_einstein_bs(
+        #                         id_i=np.ascontiguousarray(trans_batch_rates["id_i"].to_numpy()),
+        #                         id_f=np.ascontiguousarray(trans_batch_rates["id_f"].to_numpy()),
+        #                         a_fi=np.ascontiguousarray(trans_batch_rates["A_fi"].to_numpy()),
+        #                         energy_fi=np.ascontiguousarray(
+        #                             (trans_batch_rates["energy_fi"].to_numpy() << 1 / u.cm)
+        #                             .to(u.Hz, equivalencies=u.spectral()).value
+        #                         ),
+        #                         g_lookup=g_lookup
+        #                     )
+        #                     agg_batch = (
+        #                         trans_batch_rates
+        #                         .with_columns([
+        #                             pl.Series("B_fi", b_fi),
+        #                             pl.Series("B_if", b_if),
+        #                         ])
+        #                         .group_by(["id_agg_f", "id_agg_i"])
+        #                         .agg([
+        #                             pl.col("A_fi").sum(),
+        #                             pl.col("B_fi").sum(),
+        #                             pl.col("B_if").sum(),
+        #                         ])
+        #                     )
+        #                     rates_list.append(agg_batch)
+        #     # Apply broadening to buffers.
+        #     profile_buffer = profile_buffer[:, :n_bands_used, :, :]
+        #     profile_buffer = _broaden_superline_band_buffer(
+        #         profile_buffer=profile_buffer,
+        #         wn_grid=wn_grid,
+        #         temperatures=temperature_profile.value,
+        #         pressures=pressure_profile.value,
+        #         broad_n=broad_n,
+        #         broad_gamma=broad_gamma,
+        #         species_mass=self.species_mass,
+        #     )
+        # else:
+        #     # ------------------------------------------ REGULAR LINE-BY-LINE ------------------------------------------
+        #     for trans_file in self.trans_files:
+        #         log.info(f"Processing file {trans_file}.")
+        #         if str(trans_file).endswith(".parquet"):
+        #             with pq.ParquetFile(trans_file) as pq_file:
+        #                 batch_iter = pq_file.iter_batches(
+        #                     batch_size=parquet_batch_size,
+        #                     columns=trans_columns,
+        #                     use_threads=True,
+        #                 )
+        #                 for arrow_batch in batch_iter:
+        #                     trans_batch = pl.from_arrow(arrow_batch)
+        #                     trans_batch = (
+        #                         trans_batch
+        #                         .with_columns([
+        #                             pl.col("id_i").cast(pl.Int32),
+        #                             pl.col("id_f").cast(pl.Int32),
+        #                         ])
+        #                         .join(states_i, on="id_i", how="inner")
+        #                         .join(states_f, on="id_f", how="inner")
+        #                         .with_columns(
+        #                             (pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi")
+        #                         )
+        #                         .filter(
+        #                             (pl.col("energy_fi") >= wn_min)
+        #                             & (pl.col("energy_fi") <= wn_max)
+        #                         )
+        #                         .sort(["id_agg_f", "id_agg_i"])
+        #                         .fill_null(strategy="zero")
+        #                     )
+        #                     if trans_batch.height == 0:
+        #                         log.info("No valid trans in batch.")
+        #                         continue
+        #
+        #                     batch_bands = trans_batch.select(["id_agg_f", "id_agg_i"])
+        #                     if band_registry.height == 0:
+        #                         new_keys = batch_bands.unique()
+        #                     else:
+        #                         new_keys = batch_bands.unique().join(
+        #                             band_registry, on=["id_agg_f", "id_agg_i"], how="anti"
+        #                         )
+        #                     if new_keys.height > 0:
+        #                         # Generate sequential indices starting right from n_bands_used.
+        #                         new_keys = (
+        #                             new_keys
+        #                             .with_row_index(name="band_idx", offset=n_bands_used)
+        #                             .with_columns(pl.col("band_idx").cast(pl.Int32))
+        #                             .select(band_registry_cols)
+        #                         )
+        #                         # Update your global counter
+        #                         n_bands_used += new_keys.height
+        #                         # Dynamically resize buffer if exceeding bands number threshold.
+        #                         if n_bands_used > n_bands_max:
+        #                             # Grow exactly by what you need
+        #                             needed_extra = max(n_bands_used - n_bands_max, n_bands_max)
+        #                             extra = np.zeros((3, needed_extra, n_nlte_layers, n_grid), dtype=np.float64)
+        #                             profile_buffer = np.concatenate([profile_buffer, extra], axis=1)
+        #                             # n_bands_max *= 2  # Overkill.
+        #                             n_bands_max += needed_extra
+        #                         # Update the global registry dataframe
+        #                         band_registry = pl.concat([band_registry, new_keys])
+        #                     mapped_batch = batch_bands.join(
+        #                         band_registry, on=["id_agg_f", "id_agg_i"], how="left"
+        #                     )
+        #                     band_indices = np.ascontiguousarray(mapped_batch["band_idx"].to_numpy().copy())
+        #
+        #                     agg_batch = _process_trans_batch_layered(
+        #                         trans_batch=trans_batch,
+        #                         profile_buffer=profile_buffer,
+        #                         band_indices=band_indices,
+        #                         n_frac_lookup=n_frac_lookup,
+        #                         g_lookup=g_lookup,
+        #                         tau_lookup=tau_lookup,
+        #                         broad_n=broad_n,
+        #                         broad_gamma=broad_gamma,
+        #                         species_mass=self.species_mass,
+        #                         wn_grid=wn_grid.value,
+        #                         temperature_profile=temperature_slice,
+        #                         pressure_profile=pressure_slice,
+        #                     )
+        #                     # if profile_buffer is not None:
+        #                     #     add_batch_time = time.perf_counter()
+        #                     #     self.profile_store.add_batch(
+        #                     #         profile_buffer=profile_buffer, band_id_f=band_id_f, band_id_i=band_id_i
+        #                     #     )
+        #                     #     log.info(f"Add batch time = {time.perf_counter() - add_batch_time:.3f}.")
+        #
+        #                     if agg_batch is not None:
+        #                         rates_list.append(agg_batch)
+        #         else:
+        #             # ExoMol format text files (*.trans files from website).
+        #             ddf = dd.read_csv(
+        #                 trans_file,
+        #                 sep=r"\s+",
+        #                 engine="python",
+        #                 header=None,
+        #                 names=trans_columns,
+        #                 usecols=[0, 1, 2],
+        #                 dtype=dask_dtypes,
+        #                 blocksize=dask_blocksize,
+        #             )
+        #             for delayed_batch in ddf.to_delayed():
+        #                 trans_batch = pl.from_pandas(delayed_batch.compute())
+        #                 trans_batch = (
+        #                     trans_batch
+        #                     .with_columns([
+        #                         pl.col("id_i").cast(pl.Int32),
+        #                         pl.col("id_f").cast(pl.Int32),
+        #                     ])
+        #                     .join(states_i, on="id_i", how="inner")
+        #                     .join(states_f, on="id_f", how="inner")
+        #                     .with_columns((pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi"))
+        #                     .filter(
+        #                         (pl.col("energy_fi") >= wn_min)
+        #                         & (pl.col("energy_fi") <= wn_max)
+        #                     )
+        #                     .sort(["id_agg_f", "id_agg_i"])
+        #                     .fill_null(strategy="zero")
+        #                 )
+        #                 if trans_batch.height == 0:
+        #                     continue
+        #
+        #                 batch_bands = trans_batch.select(["id_agg_f", "id_agg_i"])
+        #                 if band_registry.height == 0:
+        #                     new_keys = batch_bands.unique()
+        #                 else:
+        #                     new_keys = batch_bands.unique().join(
+        #                         band_registry, on=["id_agg_f", "id_agg_i"], how="anti"
+        #                     )
+        #                 if new_keys.height > 0:
+        #                     # Generate sequential indices starting right from n_bands_used.
+        #                     new_keys = (
+        #                         new_keys
+        #                         .with_row_index(name="band_idx", offset=n_bands_used)
+        #                         .with_columns(pl.col("band_idx").cast(pl.Int32))
+        #                         .select(band_registry_cols)
+        #                     )
+        #                     # Update your global counter
+        #                     n_bands_used += new_keys.height
+        #                     # Dynamically resize buffer if exceeding bands number threshold.
+        #                     if n_bands_used > n_bands_max:
+        #                         # Grow exactly by what you need
+        #                         needed_extra = max(n_bands_used - n_bands_max, n_bands_max)
+        #                         extra = np.zeros((3, needed_extra, n_nlte_layers, n_grid), dtype=np.float64)
+        #                         profile_buffer = np.concatenate([profile_buffer, extra], axis=1)
+        #                         # n_bands_max *= 2  # Overkill.
+        #                         n_bands_max += needed_extra
+        #                     # Update the global registry dataframe
+        #                     band_registry = pl.concat([band_registry, new_keys])
+        #                 mapped_batch = batch_bands.join(
+        #                     band_registry, on=["id_agg_f", "id_agg_i"], how="left"
+        #                 )
+        #                 band_indices = np.ascontiguousarray(mapped_batch["band_idx"].to_numpy().copy())
+        #
+        #                 agg_batch = _process_trans_batch_layered(
+        #                     trans_batch=trans_batch,
+        #                     profile_buffer=profile_buffer,
+        #                     band_indices=band_indices,
+        #                     n_frac_lookup=n_frac_lookup,
+        #                     g_lookup=g_lookup,
+        #                     tau_lookup=tau_lookup,
+        #                     broad_n=broad_n,
+        #                     broad_gamma=broad_gamma,
+        #                     species_mass=self.species_mass,
+        #                     wn_grid=wn_grid.value,
+        #                     temperature_profile=temperature_slice,
+        #                     pressure_profile=pressure_slice,
+        #                 )
+        #                 # if profile_buffer is not None:
+        #                 # c    add_batch_time = time.perf_counter()
+        #                 #     self.profile_store.add_batch(
+        #                 #         profile_buffer=profile_buffer, band_id_f=band_id_f, band_id_i=band_id_i
+        #                 #     )
+        #                 #     log.info(f"Add batch time = {time.perf_counter() - add_batch_time:.3f}.")
+        #
+        #                 if agg_batch is not None:
+        #                     rates_list.append(agg_batch)
+        #     profile_buffer = profile_buffer[:, :n_bands_used, :, :]
+        # Finalise profile store from, profile_buffer accumulator.
+        # self.profile_store.finalise(save=False, species=self.species)
+        # Create band-key lookup.
+        band_keys = (
+            band_registry.sort("band_idx")
+            .select(["id_agg_f", "id_agg_i"])
+            .to_numpy()
+        )  # (n_bands_used, 2)
+        log.info(f"{self.species} Band keys = {band_keys}")
+        self.profile_store.finalise_from_buffer(
+            profile_buffer=profile_buffer,
+            band_keys=band_keys,
+            save=False,
+            species=self.species,
+        )
         # Done, finalise list of rates chunks.
         log.info(f"DEBUG: new rates/profiles duration = {time.perf_counter() - process_time:.3f}.")
         # DEBUG!
@@ -2102,9 +2406,7 @@ class NLTEProcessor:
 
         n_nlte_layers = self.n_layers - self.n_lte_layers
         cont_rates_list = []
-        self._cont_profile_store = ContinuumProfileStore(
-            n_layers=n_nlte_layers, n_agg_states=self.n_agg_states, n_grid=len(wn_grid)
-        )
+        self._cont_profile_store = ContinuumProfileStore(n_layers=n_nlte_layers)
 
         trans_columns = ["id_f", "id_i", "A_fi"]
         dask_dtypes = {"id_f": "int64", "id_i": "int64", "A_fi": "float64"}
@@ -2127,8 +2429,18 @@ class NLTEProcessor:
             .select(invariant_cols)
             .rename({col: f"{col}_f" for col in invariant_cols})
         )
+
+        # Grid parameters and buffers.
         wn_min = wn_grid[0]
         wn_max = wn_grid[-1]
+        n_grid = wn_grid.shape[0]
+        # Bin edges for finding trans bins.
+        wn_arr = wn_grid.value
+        bin_edges = np.empty(n_grid + 1, dtype=np.float64)
+        bin_edges[0] = wn_arr[0] - (wn_arr[1] - wn_arr[0]) * 0.5
+        for j in range(1, n_grid):
+            bin_edges[j] = (wn_arr[j - 1] + wn_arr[j]) * 0.5
+        bin_edges[-1] = wn_arr[-1] + (wn_arr[-1] - wn_arr[-2]) * 0.5
 
         # States lookup - much more memory efficient than duplicating it all with polars joins!
         state_ids = states_frac["id"].to_numpy()
@@ -2150,116 +2462,516 @@ class NLTEProcessor:
         v_lookup[state_ids] = states_frac["v"].to_numpy()
         v_lookup = np.ascontiguousarray(v_lookup)
 
+        # Before the batch loop, pre-allocate once.
+        n_bands_max = min(100, self.n_agg_states ** 2)
+
+        # profile_buffer[0] = abs, profile_buffer[1] = broadening.
+        if self.cont_do_super_lines:
+            # Use extra axis to accumulate broadening.
+            profile_buffer = np.zeros((2, n_bands_max, n_nlte_layers, n_grid), dtype=np.float64)
+        else:
+            profile_buffer = np.zeros((1, n_bands_max, n_nlte_layers, n_grid), dtype=np.float64)
+        profile_buffer = np.ascontiguousarray(profile_buffer)
+        n_bands_used = 0
+        band_registry = pl.DataFrame(
+            schema={"id_agg_f": pl.Int32, "id_agg_i": pl.Int32, "band_idx": pl.Int32}
+        )
+        band_registry_cols = band_registry.columns
+
         process_time = time.perf_counter()
         parquet_batch_size = 200_000_000
+
         for cont_trans_file in self.cont_trans_files:
             log.info(f"Processing file {cont_trans_file}.")
-            # Preprocessed Parquet files (MUCH faster).
-            if str(cont_trans_file).endswith(".parquet"):
-                with pq.ParquetFile(cont_trans_file) as pq_file, ThreadPoolExecutor(max_workers=1) as executor:
-                    batch_iter = pq_file.iter_batches(
-                        batch_size=parquet_batch_size,
-                        columns=trans_columns,
-                        use_threads=True,
-                    )
-                    for arrow_batch in batch_iter:
-                        trans_batch = pl.from_arrow(arrow_batch)
-                        trans_batch = (
-                            trans_batch
-                            .with_columns([
-                                pl.col("id_i").cast(pl.Int32),
-                                pl.col("id_f").cast(pl.Int32),
-                            ])
-                            .join(states_i, on="id_i", how="inner")
-                            .join(states_f, on="id_f", how="inner")
-                            .with_columns((pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi"))
-                            .filter(
-                                (pl.col("energy_fi") >= wn_min)
-                                & (pl.col("energy_fi") <= wn_max)
-                            )
-                            .sort(["id_agg_f", "id_agg_i"])
-                            # .fill_null(strategy="zero")
-                        )
-                        if trans_batch.height == 0:
-                            continue
-
-                        profile_buffer, band_id_f, band_id_i, agg_batch = _process_continuum_trans_batch_layered(
-                            trans_batch=trans_batch,
-                            n_frac_lookup=n_frac_lookup,
-                            g_lookup=g_lookup,
-                            v_lookup=v_lookup,
-                            species_mass=self.species_mass,
-                            wn_grid=wn_grid.value,
-                            n_lte_layers=self.n_lte_layers,
-                            n_layers=self.n_layers,
-                            cont_box_length=self.cont_box_length,
-                            temperature_profile=temperature_slice,
-                        )
-                        if profile_buffer is not None:
-                            add_batch_time = time.perf_counter()
-                            self._cont_profile_store.add_batch(
-                                profile_buffer=profile_buffer, band_id_f=band_id_f, band_id_i=band_id_i
-                            )
-                            log.info(f"Add batch time = {time.perf_counter() - add_batch_time:.3f}.")
-
-                        if agg_batch is not None:
-                            cont_rates_list.append(agg_batch)
-            else:
-                # ExoMol format text files (*.trans files from website).
-                ddf = dd.read_csv(
-                    cont_trans_file,
-                    sep=r"\s+",
-                    engine="python",
-                    header=None,
-                    names=trans_columns,
-                    usecols=[0, 1, 2],
-                    dtype=dask_dtypes,
-                    blocksize=dask_blocksize,
+            for trans_batch in _iter_trans_batches(
+                    trans_file=cont_trans_file,
+                    trans_columns=trans_columns,
+                    states_i=states_i,
+                    states_f=states_f,
+                    wn_min=wn_min,
+                    wn_max=wn_max,
+                    parquet_batch_size=parquet_batch_size,
+                    dask_blocksize=dask_blocksize,
+                    dask_dtypes=dask_dtypes,
+            ):
+                if trans_batch.height == 0:
+                    log.info("No valid trans in batch.")
+                    continue
+                # Assign new band indices to any new bands; extend profile buffer if needed.
+                band_registry, profile_buffer, n_bands_used, n_bands_max, band_indices = _update_band_registry(
+                    trans_batch=trans_batch,
+                    band_registry=band_registry,
+                    band_registry_cols=band_registry_cols,
+                    profile_buffer=profile_buffer,
+                    n_bands_used=n_bands_used,
+                    n_bands_max=n_bands_max,
                 )
-                for delayed_batch in ddf.to_delayed():
-                    trans_batch = pl.from_pandas(delayed_batch.compute())
-                    trans_batch = (
-                        trans_batch
-                        .with_columns([
-                            pl.col("id_i").cast(pl.Int32),
-                            pl.col("id_f").cast(pl.Int32),
-                        ])
-                        .join(states_i, on="id_i", how="inner")
-                        .join(states_f, on="id_f", how="inner")
-                        .with_columns((pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi"))
-                        .filter(
-                            (pl.col("energy_fi") >= wn_min)
-                            & (pl.col("energy_fi") <= wn_max)
-                        )
-                        .sort(["id_agg_f", "id_agg_i"])
-                        # .fill_null(strategy="zero")
+                if self.cont_do_super_lines:
+                    energy_fi = trans_batch["energy_fi"].to_numpy()
+                    a_fi = np.ascontiguousarray(trans_batch["A_fi"].to_numpy())
+                    bin_indices = np.ascontiguousarray(np.clip(
+                            np.searchsorted(bin_edges, energy_fi, side="right") - 1,
+                            0,
+                            n_grid - 1,
+                            dtype=np.int32
+                    ))
+                    _accumulate_continuum_superline_band_batch(
+                        profile_buffer=profile_buffer,
+                        band_indices=band_indices,
+                        bin_indices=bin_indices,
+                        n_frac_lookup=n_frac_lookup,
+                        g_lookup=g_lookup,
+                        v_lookup=v_lookup,
+                        abs_prefactor=np.ascontiguousarray(a_fi / (const_8_pi_c * energy_fi ** 2)),
+                        id_i=np.ascontiguousarray(trans_batch["id_i"].to_numpy()),
+                        id_f=np.ascontiguousarray(trans_batch["id_f"].to_numpy()),
+                        reduced_mass=self.reduced_mass,
+                        box_length=self.cont_box_length,
                     )
-                    if trans_batch.height == 0:
-                        continue
-
-                    profile_buffer, band_id_f, band_id_i, agg_batch = _process_continuum_trans_batch_layered(
+                else:
+                    _process_continuum_trans_batch_layered(
                         trans_batch=trans_batch,
+                        profile_buffer=profile_buffer,
+                        band_indices=band_indices,
                         n_frac_lookup=n_frac_lookup,
                         g_lookup=g_lookup,
                         v_lookup=v_lookup,
                         species_mass=self.species_mass,
-                        wn_grid=wn_grid.value,
-                        n_lte_layers=self.n_lte_layers,
-                        n_layers=self.n_layers,
+                        reduced_mass=self.reduced_mass,
                         cont_box_length=self.cont_box_length,
+                        wn_grid=wn_grid.value,
                         temperature_profile=temperature_slice,
                     )
-                    if profile_buffer is not None:
-                        add_batch_time = time.perf_counter()
-                        self._cont_profile_store.add_batch(
-                            profile_buffer=profile_buffer, band_id_f=band_id_f, band_id_i=band_id_i
-                        )
-                        log.info(f"Add batch time = {time.perf_counter() - add_batch_time:.3f}.")
-
-                    if agg_batch is not None:
-                        cont_rates_list.append(agg_batch)
+                # Do rates for batch - same regardless of line processing strategy.
+                agg_batch = _compute_agg_rates(trans_batch, g_lookup)
+                if agg_batch is not None:
+                    cont_rates_list.append(agg_batch)
+        # Contract the buffer based on n_bands_used, drop superfluous rows.
+        profile_buffer = profile_buffer[:, :n_bands_used, :, :]
+        if self.do_super_lines:
+            profile_buffer = _broaden_continuum_superline_band_buffer(
+                profile_buffer=profile_buffer,
+                wn_grid=wn_grid,
+                temperatures=temperature_profile.value,
+                species_mass=self.species_mass,
+            )
+        # if self.do_super_lines:
+        #     # ---------------------------------------------- SUPER-LINES ----------------------------------------------
+        #     # Bin edges for finding trans bins.
+        #     wn_arr = wn_grid.value
+        #     bin_edges = np.empty(n_grid + 1, dtype=np.float64)
+        #     bin_edges[0] = wn_arr[0] - (wn_arr[1] - wn_arr[0]) * 0.5
+        #     for j in range(1, n_grid):
+        #         bin_edges[j] = (wn_arr[j - 1] + wn_arr[j]) * 0.5
+        #     bin_edges[-1] = wn_arr[-1] + (wn_arr[-1] - wn_arr[-2]) * 0.5
+        #     for cont_trans_file in self.cont_trans_files:
+        #         log.info(f"Processing file {cont_trans_file}.")
+        #         if str(cont_trans_file).endswith(".parquet"):
+        #             with pq.ParquetFile(cont_trans_file) as pq_file, ThreadPoolExecutor(max_workers=1) as executor:
+        #                 batch_iter = pq_file.iter_batches(
+        #                     batch_size=parquet_batch_size,
+        #                     columns=trans_columns,
+        #                     use_threads=True,
+        #                 )
+        #                 for arrow_batch in batch_iter:
+        #                     trans_batch = pl.from_arrow(arrow_batch)
+        #                     trans_batch = (
+        #                         trans_batch
+        #                         .with_columns([
+        #                             pl.col("id_i").cast(pl.Int32),
+        #                             pl.col("id_f").cast(pl.Int32),
+        #                         ])
+        #                         .join(states_i, on="id_i", how="inner")
+        #                         .join(states_f, on="id_f", how="inner")
+        #                         .with_columns((pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi"))
+        #                         .filter(
+        #                             (pl.col("energy_fi") >= wn_min)
+        #                             & (pl.col("energy_fi") <= wn_max)
+        #                         )
+        #                         .sort(["id_agg_f", "id_agg_i"])
+        #                     )
+        #                     if trans_batch.height == 0:
+        #                         continue
+        #                     # Extract numpy arrays.
+        #                     id_i = np.ascontiguousarray(trans_batch["id_i"].to_numpy())
+        #                     id_f = np.ascontiguousarray(trans_batch["id_f"].to_numpy())
+        #                     a_fi = np.ascontiguousarray(trans_batch["A_fi"].to_numpy())
+        #
+        #                     energy_fi = trans_batch["energy_fi"].to_numpy()
+        #                     abs_prefactor = np.ascontiguousarray(a_fi / (const_8_pi_c * energy_fi ** 2))
+        #
+        #                     # Get bin indices per transition.
+        #                     bin_indices = np.searchsorted(bin_edges, energy_fi, side="right") - 1
+        #                     bin_indices = np.clip(bin_indices, 0, n_grid - 1, dtype=np.int32)
+        #                     bin_indices = np.ascontiguousarray(bin_indices)
+        #
+        #                     batch_bands = trans_batch.select(["id_agg_f", "id_agg_i"])
+        #                     if band_registry.height == 0:
+        #                         new_keys = batch_bands.unique()
+        #                     else:
+        #                         new_keys = batch_bands.unique().join(
+        #                             band_registry, on=["id_agg_f", "id_agg_i"], how="anti"
+        #                         )
+        #                     if new_keys.height > 0:
+        #                         # Generate sequential indices starting right from n_bands_used.
+        #                         new_keys = (
+        #                             new_keys
+        #                             .with_row_index(name="band_idx", offset=n_bands_used)
+        #                             .with_columns(pl.col("band_idx").cast(pl.Int32))
+        #                             .select(band_registry_cols)
+        #                         )
+        #                         # Update your global counter
+        #                         n_bands_used += new_keys.height
+        #                         # Dynamically resize buffer if exceeding bands number threshold.
+        #                         if n_bands_used > n_bands_max:
+        #                             # Grow exactly by what you need
+        #                             needed_extra = max(n_bands_used - n_bands_max, n_bands_max)
+        #                             extra = np.zeros((3, needed_extra, n_nlte_layers, n_grid), dtype=np.float64)
+        #                             profile_buffer = np.concatenate([profile_buffer, extra], axis=1)
+        #                             # n_bands_max *= 2  # Overkill.
+        #                             n_bands_max += needed_extra
+        #                         # Update the global registry dataframe
+        #                         band_registry = pl.concat([band_registry, new_keys])
+        #                     mapped_batch = batch_bands.join(
+        #                         band_registry, on=["id_agg_f", "id_agg_i"], how="left"
+        #                     )
+        #                     band_indices = np.ascontiguousarray(mapped_batch["band_idx"].to_numpy().copy())
+        #
+        #                     _accumulate_continuum_superline_band_batch(
+        #                         profile_buffer=profile_buffer,
+        #                         band_indices=band_indices,
+        #                         bin_indices=bin_indices,
+        #                         n_frac_lookup=n_frac_lookup,
+        #                         g_lookup=g_lookup,
+        #                         v_lookup=v_lookup,
+        #                         abs_prefactor=abs_prefactor,
+        #                         id_i=id_i,
+        #                         id_f=id_f,
+        #                         reduced_mass=self.reduced_mass,
+        #                         box_length=self.cont_box_length,
+        #                     )
+        #                     trans_batch_rates = trans_batch.filter(pl.col("id_agg_f") != pl.col("id_agg_i"))
+        #                     # Do rates for batch.
+        #                     if trans_batch_rates.height > 0:
+        #                         b_fi, b_if = calc_einstein_bs(
+        #                             id_i=np.ascontiguousarray(trans_batch_rates["id_i"].to_numpy()),
+        #                             id_f=np.ascontiguousarray(trans_batch_rates["id_f"].to_numpy()),
+        #                             a_fi=np.ascontiguousarray(trans_batch_rates["A_fi"].to_numpy()),
+        #                             energy_fi=np.ascontiguousarray(
+        #                                 (trans_batch_rates["energy_fi"].to_numpy() << 1 / u.cm)
+        #                                 .to(u.Hz, equivalencies=u.spectral()).value
+        #                             ),
+        #                             g_lookup=g_lookup
+        #                         )
+        #                         agg_batch = (
+        #                             trans_batch_rates
+        #                             .with_columns([
+        #                                 pl.Series("B_fi", b_fi),
+        #                                 pl.Series("B_if", b_if),
+        #                             ])
+        #                             .group_by(["id_agg_f", "id_agg_i"])
+        #                             .agg([
+        #                                 pl.col("A_fi").sum(),
+        #                                 pl.col("B_fi").sum(),
+        #                                 pl.col("B_if").sum(),
+        #                             ])
+        #                         )
+        #                         cont_rates_list.append(agg_batch)
+        #         else:
+        #             # ExoMol format text files (*.trans files from website).
+        #             ddf = dd.read_csv(
+        #                 cont_trans_file,
+        #                 sep=r"\s+",
+        #                 engine="python",
+        #                 header=None,
+        #                 names=trans_columns,
+        #                 usecols=[0, 1, 2],
+        #                 dtype=dask_dtypes,
+        #                 blocksize=dask_blocksize,
+        #             )
+        #             for delayed_batch in ddf.to_delayed():
+        #                 trans_batch = pl.from_pandas(delayed_batch.compute())
+        #                 trans_batch = (
+        #                     trans_batch
+        #                     .with_columns([
+        #                         pl.col("id_i").cast(pl.Int32),
+        #                         pl.col("id_f").cast(pl.Int32),
+        #                     ])
+        #                     .join(states_i, on="id_i", how="inner")
+        #                     .join(states_f, on="id_f", how="inner")
+        #                     .with_columns((pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi"))
+        #                     .filter(
+        #                         (pl.col("energy_fi") >= wn_min)
+        #                         & (pl.col("energy_fi") <= wn_max)
+        #                     )
+        #                     .sort(["id_agg_f", "id_agg_i"])
+        #                 )
+        #                 if trans_batch.height == 0:
+        #                     continue
+        #                 # Extract numpy arrays.
+        #                 energy_fi = trans_batch["energy_fi"].to_numpy()
+        #                 abs_prefactor = np.ascontiguousarray(a_fi / (const_8_pi_c * energy_fi ** 2))
+        #
+        #                 # Get bin indices per transition.
+        #                 bin_indices = np.searchsorted(bin_edges, energy_fi, side="right") - 1
+        #                 bin_indices = np.clip(bin_indices, 0, n_grid - 1, dtype=np.int32)
+        #                 bin_indices = np.ascontiguousarray(bin_indices)
+        #
+        #                 batch_bands = trans_batch.select(["id_agg_f", "id_agg_i"])
+        #                 if band_registry.height == 0:
+        #                     new_keys = batch_bands.unique()
+        #                 else:
+        #                     new_keys = batch_bands.unique().join(
+        #                         band_registry, on=["id_agg_f", "id_agg_i"], how="anti"
+        #                     )
+        #                 if new_keys.height > 0:
+        #                     # Generate sequential indices starting right from n_bands_used.
+        #                     new_keys = (
+        #                         new_keys
+        #                         .with_row_index(name="band_idx", offset=n_bands_used)
+        #                         .with_columns(pl.col("band_idx").cast(pl.Int32))
+        #                         .select(band_registry_cols)
+        #                     )
+        #                     # Update your global counter
+        #                     n_bands_used += new_keys.height
+        #                     # Dynamically resize buffer if exceeding bands number threshold.
+        #                     if n_bands_used > n_bands_max:
+        #                         # Grow exactly by what you need
+        #                         needed_extra = max(n_bands_used - n_bands_max, n_bands_max)
+        #                         extra = np.zeros((3, needed_extra, n_nlte_layers, n_grid), dtype=np.float64)
+        #                         profile_buffer = np.concatenate([profile_buffer, extra], axis=1)
+        #                         # n_bands_max *= 2  # Overkill.
+        #                         n_bands_max += needed_extra
+        #                     # Update the global registry dataframe
+        #                     band_registry = pl.concat([band_registry, new_keys])
+        #                 mapped_batch = batch_bands.join(
+        #                     band_registry, on=["id_agg_f", "id_agg_i"], how="left"
+        #                 )
+        #                 band_indices = np.ascontiguousarray(mapped_batch["band_idx"].to_numpy().copy())
+        #
+        #                 _accumulate_continuum_superline_band_batch(
+        #                     profile_buffer=profile_buffer,
+        #                     band_indices=band_indices,
+        #                     bin_indices=bin_indices,
+        #                     n_frac_lookup=n_frac_lookup,
+        #                     g_lookup=g_lookup,
+        #                     v_lookup=v_lookup,
+        #                     abs_prefactor=abs_prefactor,
+        #                     id_i=id_i,
+        #                     id_f=id_f,
+        #                     reduced_mass=self.reduced_mass,
+        #                     box_length=self.cont_box_length,
+        #                 )
+        #                 trans_batch_rates = trans_batch.filter(pl.col("id_agg_f") != pl.col("id_agg_i"))
+        #                 # Do rates for batch.
+        #                 if trans_batch_rates.height > 0:
+        #                     b_fi, b_if = calc_einstein_bs(
+        #                         id_i=np.ascontiguousarray(trans_batch_rates["id_i"].to_numpy()),
+        #                         id_f=np.ascontiguousarray(trans_batch_rates["id_f"].to_numpy()),
+        #                         a_fi=np.ascontiguousarray(trans_batch_rates["A_fi"].to_numpy()),
+        #                         energy_fi=np.ascontiguousarray(
+        #                             (trans_batch_rates["energy_fi"].to_numpy() << 1 / u.cm)
+        #                             .to(u.Hz, equivalencies=u.spectral()).value
+        #                         ),
+        #                         g_lookup=g_lookup
+        #                     )
+        #                     agg_batch = (
+        #                         trans_batch_rates
+        #                         .with_columns([
+        #                             pl.Series("B_fi", b_fi),
+        #                             pl.Series("B_if", b_if),
+        #                         ])
+        #                         .group_by(["id_agg_f", "id_agg_i"])
+        #                         .agg([
+        #                             pl.col("A_fi").sum(),
+        #                             pl.col("B_fi").sum(),
+        #                             pl.col("B_if").sum(),
+        #                         ])
+        #                     )
+        #                     cont_rates_list.append(agg_batch)
+        #     # Apply broadening to buffers.
+        #     profile_buffer = profile_buffer[:, :n_bands_used, :, :]
+        #     profile_buffer = _broaden_continuum_superline_band_buffer(
+        #         profile_buffer=profile_buffer,
+        #         wn_grid=wn_grid,
+        #         temperatures=temperature_profile.value,
+        #         species_mass=self.species_mass,
+        #     )
+        # else:
+        #     # ------------------------------------------ REGULAR LINE-BY-LINE ------------------------------------------
+        #     for cont_trans_file in self.cont_trans_files:
+        #         log.info(f"Processing file {cont_trans_file}.")
+        #         if str(cont_trans_file).endswith(".parquet"):
+        #             with pq.ParquetFile(cont_trans_file) as pq_file, ThreadPoolExecutor(max_workers=1) as executor:
+        #                 batch_iter = pq_file.iter_batches(
+        #                     batch_size=parquet_batch_size,
+        #                     columns=trans_columns,
+        #                     use_threads=True,
+        #                 )
+        #                 for arrow_batch in batch_iter:
+        #                     trans_batch = pl.from_arrow(arrow_batch)
+        #                     trans_batch = (
+        #                         trans_batch
+        #                         .with_columns([
+        #                             pl.col("id_i").cast(pl.Int32),
+        #                             pl.col("id_f").cast(pl.Int32),
+        #                         ])
+        #                         .join(states_i, on="id_i", how="inner")
+        #                         .join(states_f, on="id_f", how="inner")
+        #                         .with_columns((pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi"))
+        #                         .filter(
+        #                             (pl.col("energy_fi") >= wn_min)
+        #                             & (pl.col("energy_fi") <= wn_max)
+        #                         )
+        #                         .sort(["id_agg_f", "id_agg_i"])
+        #                         # .fill_null(strategy="zero")
+        #                     )
+        #                     if trans_batch.height == 0:
+        #                         continue
+        #
+        #                     batch_bands = trans_batch.select(["id_agg_f", "id_agg_i"])
+        #                     if band_registry.height == 0:
+        #                         new_keys = batch_bands.unique()
+        #                     else:
+        #                         new_keys = batch_bands.unique().join(
+        #                             band_registry, on=["id_agg_f", "id_agg_i"], how="anti"
+        #                         )
+        #                     if new_keys.height > 0:
+        #                         # Generate sequential indices starting right from n_bands_used.
+        #                         new_keys = (
+        #                             new_keys
+        #                             .with_row_index(name="band_idx", offset=n_bands_used)
+        #                             .with_columns(pl.col("band_idx").cast(pl.Int32))
+        #                             .select(band_registry_cols)
+        #                         )
+        #                         # Update your global counter
+        #                         n_bands_used += new_keys.height
+        #                         # Dynamically resize buffer if exceeding bands number threshold.
+        #                         if n_bands_used > n_bands_max:
+        #                             # Grow exactly by what you need
+        #                             needed_extra = max(n_bands_used - n_bands_max, n_bands_max)
+        #                             extra = np.zeros((3, needed_extra, n_nlte_layers, n_grid), dtype=np.float64)
+        #                             profile_buffer = np.concatenate([profile_buffer, extra], axis=1)
+        #                             # n_bands_max *= 2  # Overkill.
+        #                             n_bands_max += needed_extra
+        #                         # Update the global registry dataframe
+        #                         band_registry = pl.concat([band_registry, new_keys])
+        #                     mapped_batch = batch_bands.join(
+        #                         band_registry, on=["id_agg_f", "id_agg_i"], how="left"
+        #                     )
+        #                     band_indices = np.ascontiguousarray(mapped_batch["band_idx"].to_numpy().copy())
+        #
+        #                     agg_batch = _process_continuum_trans_batch_layered(
+        #                         trans_batch=trans_batch,
+        #                         profile_buffer=profile_buffer,
+        #                         band_indices=band_indices,
+        #                         n_frac_lookup=n_frac_lookup,
+        #                         g_lookup=g_lookup,
+        #                         v_lookup=v_lookup,
+        #                         species_mass=self.species_mass,
+        #                         wn_grid=wn_grid.value,
+        #                         cont_box_length=self.cont_box_length,
+        #                         temperature_profile=temperature_slice,
+        #                     )
+        #
+        #                     if agg_batch is not None:
+        #                         cont_rates_list.append(agg_batch)
+        #         else:
+        #             # ExoMol format text files (*.trans files from website).
+        #             ddf = dd.read_csv(
+        #                 cont_trans_file,
+        #                 sep=r"\s+",
+        #                 engine="python",
+        #                 header=None,
+        #                 names=trans_columns,
+        #                 usecols=[0, 1, 2],
+        #                 dtype=dask_dtypes,
+        #                 blocksize=dask_blocksize,
+        #             )
+        #             for delayed_batch in ddf.to_delayed():
+        #                 trans_batch = pl.from_pandas(delayed_batch.compute())
+        #                 trans_batch = (
+        #                     trans_batch
+        #                     .with_columns([
+        #                         pl.col("id_i").cast(pl.Int32),
+        #                         pl.col("id_f").cast(pl.Int32),
+        #                     ])
+        #                     .join(states_i, on="id_i", how="inner")
+        #                     .join(states_f, on="id_f", how="inner")
+        #                     .with_columns((pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi"))
+        #                     .filter(
+        #                         (pl.col("energy_fi") >= wn_min)
+        #                         & (pl.col("energy_fi") <= wn_max)
+        #                     )
+        #                     .sort(["id_agg_f", "id_agg_i"])
+        #                     # .fill_null(strategy="zero")
+        #                 )
+        #                 if trans_batch.height == 0:
+        #                     continue
+        #
+        #                 batch_bands = trans_batch.select(["id_agg_f", "id_agg_i"])
+        #                 if band_registry.height == 0:
+        #                     new_keys = batch_bands.unique()
+        #                 else:
+        #                     new_keys = batch_bands.unique().join(
+        #                         band_registry, on=["id_agg_f", "id_agg_i"], how="anti"
+        #                     )
+        #                 if new_keys.height > 0:
+        #                     # Generate sequential indices starting right from n_bands_used.
+        #                     new_keys = (
+        #                         new_keys
+        #                         .with_row_index(name="band_idx", offset=n_bands_used)
+        #                         .with_columns(pl.col("band_idx").cast(pl.Int32))
+        #                         .select(band_registry_cols)
+        #                     )
+        #                     # Update your global counter
+        #                     n_bands_used += new_keys.height
+        #                     # Dynamically resize buffer if exceeding bands number threshold.
+        #                     if n_bands_used > n_bands_max:
+        #                         # Grow exactly by what you need
+        #                         needed_extra = max(n_bands_used - n_bands_max, n_bands_max)
+        #                         extra = np.zeros((3, needed_extra, n_nlte_layers, n_grid), dtype=np.float64)
+        #                         profile_buffer = np.concatenate([profile_buffer, extra], axis=1)
+        #                         # n_bands_max *= 2  # Overkill.
+        #                         n_bands_max += needed_extra
+        #                     # Update the global registry dataframe
+        #                     band_registry = pl.concat([band_registry, new_keys])
+        #                 mapped_batch = batch_bands.join(
+        #                     band_registry, on=["id_agg_f", "id_agg_i"], how="left"
+        #                 )
+        #                 band_indices = np.ascontiguousarray(mapped_batch["band_idx"].to_numpy().copy())
+        #
+        #                 agg_batch = _process_continuum_trans_batch_layered(
+        #                     trans_batch=trans_batch,
+        #                     profile_buffer=profile_buffer,
+        #                     band_indices=band_indices,
+        #                     n_frac_lookup=n_frac_lookup,
+        #                     g_lookup=g_lookup,
+        #                     v_lookup=v_lookup,
+        #                     species_mass=self.species_mass,
+        #                     wn_grid=wn_grid.value,
+        #                     cont_box_length=self.cont_box_length,
+        #                     temperature_profile=temperature_slice,
+        #                 )
+        #
+        #                 if agg_batch is not None:
+        #                     cont_rates_list.append(agg_batch)
+        #     profile_buffer = profile_buffer[:, :n_bands_used, :, :]
+        # Finalise profile store from, profile_buffer accumulator.
+        # self._cont_profile_store.finalise()
+        # Create band-key lookup.
+        band_keys = (
+            band_registry.sort("band_idx")
+            .select(["id_agg_f", "id_agg_i"])
+            .to_numpy()
+        )  # (n_bands_used, 2)
+        self._cont_profile_store.finalise_from_buffer(
+            profile_buffer=profile_buffer,
+            band_keys=band_keys,
+            save=False,
+            species=self.species,
+        )
         log.info(f"DEBUG: new cont. rates/profiles duration = {time.perf_counter() - process_time:.3f}.")
-        self._cont_profile_store.finalise()
 
         if len(cont_rates_list) > 0:
             self._cont_rates = pl.concat(cont_rates_list)
@@ -2505,11 +3217,10 @@ class NLTEProcessor:
         )
         # log.info(f"T_ex DEBUG: C_if = {c_if_approx}, C_fi = {c_fi_approx}, V_if = {v_if_rate}, V_fi = {v_fi_rate},"
         #          f" A_fi = {a_fi_approx}.")
-        # TODO: Try using ratios between sequential agg states?
-        n_ratio = (c_if_approx + v_if_rate) / (c_fi_approx + a_fi_approx + v_fi_rate)
-        t_ex_profile = (ac_h_c_on_kB * mean_energy_dif / np.log(1 / n_ratio)).to(u.K)
-        log.info(f"T_ex profile global fit = {t_ex_profile}")
-        # t_ex_profiles = []
+        energy_dif_wmean_global = (mol_chi_norm @ wn_grid) / mol_chi_norm.sum(axis=1)
+        n_ratio_old = (c_if_approx + v_if_rate) / (c_fi_approx + a_fi_approx + v_fi_rate)
+        t_ex_profile_old = (ac_h_c_on_kB * energy_dif_wmean_global / np.log(1 / n_ratio_old)).to(u.K)
+        log.info(f"T_ex profile global fit = {t_ex_profile_old}")
         # Get pairs of valid band keys: choosing adjacent IDs do not always exist, i.e.: in species with distinct
         # isomers whose states are close in energy.
         agg_energies = self.agg_states.sort("id_agg")["energy_agg"].to_numpy()
@@ -2535,7 +3246,7 @@ class NLTEProcessor:
 
             v_fi = np.zeros(n_layers) << 1 / u.s
             v_if = np.zeros(n_layers) << 1 / u.s
-            energy_dif_wmean = np.zeros(n_layers)
+            energy_dif_wmean = np.zeros(n_layers) << wn_grid.unit
             for layer_idx in range(self.n_lte_layers, temperature_profile.shape[0]):
                 nlte_layer_idx = layer_idx - self.n_lte_layers
                 abs_profile, abs_start_idx = self.profile_store.get_profile(
@@ -2576,19 +3287,18 @@ class NLTEProcessor:
                     y_data=abs_profile_norm * b_if * i_mean[layer_idx, abs_start_idx:abs_end_idx],
                     dx=wn_dx[abs_start_idx:abs_end_idx]
                 )
-                # TODO: TEST THIS!
                 energy_dif_wmean[layer_idx] = np.average(
                     wn_grid[abs_start_idx:abs_end_idx].value,
-                    weights=abs_profile[abs_start_idx:abs_end_idx]
-                )
+                    weights=abs_profile_norm.value,
+                ) * wn_grid.unit
             c_fi = self._col_chem_c_matrix[:, id_agg_i, id_agg_f] << 1 / u.s
             c_if = self._col_chem_c_matrix[:, id_agg_f, id_agg_i] << 1 / u.s
             n_ratio = (c_if + v_if) / (c_fi + a_fi + v_fi)
-            energy_agg_f = self.agg_states.filter(pl.col("id_agg") == id_agg_f).select(pl.col("energy_agg")).item()
-            energy_agg_i = self.agg_states.filter(pl.col("id_agg") == id_agg_i).select(pl.col("energy_agg")).item()
-            energy_dif = (energy_agg_f - energy_agg_i) / u.cm
-            log.info(f"DEBUG: energy_dif = {energy_dif}, WMean = {energy_f_wmean}.")
-            t_ex_profile = (ac_h_c_on_kB * energy_dif / np.log(1 / n_ratio)).to(u.K)
+            # energy_agg_f = self.agg_states.filter(pl.col("id_agg") == id_agg_f).select(pl.col("energy_agg")).item()
+            # energy_agg_i = self.agg_states.filter(pl.col("id_agg") == id_agg_i).select(pl.col("energy_agg")).item()
+            # energy_dif = (energy_agg_f - energy_agg_i) / u.cm
+            # log.info(f"DEBUG: energy_dif = {energy_dif}, WMean = {energy_dif_wmean}.")
+            t_ex_profile = (ac_h_c_on_kB * energy_dif_wmean / np.log(1 / n_ratio)).to(u.K)
             if np.any(t_ex_profile < 0):
                 log.warning(f"{self.species} T_ex for ({id_agg_f}-{id_agg_i}) band contains negatives!")
                 t_ex_profile = np.clip(t_ex_profile.value, a_min=1.0, a_max=20000) << u.K  # Failsafe

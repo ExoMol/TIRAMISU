@@ -1,4 +1,5 @@
 import re
+import typing as t
 
 # AME2012 nuclear mass data.
 
@@ -271,6 +272,59 @@ def get_molecular_mass(formula: str) -> float:
         else:
             total_mass += get_mass(part) * count
     return total_mass
+
+
+def get_reduced_mass(formula: str) -> float:
+    if re.search(r'\d+[A-Z][a-z]?\d+[A-Z]', formula):
+        raise ValueError(
+            f"Ambiguous formula '{formula}'. Use delimiters like '12C-2H' or '13C-16O' to clarify isotopes."
+        )
+
+    def parse_segment(segment: str) -> t.Tuple[float, float]:
+        """Parse a simple segment without parentheses and sum isotope masses."""
+        total_sum = 0.0
+        total_prod = 1.0
+        pattern = r'(\d*[A-Z][a-z]?)(\d*)'  # isotope prefix or normal element with count
+        tokens = re.findall(pattern, segment)
+        for (symbol, count_str) in tokens:
+            count = int(count_str) if count_str else 1
+            symbol_mass = get_mass(symbol)
+            total_sum += symbol_mass * count
+            total_prod *= symbol_mass ** count
+        return total_sum, total_prod
+
+    mass_sum = 0.0
+    mass_prod = 1.0
+
+    # --- Handle parentheses recursively ---
+    while '(' in formula:
+        match = re.search(r"\(([^\(\)]+)\)(\d*)", formula)
+        if not match:
+            print("here")
+            break
+        inner, multiplier_str = match.groups()
+        multiplier = int(multiplier_str) if multiplier_str else 1
+        inner_sum, inner_prod = parse_segment(inner)
+        mass_sum += inner_sum * multiplier
+        mass_prod *= inner_prod ** multiplier
+        # Replace this group with a pseudo-element marker that carries numeric value
+        formula = formula[:match.start()] + formula[match.end():]
+
+    # --- Parse remaining parts ---
+    parts = re.findall(r"(\d*[A-Z][a-z]?|\d*\.\d+X)(\d*)", formula)
+    for (part, count_str) in parts:
+        count = int(count_str) if count_str else 1
+        if part.endswith("X"):
+            mass_part = float(part[:-1])
+            mass_sum += mass_part * count
+            mass_prod *= mass_part ** count
+        else:
+            mass_part = get_mass(part)
+            mass_sum += mass_part * count
+            mass_prod *= mass_part ** count
+
+    reduced_mass = mass_prod / mass_sum
+    return reduced_mass
 
 
 def get_number_of_atoms(formula: str) -> int:
