@@ -105,7 +105,10 @@ class CollisionalRatesDatabase:
         KeyError
             If species has no configured rates
         """
-        return cls.SPECIES_INFO[species].temperature_dependent
+        if species in cls.SPECIES_INFO:
+            return cls.SPECIES_INFO[species].temperature_dependent
+        else:
+            raise RuntimeWarning(f"Collisional rates not configured for {species}.")
 
     @classmethod
     def get_collision_partners(cls, species: str) -> t.Set[str]:
