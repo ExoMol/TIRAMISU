@@ -37,6 +37,7 @@ ac_c_sq_on_2h = (ac.c ** 2) / (2 * ac.h)
 # Constant values.
 const_amu = ac.u.cgs.value
 const_h_on_8_c = ac_h_on_8_c.value
+const_h_on_8_c_amu = const_h_on_8_c / const_amu
 const_4_pi_c = ac_4_pi_c.value
 const_8_pi_c = ac_8_pi_c.value
 const_16_pi_c = ac_16_pi_c.value
@@ -128,6 +129,53 @@ def _iter_trans_batches(
             yield _process(pl.from_pandas(delayed_batch.compute()))
 
 
+@numba.njit(parallel=False, cache=True, error_model="numpy", inline="always")
+def _find_groups_from_ids(
+        id_agg_f: npt.NDArray[np.int32],
+        id_agg_i: npt.NDArray[np.int32],
+        band_indices: npt.NDArray[np.int32],
+) -> t.Tuple[npt.NDArray[np.int32], npt.NDArray[np.int32], npt.NDArray[np.int32]]:
+    """
+    Parameters
+    ----------
+    id_agg_f : ndarray, shape (n_trans,)
+    id_agg_i : ndarray, shape (n_trans,)
+    band_indices : ndarray, shape (n_trans,)
+
+    Returns
+    -------
+    band_group_indices : ndarray, shape (n_bands_in_batch,)
+        Maps the bands in the current batch to the band index stored in the external band_indices map.
+    group_starts : ndarray, shape (n_bands_in_batch,)
+        Start index in the transition arrays for each band.
+    group_ends : ndarray, shape (n_bands_in_batch,)
+        End index (exclusive) in the transition arrays for each band.
+    """
+    n_keys = id_agg_f.shape[0]
+    n_groups = 1
+
+    starts = np.empty(n_keys, dtype=np.int32)
+    starts[0] = 0
+
+    for i in range(1, n_keys):
+        if id_agg_f[i] != id_agg_f[i - 1] or id_agg_i[i] != id_agg_i[i - 1]:
+            starts[n_groups] = i
+            n_groups += 1
+    starts = starts[:n_groups]
+
+    ends = np.empty(n_groups, dtype=np.int32)
+    for g in range(n_groups - 1):
+        ends[g] = starts[g + 1]
+    ends[n_groups - 1] = n_keys
+
+    band_group_indices = np.empty(n_groups, dtype=band_indices.dtype, )
+
+    for g in range(n_groups):
+        band_group_indices[g] = band_indices[starts[g]]
+
+    return band_group_indices, starts, ends
+
+
 # ------------------------------------- EINSTEIN COEFFICIENTS -------------------------------------
 @numba.njit(parallel=True, cache=True, error_model="numpy")
 def calc_einstein_bs(
@@ -136,11 +184,11 @@ def calc_einstein_bs(
         a_fi: npt.NDArray[np.float64],
         energy_fi: npt.NDArray[np.float64],
         g_lookup: npt.NDArray[np.float64],
+        inv_g_lookup: npt.NDArray[np.float64],
 ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
     n_trans = a_fi.shape[0]
     b_fi = np.zeros(n_trans, dtype=np.float64)
     b_if = np.zeros(n_trans, dtype=np.float64)
-    inv_g_lookup = 1.0 / g_lookup
     inv_energy_fi_cubed = 1.0 / (energy_fi ** 3)
 
     for t in numba.prange(n_trans):
@@ -161,35 +209,54 @@ def calc_einstein_bs(
 @numba.njit(parallel=True, cache=True, error_model="numpy")
 def _accumulate_superline_batch(
         profile_buffer: npt.NDArray[np.float64],
-        bin_indices: npt.NDArray[np.int32],
+        bin_edges: npt.NDArray[np.float64],
         n_lookup: npt.NDArray[np.float64],
         g_lookup: npt.NDArray[np.float64],
-        abs_prefactor: npt.NDArray[np.float64],
-        emi_prefactor: npt.NDArray[np.float64],
-        id_i: npt.NDArray[np.int32],
+        inv_g_lookup: npt.NDArray[np.float64],
         id_f: npt.NDArray[np.int32],
+        id_i: npt.NDArray[np.int32],
+        a_fi: npt.NDArray[np.float64],
+        energy_fi: npt.NDArray[np.float64],
 ) -> None:
     """
 
     Parameters
     ----------
     profile_buffer : ndarray, shape (2, n_layers, n_grid)
-    bin_indices : ndarray, shape (n_trans,)
-    n_lookup : ndarray, shape (n_trans, n_layers)
-    g_lookup : ndarray, shape (n_trans, n_layers)
-    abs_prefactor : ndarray, shape (n_trans,)
-    emi_prefactor : ndarray, shape (n_trans,)
-    id_i : ndarray, shape (n_trans,)
+    bin_edges : ndarray, shape (n_grid + 1,)
+    n_lookup : ndarray, shape (n_states + 1, n_layers)
+    g_lookup : ndarray, shape (n_states + 1)
+    inv_g_lookup : ndarray, shape (n_states + 1)
     id_f : ndarray, shape (n_trans,)
+    id_i : ndarray, shape (n_trans,)
+    a_fi : ndarray, shape (n_trans,)
+    energy_fi : ndarray (n_trans,)
 
     Returns
     -------
 
     """
-    n_trans = bin_indices.shape[0]
+    n_trans = energy_fi.shape[0]
     n_layers = n_lookup.shape[1]
+    max_idx = bin_edges.shape[0] - 2
 
-    inv_g_lookup = 1.0 / g_lookup
+    bin_indices = np.empty(n_trans, dtype=np.int32)
+    abs_prefactor = np.empty(n_trans, np.float64)
+    emi_prefactor = np.empty(n_trans, np.float64)
+
+    for t in numba.prange(n_trans):
+        a_fi_t = a_fi[t]
+        energy_fi_t = energy_fi[t]
+        abs_prefactor[t] = a_fi_t / (const_8_pi_c * energy_fi_t * energy_fi_t)
+        emi_prefactor[t] = a_fi_t * energy_fi_t * const_h_c_on_4_pi
+
+        bin_idx = _binary_search_right(bin_edges, energy_fi_t) - 1
+        if bin_idx < 0:
+            bin_idx = 0
+        elif bin_idx > max_idx:
+            bin_idx = max_idx
+
+        bin_indices[t] = bin_idx
 
     for l in numba.prange(n_layers):
         for t in range(n_trans):
@@ -214,13 +281,15 @@ def _accumulate_superline_batch(
 @numba.njit(parallel=True, cache=True, error_model="numpy")
 def _accumulate_continuum_superline_batch(
         profile_buffer: npt.NDArray[np.float64],
-        bin_indices: npt.NDArray[np.int32],
+        bin_edges: npt.NDArray[np.float64],
         n_lookup: npt.NDArray[np.float64],
         g_lookup: npt.NDArray[np.float64],
+        inv_g_lookup: npt.NDArray[np.float64],
         v_lookup: npt.NDArray[np.float64],
-        abs_prefactor: npt.NDArray[np.float64],
-        id_i: npt.NDArray[np.int32],
         id_f: npt.NDArray[np.int32],
+        id_i: npt.NDArray[np.int32],
+        a_fi: npt.NDArray[np.float64],
+        energy_fi: npt.NDArray[np.float64],
         reduced_mass: float,
         box_length: float,
 ) -> None:
@@ -230,25 +299,42 @@ def _accumulate_continuum_superline_batch(
     Parameters
     ----------
     profile_buffer : ndarray, shape (2, n_layers, n_grid)
-    bin_indices : ndarray, shape (n_trans,)
+    bin_edges : ndarray, shape (n_grid + 1,)
     n_lookup : ndarray, shape (n_states + 1, n_layers)
     g_lookup : ndarray, shape (n_states + 1, )
+    inv_g_lookup : ndarray, shape (n_states + 1, )
     v_lookup : ndarray, shape (n_states + 1, )
-    abs_prefactor : ndarray, shape (n_trans,)
-    id_i : ndarray, shape (n_trans,)
     id_f : ndarray, shape (n_trans,)
+    id_i : ndarray, shape (n_trans,)
+    a_fi : ndarray, shape (n_trans,)
+    energy_fi : ndarray (n_trans,)
     reduced_mass : float
     box_length : floatawdasdasda
 
     """
-    n_trans = bin_indices.shape[0]
+    n_trans = energy_fi.shape[0]
     n_layers = n_lookup.shape[1]
     n_states = v_lookup.shape[0]
+    max_idx = bin_edges.shape[0] - 2
 
-    inv_g_lookup = 1.0 / g_lookup
+    bin_indices = np.empty(n_trans, dtype=np.int32)
+    abs_prefactor = np.empty(n_trans, np.float64)
+
+    for t in numba.prange(n_trans):
+        a_fi_t = a_fi[t]
+        energy_fi_t = energy_fi[t]
+        abs_prefactor[t] = a_fi_t / (const_8_pi_c * energy_fi_t * energy_fi_t)
+
+        bin_idx = _binary_search_right(bin_edges, energy_fi_t) - 1
+        if bin_idx < 0:
+            bin_idx = 0
+        elif bin_idx > max_idx:
+            bin_idx = max_idx
+
+        bin_indices[t] = bin_idx
 
     alpha_box_lookup = np.empty(n_states, dtype=np.float64)
-    alpha_box_prefactor = const_h_on_8_c / (const_amu * box_length * box_length * reduced_mass)
+    alpha_box_prefactor = const_h_on_8_c_amu / (box_length * box_length * reduced_mass)
     for s in numba.prange(n_states):
         alpha_box_lookup[s] = alpha_box_prefactor * (2.0 * v_lookup[s] + 1.0)
 
@@ -265,13 +351,14 @@ def _accumulate_continuum_superline_batch(
 def _accumulate_superline_band_batch(
         profile_buffer: npt.NDArray[np.float64],
         band_indices: npt.NDArray[np.int32],
-        bin_indices: npt.NDArray[np.int32],
-        g_lookup: npt.NDArray[np.float64],
-        abs_ste_prefactor: npt.NDArray[np.float64],
-        spe_prefactor: npt.NDArray[np.float64],
-        id_i: npt.NDArray[np.int32],
-        id_f: npt.NDArray[np.int32],
+        bin_edges: npt.NDArray[np.float64],
         n_frac_lookup: npt.NDArray[np.float64],
+        g_lookup: npt.NDArray[np.float64],
+        inv_g_lookup: npt.NDArray[np.float64],
+        id_f: npt.NDArray[np.int32],
+        id_i: npt.NDArray[np.int32],
+        a_fi: npt.NDArray[np.float64],
+        energy_fi: npt.NDArray[np.float64],
 ) -> None:
     """
 
@@ -279,18 +366,36 @@ def _accumulate_superline_band_batch(
     ----------
     profile_buffer : ndarray, shape (3, n_bands, n_layers, n_grid)
     band_indices : ndarray, shape (n_trans,)
-    bin_indices : ndarray, shape (n_trans,)
-    g_lookup : ndarray, shape (n_states + 1, )
-    abs_ste_prefactor : ndarray, shape (n_trans,)
-    spe_prefactor : ndarray, shape (n_trans,)
-    id_i : ndarray, shape (n_trans,)
-    id_f : ndarray, shape (n_trans,)
+    bin_edges : ndarray, shape (n_grid + 1,)
     n_frac_lookup : ndarray, shape (n_states + 1, n_layers)
+    g_lookup : ndarray, shape (n_states + 1,)
+    inv_g_lookup : ndarray, shape (n_states + 1,)
+    id_f : ndarray, shape (n_trans,)
+    id_i : ndarray, shape (n_trans,)
+    a_fi : ndarray, shape (n_trans,)
+    energy_fi : ndarray (n_trans,)
     """
-    n_trans = bin_indices.shape[0]
+    n_trans = energy_fi.shape[0]
     n_layers = n_frac_lookup.shape[1]
+    max_idx = bin_edges.shape[0] - 2
 
-    inv_g_lookup = 1.0 / g_lookup
+    bin_indices = np.empty(n_trans, dtype=np.int32)
+    abs_ste_prefactor = np.empty(n_trans, np.float64)
+    spe_prefactor = np.empty(n_trans, np.float64)
+
+    for t in numba.prange(n_trans):
+        a_fi_t = a_fi[t]
+        energy_fi_t = energy_fi[t]
+        abs_ste_prefactor[t] = a_fi_t / (const_8_pi_c * energy_fi_t * energy_fi_t)
+        spe_prefactor[t] = a_fi_t * energy_fi_t * const_h_c_on_4_pi
+
+        bin_idx = _binary_search_right(bin_edges, energy_fi_t) - 1
+        if bin_idx < 0:
+            bin_idx = 0
+        elif bin_idx > max_idx:
+            bin_idx = max_idx
+
+        bin_indices[t] = bin_idx
 
     for l in numba.prange(n_layers):
         for t in range(n_trans):
@@ -316,13 +421,15 @@ def _accumulate_superline_band_batch(
 def _accumulate_continuum_superline_band_batch(
         profile_buffer: npt.NDArray[np.float64],
         band_indices: npt.NDArray[np.int32],
-        bin_indices: npt.NDArray[np.int32],
+        bin_edges: npt.NDArray[np.float64],
         n_frac_lookup: npt.NDArray[np.float64],
         g_lookup: npt.NDArray[np.float64],
+        inv_g_lookup: npt.NDArray[np.float64],
         v_lookup: npt.NDArray[np.float64],
-        abs_prefactor: npt.NDArray[np.float64],
-        id_i: npt.NDArray[np.int32],
         id_f: npt.NDArray[np.int32],
+        id_i: npt.NDArray[np.int32],
+        a_fi: npt.NDArray[np.float64],
+        energy_fi: npt.NDArray[np.float64],
         reduced_mass: float,
         box_length: float,
 ) -> None:
@@ -333,25 +440,41 @@ def _accumulate_continuum_superline_band_batch(
     ----------
     profile_buffer : ndarray, shape (2, n_bands, n_layers, n_grid)
     band_indices : ndarray, shape (n_trans,)
-    bin_indices : ndarray, shape (n_trans,)
+    bin_edges : ndarray, shape (n_grid + 1,)
     n_frac_lookup : ndarray, shape (n_states + 1, n_layers)
     g_lookup : ndarray, shape (n_states + 1, )
+    inv_g_lookup : ndarray, shape (n_states + 1,)
     v_lookup : ndarray, shape (n_states + 1, )
-    abs_prefactor : ndarray, shape (n_trans,)
-    id_i : ndarray, shape (n_trans,)
     id_f : ndarray, shape (n_trans,)
+    id_i : ndarray, shape (n_trans,)
+    a_fi : ndarray, shape (n_trans,)
+    energy_fi : ndarray (n_trans,)
     reduced_mass : float
-    box_length : floatawdasdasda
-
+    box_length : float
     """
-    n_trans = bin_indices.shape[0]
+    n_trans = energy_fi.shape[0]
     n_layers = n_frac_lookup.shape[1]
     n_states = v_lookup.shape[0]
+    max_idx = bin_edges.shape[0] - 2
 
-    inv_g_lookup = 1.0 / g_lookup
+    bin_indices = np.empty(n_trans, dtype=np.int32)
+    abs_prefactor = np.empty(n_trans, np.float64)
+
+    for t in numba.prange(n_trans):
+        a_fi_t = a_fi[t]
+        energy_fi_t = energy_fi[t]
+        abs_prefactor[t] = a_fi_t / (const_8_pi_c * energy_fi_t * energy_fi_t)
+
+        bin_idx = _binary_search_right(bin_edges, energy_fi_t) - 1
+        if bin_idx < 0:
+            bin_idx = 0
+        elif bin_idx > max_idx:
+            bin_idx = max_idx
+
+        bin_indices[t] = bin_idx
 
     alpha_box_lookup = np.empty(n_states, dtype=np.float64)
-    alpha_box_prefactor = const_h_on_8_c / (const_amu * box_length * box_length * reduced_mass)
+    alpha_box_prefactor = const_h_on_8_c_amu / (box_length * box_length * reduced_mass)
     for s in numba.prange(n_states):
         alpha_box_lookup[s] = alpha_box_prefactor * (2.0 * v_lookup[s] + 1.0)
 
@@ -1245,7 +1368,8 @@ def abs_emi_xsec(
 
     Returns
     -------
-
+    abs_xsec : ndarray, shape (n_grid,)
+    emi_xsec : ndarray, shape (n_grid,)
     """
     trans_columns = ["id_f", "id_i", "A_fi"]
     dask_dtypes = {"id_f": "int64", "id_i": "int64", "A_fi": "float64", }
@@ -1293,6 +1417,9 @@ def abs_emi_xsec(
     g_lookup = np.zeros(max_state_id + 1, dtype=np.float64)
     g_lookup[state_ids] = states["g"].to_numpy()
     g_lookup = np.ascontiguousarray(g_lookup)
+    inv_g_lookup = np.zeros_like(g_lookup)
+    inv_g_lookup[1:] = 1.0 / g_lookup[1:]
+    inv_g_lookup = np.ascontiguousarray(inv_g_lookup)
 
     tau_lookup = np.zeros(max_state_id + 1, dtype=np.float64)
     tau_lookup[state_ids] = states["tau"].to_numpy()
@@ -1330,23 +1457,16 @@ def abs_emi_xsec(
                 continue
 
             if do_super_lines:
-                energy_fi = trans_batch["energy_fi"].to_numpy()
-                a_fi = np.ascontiguousarray(trans_batch["A_fi"].to_numpy())
-                bin_indices = np.ascontiguousarray(np.clip(
-                    np.searchsorted(bin_edges, energy_fi, side="right") - 1,
-                    0,
-                    n_grid - 1,
-                    dtype=np.int32
-                ))
                 _accumulate_superline_batch(
                     profile_buffer=profile_buffer,
-                    bin_indices=bin_indices,
+                    bin_edges=bin_edges,
                     n_lookup=n_lookup,
                     g_lookup=g_lookup,
-                    abs_prefactor=np.ascontiguousarray(a_fi / (const_8_pi_c * energy_fi ** 2)),
-                    emi_prefactor=np.ascontiguousarray(a_fi * energy_fi * const_h_c_on_4_pi),
-                    id_i=np.ascontiguousarray(trans_batch["id_i"].to_numpy()),
+                    inv_g_lookup=inv_g_lookup,
                     id_f=np.ascontiguousarray(trans_batch["id_f"].to_numpy()),
+                    id_i=np.ascontiguousarray(trans_batch["id_i"].to_numpy()),
+                    a_fi=np.ascontiguousarray(trans_batch["A_fi"].to_numpy()),
+                    energy_fi=np.ascontiguousarray(trans_batch["energy_fi"].to_numpy()),
                 )
             else:
                 _abs_emi_sampled_voigt(
@@ -1356,6 +1476,7 @@ def abs_emi_xsec(
                     id_f=np.ascontiguousarray(trans_batch["id_f"].to_numpy()),
                     n_lookup=n_lookup,
                     g_lookup=g_lookup,
+                    inv_g_lookup=inv_g_lookup,
                     tau_lookup=tau_lookup,
                     a_fi=np.ascontiguousarray(trans_batch["A_fi"].to_numpy()),
                     energy_fi=np.ascontiguousarray(trans_batch["energy_fi"].to_numpy()),
@@ -1396,7 +1517,26 @@ def continuum_xsec(
         cont_box_length: float,
         do_super_lines: bool,
 ) -> npt.NDArray[np.float64]:
-    # TODO This whole thing is now wrong now, needs a complete overhaul.
+    """
+
+    Parameters
+    ----------
+    states
+    cont_states
+    cont_trans_files
+    n_lte_layers
+    n_nlte_layers
+    temperature_profile
+    wn_grid
+    species_mass
+    reduced_mass
+    cont_box_length
+    do_super_lines
+
+    Returns
+    -------
+    abs_xsec : ndarray, shape (n_grid,)
+    """
     trans_columns = ["id_f", "id_i", "A_fi"]
     dask_dtypes = {"id_f": "int64", "id_i": "int64", "A_fi": "float64"}
     dask_blocksize = "512MB"
@@ -1408,8 +1548,6 @@ def continuum_xsec(
     select_cols = ["id", "g", "v"] + n_cols
     cont_states = cont_states.join(states.select(select_cols), on="id", how="left")
 
-    # invariant_cols_i = ["id", "energy", "g", ] + n_cols
-    # invariant_cols_f = ["id", "energy", "g", "v"] + n_cols
     invariant_cols = ["id", "energy", "id_agg"]
     states_i = (
         cont_states
@@ -1448,6 +1586,9 @@ def continuum_xsec(
     g_lookup = np.zeros(max_state_id + 1, dtype=np.float64)
     g_lookup[state_ids] = cont_states["g"].to_numpy()
     g_lookup = np.ascontiguousarray(g_lookup)
+    inv_g_lookup = np.zeros_like(g_lookup)
+    inv_g_lookup[1:] = 1.0 / g_lookup[1:]
+    inv_g_lookup = np.ascontiguousarray(inv_g_lookup)
 
     v_lookup = np.zeros(max_state_id + 1, dtype=np.float64)
     v_lookup[state_ids] = cont_states["tau"].to_numpy()
@@ -1479,23 +1620,17 @@ def continuum_xsec(
                 continue
 
             if do_super_lines:
-                energy_fi = trans_batch["energy_fi"].to_numpy()
-                a_fi = np.ascontiguousarray(trans_batch["A_fi"].to_numpy())
-                bin_indices = np.ascontiguousarray(np.clip(
-                    np.searchsorted(bin_edges, energy_fi, side="right") - 1,
-                    0,
-                    n_grid - 1,
-                    dtype=np.int32
-                ))
                 _accumulate_continuum_superline_batch(
                     profile_buffer=profile_buffer,
-                    bin_indices=bin_indices,
+                    bin_edges=bin_edges,
                     n_lookup=n_lookup,
                     g_lookup=g_lookup,
+                    inv_g_lookup=inv_g_lookup,
                     v_lookup=v_lookup,
-                    abs_prefactor=np.ascontiguousarray(a_fi / (const_8_pi_c * energy_fi ** 2)),
-                    id_i=np.ascontiguousarray(trans_batch["id_i"].to_numpy()),
                     id_f=np.ascontiguousarray(trans_batch["id_f"].to_numpy()),
+                    id_i=np.ascontiguousarray(trans_batch["id_i"].to_numpy()),
+                    a_fi=np.ascontiguousarray(trans_batch["A_fi"].to_numpy()),
+                    energy_fi=np.ascontiguousarray(trans_batch["energy_fi"].to_numpy()),
                     reduced_mass=reduced_mass,
                     box_length=cont_box_length,
                 )
@@ -1507,6 +1642,7 @@ def continuum_xsec(
                     id_f=np.ascontiguousarray(trans_batch["id_f"].to_numpy()),
                     n_lookup=n_lookup,
                     g_lookup=g_lookup,
+                    inv_g_lookup=inv_g_lookup,
                     v_lookup=v_lookup,
                     a_fi=np.ascontiguousarray(trans_batch["A_fi"].to_numpy()),
                     energy_fi=np.ascontiguousarray(trans_batch["energy_fi"].to_numpy()),
@@ -1533,7 +1669,7 @@ def continuum_xsec(
 
 
 @numba.njit(cache=True, error_model="numpy", inline="always")
-def _binary_search_left(arr: npt.NDArray[np.float64], value: float, start: int = 0) -> int:
+def _binary_search_left(arr: npt.NDArray[np.float64], value: np.float64, start: np.int32 = 0) -> np.int32:
     """Fast binary search for left insertion point with optional start hint."""
     left, right = start, len(arr)
     while left < right:
@@ -1546,7 +1682,7 @@ def _binary_search_left(arr: npt.NDArray[np.float64], value: float, start: int =
 
 
 @numba.njit(cache=True, error_model="numpy", inline="always")
-def _binary_search_right(arr: npt.NDArray[np.float64], value: float, start: int = 0) -> int:
+def _binary_search_right(arr: npt.NDArray[np.float64], value: np.float64, start: np.int32 = 0) -> np.int32:
     """Fast binary search for right insertion point with optional start hint."""
     left, right = start, len(arr)
     while left < right:
@@ -2041,11 +2177,12 @@ def _band_profile_sampled_voigt(
         wn_grid: npt.NDArray[np.float64],
         id_f: npt.NDArray[np.int32],
         id_i: npt.NDArray[np.int32],
-        band_group_indices: npt.NDArray[np.int32],
-        group_starts: npt.NDArray[np.int32],
-        group_ends: npt.NDArray[np.int32],
+        id_agg_f: npt.NDArray[np.int32],
+        id_agg_i: npt.NDArray[np.int32],
+        band_indices: npt.NDArray[np.int32],
         n_lookup: npt.NDArray[np.float64],
         g_lookup: npt.NDArray[np.float64],
+        inv_g_lookup: npt.NDArray[np.float64],
         tau_lookup: npt.NDArray[np.float64],
         a_fi: npt.NDArray[np.float64],
         energy_fi: npt.NDArray[np.float64],
@@ -2074,16 +2211,14 @@ def _band_profile_sampled_voigt(
     wn_grid : ndarray, shape (n_grid,)
     id_f : ndarray, shape (n_trans,)
     id_i : ndarray, shape (n_trans,)
-    band_group_indices : ndarray, shape (n_bands_in_batch,)
-        Maps the bands in the current batch to the band index stored in the external band_indices map.
-    group_starts : ndarray, shape (n_bands_in_batch,)
-        Start index in the transition arrays for each band.
-    group_ends : ndarray, shape (n_bands_in_batch,)
-        End index (exclusive) in the transition arrays for each band.
+    id_agg_f : ndarray, shape (n_trans,)
+    id_agg_i : ndarray, shape (n_trans,)
+    band_indices : ndarray, shape (n_trans,)
     n_lookup : ndarray, shape (n_states + 1, n_layers)
         Lookup table for n_frac, avoiding extremely memory intensive joins.
     g_lookup : ndarray, shape (n_states + 1, )
         Lookup table for g, avoiding extremely memory intensive joins.
+    inv_g_lookup : ndarray, shape (n_states + 1, )
     tau_lookup : ndarray, shape (n_states + 1, )
         Lookup table for tau (lifetimes), avoiding extremely memory intensive joins.
     a_fi : ndarray, shape (n_trans,)
@@ -2101,6 +2236,12 @@ def _band_profile_sampled_voigt(
     n_trans = energy_fi.shape[0]
     n_broad = broad_n.shape[0]
     n_states = n_lookup.shape[0]
+
+    band_group_indices, group_starts, group_ends = _find_groups_from_ids(
+        id_agg_f=id_agg_f,
+        id_agg_i=id_agg_i,
+        band_indices=band_indices,
+    )
     n_bands_in_batch = group_starts.shape[0]
 
     cutoff = 25.0
@@ -2111,8 +2252,6 @@ def _band_profile_sampled_voigt(
     # Per-layer per-transition: sigma_D, gamma_total, and profile coefficients
     inv_sigma_sqrt2 = np.empty((n_layers, n_trans), dtype=np.float64)  # Doppler sigma (std dev)
     gamma_total_lookup = np.empty((n_layers, n_states), dtype=np.float64)
-
-    inv_g_lookup = 1.0 / g_lookup
 
     # gamma_lifetime = 1.0 / (const_4_pi_c * lifetimes)  # (n_trans,)
     gamma_lifetime_lookup = 1.0 / (const_4_pi_c * tau_lookup)
@@ -2204,6 +2343,7 @@ def _abs_emi_sampled_voigt_threadlocal(
         id_i: npt.NDArray[np.float64],
         n_lookup: npt.NDArray[np.float64],
         g_lookup: npt.NDArray[np.float64],
+        inv_g_lookup: npt.NDArray[np.float64],
         tau_lookup: npt.NDArray[np.float64],
         a_fi: npt.NDArray[np.float64],
         energy_fi: npt.NDArray[np.float64],
@@ -2242,6 +2382,7 @@ def _abs_emi_sampled_voigt_threadlocal(
         Lookup table for n_frac, avoiding extremely memory intensive joins.
     g_lookup : ndarray, shape (n_states + 1, )
         Lookup table for g, avoiding extremely memory intensive joins.
+    inv_g_lookup : ndarray, shape (n_states + 1, )
     tau_lookup : ndarray, shape (n_states + 1, )
         Lookup table for tau (lifetimes), avoiding extremely memory intensive joins.
     a_fi : ndarray, shape (n_trans,)
@@ -2267,8 +2408,6 @@ def _abs_emi_sampled_voigt_threadlocal(
     # Per-layer per-transition: sigma_D, gamma_total, and profile coefficients
     inv_sigma_sqrt2 = np.empty((n_layers, n_trans), dtype=np.float64)  # Doppler sigma (std dev)
     gamma_total_lookup = np.empty((n_layers, n_states), dtype=np.float64)
-
-    inv_g_lookup = 1.0 / g_lookup
 
     # gamma_lifetime = 1.0 / (const_4_pi_c * lifetimes)  # (n_trans,)
     gamma_lifetime_lookup = 1.0 / (const_4_pi_c * tau_lookup)
@@ -2355,6 +2494,7 @@ def _abs_emi_sampled_voigt(
         id_i: npt.NDArray[np.float64],
         n_lookup: npt.NDArray[np.float64],
         g_lookup: npt.NDArray[np.float64],
+        inv_g_lookup: npt.NDArray[np.float64],
         tau_lookup: npt.NDArray[np.float64],
         a_fi: npt.NDArray[np.float64],
         energy_fi: npt.NDArray[np.float64],
@@ -2387,6 +2527,7 @@ def _abs_emi_sampled_voigt(
         Lookup table for n_frac, avoiding extremely memory intensive joins.
     g_lookup : ndarray, shape (n_states + 1, )
         Lookup table for g, avoiding extremely memory intensive joins.
+    inv_g_lookup : ndarray, shape (n_states + 1, )
     tau_lookup : ndarray, shape (n_states + 1, )
         Lookup table for tau (lifetimes), avoiding extremely memory intensive joins.
     a_fi : ndarray, shape (n_trans,)
@@ -2412,7 +2553,6 @@ def _abs_emi_sampled_voigt(
     inv_sigma_sqrt2 = np.empty((n_layers, n_trans), dtype=np.float64)  # Doppler sigma (std dev)
     gamma_total_lookup = np.empty((n_layers, n_states), dtype=np.float64)
 
-    inv_g_lookup = 1.0 / g_lookup
     gamma_lifetime_lookup = 1.0 / (const_4_pi_c * tau_lookup)
 
     for l in numba.prange(n_layers):
@@ -2488,11 +2628,12 @@ def _continuum_band_profile_sampled_gauss_layered(
         wn_grid: npt.NDArray[np.float64],
         id_f: npt.NDArray[np.float32],
         id_i: npt.NDArray[np.float32],
-        band_group_indices: npt.NDArray[np.int32],
-        group_starts: npt.NDArray[np.int32],
-        group_ends: npt.NDArray[np.int32],
+        id_agg_f: npt.NDArray[np.int32],
+        id_agg_i: npt.NDArray[np.int32],
+        band_indices: npt.NDArray[np.int32],
         n_lookup: npt.NDArray[np.float64],
         g_lookup: npt.NDArray[np.float64],
+        inv_g_lookup: npt.NDArray[np.float64],
         v_lookup: npt.NDArray[np.float64],
         a_fi: npt.NDArray[np.float64],
         energy_fi: npt.NDArray[np.float64],
@@ -2518,16 +2659,14 @@ def _continuum_band_profile_sampled_gauss_layered(
     wn_grid : ndarray, shape (n_grid,)
     id_f : ndarray, shape (n_trans,)
     id_i : ndarray, shape (n_trans,)
-    band_group_indices : ndarray, shape (n_bands_in_batch,)
-        Maps the bands in the current batch to the band index stored in the external band_indices map.
-    group_starts : ndarray, shape (n_bands_in_batch,)
-        Start index in the transition arrays for each band.
-    group_ends : ndarray, shape (n_bands_in_batch,)
-        End index (exclusive) in the transition arrays for each band.
+    id_agg_f : ndarray, shape (n_trans,)
+    id_agg_i : ndarray, shape (n_trans,)
+    band_indices : ndarray, shape (n_trans,)
     n_lookup : ndarray, shape (n_states + 1, n_layers)
         Lookup table for n_frac, avoiding extremely memory intensive joins.
     g_lookup : ndarray, shape (n_states + 1, )
         Lookup table for g, avoiding extremely memory intensive joins.
+    inv_g_lookup : ndarray, shape (n_states + 1, )
     v_lookup : ndarray, shape (n_states + 1, )
         Lookup table for v for box broadening, avoiding extremely memory intensive joins.
     a_fi : ndarray, shape (n_trans,)
@@ -2540,6 +2679,12 @@ def _continuum_band_profile_sampled_gauss_layered(
     n_layers = temperatures.shape[0]
     n_grid = wn_grid.shape[0]
     n_states = n_lookup.shape[0]
+
+    band_group_indices, group_starts, group_ends = _find_groups_from_ids(
+        id_agg_f=id_agg_f,
+        id_agg_i=id_agg_i,
+        band_indices=band_indices,
+    )
     n_bands_in_batch = group_starts.shape[0]
 
     sqrtln2 = np.sqrt(np.log(2.0))
@@ -2552,11 +2697,10 @@ def _continuum_band_profile_sampled_gauss_layered(
     inv_mass = 1 / species_mass
 
     alpha_box_lookup = np.empty(n_states, dtype=np.float64)
-    alpha_box_prefactor = const_h_on_8_c / (const_amu * box_length * box_length * reduced_mass)
+    alpha_box_prefactor = const_h_on_8_c_amu / (box_length * box_length * reduced_mass)
     for s in numba.prange(n_states):
         alpha_box_lookup[s] = alpha_box_prefactor * (2.0 * v_lookup[s] + 1.0)
 
-    inv_g_lookup = 1.0 / g_lookup
     doppler_prefactor = np.empty((n_layers,), dtype=np.float64)
 
     doppler_coef = const_sqrt_2_NA_kB_log2_on_c * math.sqrt(inv_mass)
@@ -2630,6 +2774,7 @@ def _continuum_sampled_gauss(
         id_i: npt.NDArray[np.float64],
         n_lookup: npt.NDArray[np.float64],
         g_lookup: npt.NDArray[np.float64],
+        inv_g_lookup: npt.NDArray[np.float64],
         v_lookup: npt.NDArray[np.float64],
         a_fi: npt.NDArray[np.float64],
         energy_fi: npt.NDArray[np.float64],
@@ -2650,6 +2795,7 @@ def _continuum_sampled_gauss(
         Lookup table for n.
     g_lookup : ndarray, shape (n_states + 1, )
         Lookup table for g.
+    inv_g_lookup : ndarray, shape (n_states + 1, )
     v_lookup : ndarray, shape (n_states + 1, )
         Lookup table for v, for box broadening.
     a_fi : ndarray, shape (n_trans,)
@@ -2674,11 +2820,10 @@ def _continuum_sampled_gauss(
     inv_mass = 1 / species_mass
 
     alpha_box_lookup = np.empty(n_states, dtype=np.float64)
-    alpha_box_prefactor = const_h_on_8_c / (const_amu * box_length * box_length * reduced_mass)
+    alpha_box_prefactor = const_h_on_8_c_amu / (box_length * box_length * reduced_mass)
     for s in numba.prange(n_states):
         alpha_box_lookup[s] = alpha_box_prefactor * (2.0 * v_lookup[s] + 1.0)
 
-    inv_g_lookup = 1.0 / g_lookup
     doppler_prefactor = np.empty((n_layers,), dtype=np.float64)
 
     doppler_coef = const_sqrt_2_NA_kB_log2_on_c * math.sqrt(inv_mass)

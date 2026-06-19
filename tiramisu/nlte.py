@@ -4,19 +4,16 @@ import pathlib
 import pickle
 import time
 import typing as t
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
 import polars as pl
 import numba
-from dask import dataframe as dd
 from numpy import typing as npt
 
 from phoenix4all import get_spectrum
 
 from astropy import units as u, constants as ac
-from pyarrow import parquet as pq, dataset as ds
 
 from scipy.integrate import cumulative_simpson
 from scipy.optimize import least_squares
@@ -28,12 +25,13 @@ from .colchem import CollisionalRatesDatabase, RateTransition
 from .config import output_dir
 from .numerics import (loglinear_normalise_1d_nonnegative, loglinear_normalise_quantity_2d_nonnegative,
                        loglinear_normalise_quantity_1d_nonnegative, loglinear_integral_quantity_1d,
-                       loglinear_integral_quantity_1d_nonnegative, loglinear_integral_quantity_2d_nonnegative)
-from .profiles import (ProfileStore, ContinuumProfileStore, _process_band_batch,
-                       _process_continuum_band_batch, abs_emi_xsec, continuum_xsec, const_8_pi_c,
+                       loglinear_integral_quantity_1d_nonnegative, loglinear_integral_quantity_2d_nonnegative,
+                       loglinear_integral_1d, loglinear_integral_2d_nonnegative, loglinear_integral_1d_nonnegative)
+from .profiles import (ProfileStore, ContinuumProfileStore, abs_emi_xsec, continuum_xsec, const_8_pi_c,
                        _accumulate_superline_band_batch, const_h_c_on_4_pi, _broaden_superline_band_buffer,
                        calc_einstein_bs, _accumulate_continuum_superline_band_batch,
-                       _broaden_continuum_superline_band_buffer, _iter_trans_batches, _band_profile_sampled_voigt)
+                       _broaden_continuum_superline_band_buffer, _iter_trans_batches, _band_profile_sampled_voigt,
+                       _continuum_band_profile_sampled_gauss_layered)
 
 log = logging.getLogger(__name__)
 
@@ -130,40 +128,10 @@ def _update_band_registry(
     return band_registry, profile_buffer, n_bands_used, n_bands_max, band_indices
 
 
-@numba.njit(parallel=False, cache=True, error_model="numpy")
-def _find_groups_from_ids(
-        id_agg_f: npt.NDArray[np.int32],
-        id_agg_i: npt.NDArray[np.int32],
-        band_indices: npt.NDArray[np.int32],
-) -> t.Tuple[npt.NDArray[np.int32], npt.NDArray[np.int32], npt.NDArray[np.int32]]:
-    n_keys = id_agg_f.shape[0]
-    n_groups = 1
-
-    starts = np.empty(n_keys, dtype=np.int32)
-    starts[0] = 0
-
-    for i in range(1, n_keys):
-        if id_agg_f[i] != id_agg_f[i - 1] or id_agg_i[i] != id_agg_i[i - 1]:
-            starts[n_groups] = i
-            n_groups += 1
-    starts = starts[:n_groups]
-
-    ends = np.empty(n_groups, dtype=np.int32)
-    for g in range(n_groups - 1):
-        ends[g] = starts[g + 1]
-    ends[n_groups - 1] = n_keys
-
-    band_group_indices = np.empty(n_groups, dtype=band_indices.dtype, )
-
-    for g in range(n_groups):
-        band_group_indices[g] = band_indices[starts[g]]
-
-    return band_group_indices, starts, ends
-
-
 def _compute_agg_rates(
         trans_batch: pl.DataFrame,
         g_lookup: npt.NDArray[np.float64],
+        inv_g_lookup: npt.NDArray[np.float64],
 ) -> t.Optional[pl.DataFrame]:
     """
     Computes the radiative (Einstein) rate coefficients for the batch of transitions.
@@ -174,6 +142,7 @@ def _compute_agg_rates(
     ----------
     trans_batch : pl.DataFrame
     g_lookup : ndarray, shape (n_states + 1, )
+    inv_g_lookup : ndarray, shape (n_states + 1, )
 
     Returns
     -------
@@ -192,6 +161,7 @@ def _compute_agg_rates(
             .to(u.Hz, equivalencies=u.spectral()).value
         ),
         g_lookup=g_lookup,
+        inv_g_lookup=inv_g_lookup,
     )
     return (
         trans_batch_rates
@@ -203,6 +173,339 @@ def _compute_agg_rates(
             [pl.col("A_fi").sum(), pl.col("B_fi").sum(), pl.col("B_if").sum()]
         )
     )
+
+
+# -------------------------------------------------- Y matrix kernels --------------------------------------------------
+
+@numba.njit(cache=True, error_model="numpy")
+def _build_y_matrix_core(
+        id_agg_f: npt.NDArray[np.int32],
+        id_agg_i: npt.NDArray[np.int32],
+        rates_grid_arr: npt.NDArray[np.float64],
+        id_agg_cutoff: int,
+        n_lookup: npt.NDArray[np.float64],
+        chem_scale_factor: float,
+        lambda_layer_grid: npt.NDArray[np.float64],
+        global_chi: npt.NDArray[np.float64],
+        i_prec: npt.NDArray[np.float64],
+        wn_dx: npt.NDArray[np.float64],
+        abs_profiles: npt.NDArray[np.float64],
+        abs_offsets: npt.NDArray[np.int64],
+        abs_start_idxs: npt.NDArray[np.int64],
+        abs_profile_idx: npt.NDArray[np.int64],
+        ste_profiles: npt.NDArray[np.float64],
+        ste_offsets: npt.NDArray[np.int64],
+        ste_start_idxs: npt.NDArray[np.int64],
+        ste_profile_idx: npt.NDArray[np.int64],
+        spe_profiles: npt.NDArray[np.float64],
+        spe_offsets: npt.NDArray[np.int64],
+        spe_start_idxs: npt.NDArray[np.int64],
+        spe_profile_idx: npt.NDArray[np.int64],
+        full_prec: bool,
+        psi_approx_cross: npt.NDArray[np.float64],
+        # Outputs
+        y_matrix: npt.NDArray[np.float64],
+) -> None:
+    """
+
+    Parameters
+    ----------
+    id_agg_f : ndarray, shape (n_agg,)
+    id_agg_i : ndarray, shape (n_agg,)
+    rates_grid_arr : ndarray, shape (n_agg, three)
+        Each row contains the triple (A_fi, B_fi, B_if).
+    id_agg_cutoff : int
+    n_lookup : ndarray, shape (n_agg,)
+    chem_scale_factor : float
+        Dimensionless fractional abundance of the species at the current layer.
+    lambda_layer_grid : ndarray, shape (n_grid,)
+        Dimensionless Lambda operator at each grid point in the current layer.
+    global_chi : ndarray, shape (n_grid,)
+        Global opacity (from all sources) in the current layer [cm^2].
+    i_prec : ndarray, shape (n_grid,)
+        Preconditioned intensity in the current layer [J/(m^2)].
+    wn_dx : ndarray, shape (n_grid - 1,)
+        Wavenumber grid steps, used for integrals which do not require knowledge of grid point values.
+    abs_profiles
+    abs_offsets
+    abs_start_idxs
+    abs_profile_idx
+    ste_profiles
+    ste_offsets
+    ste_start_idxs
+    ste_profile_idx
+    spe_profiles
+    spe_offsets
+    spe_start_idxs
+    spe_profile_idx
+    full_prec : bool
+        Determines whether the full preconditioning strategy should be used, or whether rates are preconditioned only
+        within their single transition/have no other profile overlap.
+    psi_approx_cross : ndarray, shape (n_agg, n_grid,)
+        Cross coupling terms for each upper state [cm^-1.s^-1]. Empty when full_prec is False.
+    y_matrix : ndarray, shape (n_agg, n_agg)
+        Output Y matrix that is modified inplace.
+
+    """
+    n_trans = rates_grid_arr.shape[0]
+    n_grid = lambda_layer_grid.shape[0]
+    n_cross = psi_approx_cross.shape[0]
+
+    for t in range(n_trans):
+        id_agg_f_t = id_agg_f[t]
+        id_agg_i_t = id_agg_i[t]
+        if id_agg_f_t > id_agg_cutoff or id_agg_i_t > id_agg_cutoff:
+            continue
+
+        a_fi = rates_grid_arr[t, 0]  # [s^-1]
+        b_fi = rates_grid_arr[t, 1]  # [m^2/(J.s)]
+        b_if = rates_grid_arr[t, 2]  # [m^2/(J.s)]
+
+        # --- Slice out this transition's profile windows from the flat buffers. ---
+        abs_pidx = abs_profile_idx[t]
+        abs_offset_start_t = abs_offsets[abs_pidx]
+        abs_offset_end_t = abs_offsets[abs_pidx + 1]
+        abs_grid_start_t = abs_start_idxs[abs_pidx]
+        n_abs = abs_offset_end_t - abs_offset_start_t
+        abs_grid_end_t = abs_grid_start_t + n_abs
+
+        ste_pidx = ste_profile_idx[t]
+        ste_offset_start_t = ste_offsets[ste_pidx]
+        ste_offset_end_t = ste_offsets[ste_pidx + 1]
+        ste_grid_start_t = ste_start_idxs[ste_pidx]
+        n_ste = ste_offset_end_t - ste_offset_start_t
+        ste_grid_end_t = ste_grid_start_t + n_ste
+
+        # Profile units [cm^2]
+        abs_profile = abs_profiles[abs_offset_start_t:abs_offset_end_t]
+        ste_profile = ste_profiles[ste_offset_start_t:ste_offset_end_t]
+
+        # Normalised profiles [cm]
+        abs_profile_norm = loglinear_normalise_1d_nonnegative(
+            y_data=abs_profile, dx=wn_dx[abs_grid_start_t:abs_grid_end_t - 1]
+        )
+        ste_profile_norm = loglinear_normalise_1d_nonnegative(
+            y_data=ste_profile, dx=wn_dx[ste_grid_start_t:ste_grid_end_t - 1]
+        )
+
+        # U_fi [s^-1]
+        u_fi = float(a_fi)
+
+        n_f = n_lookup[id_agg_f_t]
+        n_i = n_lookup[id_agg_i_t]
+
+        # Band opacity [cm^2]
+        chi_if = np.zeros(n_grid, dtype=np.float64)
+        for i in range(n_abs):
+            chi_if[abs_grid_start_t + i] += n_i * abs_profile[i]
+        for i in range(n_ste):
+            chi_if[ste_grid_start_t + i] -= n_f * ste_profile[i]
+        chi_if *= chem_scale_factor
+        for i in range(n_grid):
+            if chi_if[i] < 0.0:
+                chi_if[i] = 0.0
+
+        if full_prec:
+            # psi_approx_cross_if = |chi_if[None, :] * psi_approx_cross|.
+            # Overwrite array for integrating each row loop.
+            psi_approx_cross_chi = np.empty(n_grid, dtype=np.float64)
+            for row in range(n_cross):
+                for i in range(n_grid):
+                    # Val is units [cm.s^-1]
+                    val = chi_if[i] * psi_approx_cross[row, i]
+                    # psi_approx_cross[row, i] = val if val >= 0.0 else -val
+                    psi_approx_cross_chi[i] = val if val >= 0.0 else -val
+                # Integrated Psi is a rate [s^-1]
+                psi_integral = loglinear_integral_1d_nonnegative(y_data=psi_approx_cross_chi, dx=wn_dx)
+                if psi_integral != 0:
+                    y_matrix[id_agg_i_t, row] -= psi_integral
+                    y_matrix[id_agg_f_t, row] += psi_integral
+        else:
+            spe_pidx = spe_profile_idx[t]
+            spe_offset_start_t = spe_offsets[spe_pidx]
+            spe_offset_end_t = spe_offsets[spe_pidx + 1]
+            spe_grid_start_t = spe_start_idxs[spe_pidx]
+            n_spe = spe_offset_end_t - spe_offset_start_t
+            spe_grid_end_t = spe_grid_start_t + n_spe
+
+            # Emission is stored in [erg.cm/(s.sr)]
+            spe_profile = spe_profiles[spe_offset_start_t:spe_offset_end_t]
+            spe_profile_norm = loglinear_normalise_1d_nonnegative(
+                y_data=spe_profile, dx=wn_dx[spe_grid_start_t:spe_grid_end_t - 1]
+            )
+
+            # self_prec_full = np.zeros(n_grid)
+            # for i in range(n_grid):
+            #     if chi_mask[i]:
+            #         self_prec_full[i] = lambda_layer_grid[i] * chi_if[i] / global_chi[i]
+
+            self_prec_windowed = np.empty(n_spe)
+            for i in range(n_spe):
+                # Windowed retains units of spe_profile_norm [cm]
+                if global_chi[spe_grid_start_t + i] == 0:
+                    self_prec_windowed[i] = 0
+                else:
+                    self_prec_windowed[i] = (
+                            lambda_layer_grid[spe_grid_start_t + i]
+                            * chi_if[spe_grid_start_t + i]
+                            * spe_profile_norm[i]
+                            / global_chi[spe_grid_start_t + i]
+                    )
+            # The self prec term is hence dimensionless.
+            self_prec = loglinear_integral_1d(y_data=self_prec_windowed, dx=wn_dx[spe_grid_start_t:spe_grid_end_t - 1])
+            u_fi *= (1.0 - self_prec)
+
+        # Integrands are [cm.J/m^2]
+        ste_integrand = np.empty(n_ste)
+        for i in range(n_ste):
+            ste_integrand[i] = ste_profile_norm[i] * i_prec[ste_grid_start_t + i]
+        # Integral is [J/m^2], product is hence [s^-1].
+        v_fi_prec = loglinear_integral_1d(y_data=ste_integrand, dx=wn_dx[ste_grid_start_t:ste_grid_end_t - 1]) * b_fi
+
+        abs_integrand = np.empty(n_abs)
+        for i in range(n_abs):
+            abs_integrand[i] = abs_profile_norm[i] * i_prec[abs_grid_start_t + i]
+        v_if_prec = loglinear_integral_1d(y_data=abs_integrand, dx=wn_dx[abs_grid_start_t:abs_grid_end_t - 1]) * b_if
+
+        # Update Y matrix inplace.
+        y_matrix[id_agg_f_t, id_agg_i_t] += v_if_prec
+        y_matrix[id_agg_i_t, id_agg_f_t] += u_fi + v_fi_prec
+        y_matrix[id_agg_f_t, id_agg_f_t] -= (u_fi + v_fi_prec)
+        y_matrix[id_agg_i_t, id_agg_i_t] -= v_if_prec
+
+
+@numba.njit(cache=True, error_model="numpy")
+def _build_y_matrix_cont(
+        id_agg_i: npt.NDArray[np.int32],
+        rates_grid_arr: npt.NDArray[np.float64],
+        id_agg_cutoff: int,
+        n_lookup: npt.NDArray[np.float64],
+        chem_scale_factor: float,
+        lambda_layer_grid: npt.NDArray[np.float64],
+        i_prec: npt.NDArray[np.float64],
+        wn_dx: npt.NDArray[np.float64],
+        abs_profiles: npt.NDArray[np.float64],
+        abs_offsets: npt.NDArray[np.int64],
+        abs_start_idxs: npt.NDArray[np.int64],
+        abs_profile_idx: npt.NDArray[np.int64],
+        limiting_species_num_dens: float,
+        full_prec: bool,
+        psi_approx_cross: npt.NDArray[np.float64],
+        # Outputs
+        y_matrix: npt.NDArray[np.float64],
+) -> None:
+    """
+
+    Parameters
+    ----------
+    id_agg_i : ndarray, shape (n_agg,)
+    rates_grid_arr : ndarray, shape (n_agg, three)
+        Each row contains the triple (A_fi, B_fi, B_if).
+    id_agg_cutoff : int
+    n_lookup : ndarray, shape (n_agg,)
+    chem_scale_factor : float
+        Dimensionless fractional abundance of the species at the current layer.
+    lambda_layer_grid : ndarray, shape (n_grid,)
+        Dimensionless Lambda operator at each grid point in the current layer.
+    i_prec : ndarray, shape (n_grid,)
+        Preconditioned intensity in the current layer [J/(m^2)].
+    wn_dx : ndarray, shape (n_grid - 1,)
+        Wavenumber grid steps, used for integrals which do not require knowledge of grid point values.
+    abs_profiles
+    abs_offsets
+    abs_start_idxs
+    abs_profile_idx
+    limiting_species_num_dens : float
+        Limiting number density of the species involved in photoassociative process to produce the current species.
+    full_prec : bool
+        Determines whether the full preconditioning strategy should be used, or whether rates are preconditioned only
+        within their single transition/have no other profile overlap.
+    psi_approx_cross : ndarray, shape (n_agg, n_grid,)
+        Cross coupling terms for each upper state [cm^-1.s^-1]. Empty when full_prec is False.
+    y_matrix : ndarray, shape (n_agg, n_agg)
+        Output Y matrix that is modified inplace.
+
+    """
+    n_trans = rates_grid_arr.shape[0]
+    n_grid = lambda_layer_grid.shape[0]
+    n_cross = psi_approx_cross.shape[0]
+
+    for t in range(n_trans):
+        id_agg_i_t = id_agg_i[t]
+        if id_agg_i_t > id_agg_cutoff:
+            continue
+
+        # a_ci = rates_grid_arr[t, 0]  # [s^-1]
+        # b_ci = rates_grid_arr[t, 1]  # [m^2/(J.s)]
+        b_ic = rates_grid_arr[t, 2]  # [m^2/(J.s)]
+
+        # --- Slice out this transition's profile windows from the flat buffers. ---
+        abs_pidx = abs_profile_idx[t]
+        abs_offset_start_t = abs_offsets[abs_pidx]
+        abs_offset_end_t = abs_offsets[abs_pidx + 1]
+        abs_grid_start_t = abs_start_idxs[abs_pidx]
+        n_abs = abs_offset_end_t - abs_offset_start_t
+        abs_grid_end_t = abs_grid_start_t + n_abs
+
+        # Profile units [cm^2]
+        abs_profile = abs_profiles[abs_offset_start_t:abs_offset_end_t]
+
+        # Normalised profiles [cm]
+        abs_profile_norm = loglinear_normalise_1d_nonnegative(
+            y_data=abs_profile, dx=wn_dx[abs_grid_start_t:abs_grid_end_t - 1]
+        )
+
+        # U_ci [s^-1]
+        # u_ci = float(a_ci)
+
+        n_i = n_lookup[id_agg_i_t]
+        n_i_scaled = n_i * chem_scale_factor
+
+        # Band opacity [cm^2]
+        chi_ic = np.zeros(n_grid, dtype=np.float64)
+        for i in range(n_abs):
+            chi_ic[abs_grid_start_t + i] += n_i_scaled * abs_profile[i]
+
+        for i in range(n_grid):
+            if chi_ic[i] < 0.0:
+                chi_ic[i] = 0.0
+
+        if full_prec:
+            # psi_approx_cross_if = |chi_if[None, :] * psi_approx_cross|.
+            # Overwrite array for integrating each row loop.
+            psi_approx_cross_chi = np.empty(n_grid, dtype=np.float64)
+            for row in range(n_cross):
+                for i in range(n_grid):
+                    # Val is units [cm.s^-1]
+                    val = chi_ic[i] * psi_approx_cross[row, i]
+                    # psi_approx_cross[row, i] = val if val >= 0.0 else -val
+                    psi_approx_cross_chi[i] = val if val >= 0.0 else -val
+                # Integrated Psi is a rate [s^-1]
+                psi_integral = loglinear_integral_1d_nonnegative(y_data=psi_approx_cross_chi, dx=wn_dx)
+                if psi_integral != 0:
+                    y_matrix[id_agg_i_t, row] -= psi_integral
+                    # y_matrix[id_agg_f_t, row] += psi_integral
+        # Integrands are [cm.J/m^2]
+        abs_integrand = np.empty(n_abs)
+        for i in range(n_abs):
+            abs_integrand[i] = abs_profile_norm[i] * i_prec[abs_grid_start_t + i]
+        v_ic_prec = loglinear_integral_1d(y_data=abs_integrand, dx=wn_dx[abs_grid_start_t:abs_grid_end_t - 1]) * b_ic
+
+        # limiting_scale_factor = 0.0
+        # if limiting_species_num_dens != 0:
+        #     limiting_scale_factor = chem_scale_factor * n_i / limiting_species_num_dens
+
+        # Update Y matrix inplace.
+        # This assumes an 100% dissociation efficiency.
+        # Hence, we don't keep track of the continuum state population; id_agg_c_t is always 0.
+        # y_matrix[id_agg_c_t, id_agg_i_t] += v_if_prec
+        # y_matrix[id_agg_i_t, id_agg_c_t] += u_ci + v_ci_prec
+        # y_matrix[id_agg_c_t, id_agg_c_t] -= (u_ci + v_ci_prec)
+        y_matrix[id_agg_i_t, id_agg_i_t] -= v_ic_prec
+        # However, we can fix the effective "c" population as a scaled function of the limiting, photoassociating
+        # species' number density.
+        # y_matrix[id_agg_i_t, id_agg_i_t] += u_ci * limiting_scale_factor
+        # y_matrix[id_agg_i_t, id_agg_i_t] += v_ci_prec * limiting_scale_factor
 
 
 # -------------------------------------------- Bezier Coefficients & Setup --------------------------------------------
@@ -1698,6 +2001,10 @@ class NLTEProcessor:
         g_lookup = np.zeros(max_state_id + 1, dtype=np.float64)
         g_lookup[state_ids] = states_frac["g"].to_numpy()
         g_lookup = np.ascontiguousarray(g_lookup)
+        inv_g_lookup = np.zeros_like(g_lookup)
+        zero_mask = g_lookup == 0.0
+        inv_g_lookup[~zero_mask] = 1.0 / g_lookup[~zero_mask]
+        inv_g_lookup = np.ascontiguousarray(inv_g_lookup)
 
         tau_lookup = np.zeros(max_state_id + 1, dtype=np.float64)
         tau_lookup[state_ids] = states_frac["tau"].to_numpy()
@@ -1753,41 +2060,30 @@ class NLTEProcessor:
                     n_bands_max=n_bands_max,
                 )
                 if self.do_super_lines:
-                    energy_fi = trans_batch["energy_fi"].to_numpy()
-                    a_fi = np.ascontiguousarray(trans_batch["A_fi"].to_numpy())
-                    bin_indices = np.ascontiguousarray(np.clip(
-                        np.searchsorted(bin_edges, energy_fi, side="right") - 1,
-                        0,
-                        n_grid - 1,
-                        dtype=np.int32
-                    ))
                     _accumulate_superline_band_batch(
                         profile_buffer=profile_buffer,
                         band_indices=band_indices,
-                        bin_indices=bin_indices,
-                        g_lookup=g_lookup,
-                        abs_ste_prefactor=np.ascontiguousarray(a_fi / (const_8_pi_c * energy_fi ** 2)),
-                        spe_prefactor=np.ascontiguousarray(a_fi * energy_fi * const_h_c_on_4_pi),
-                        id_i=np.ascontiguousarray(trans_batch["id_i"].to_numpy()),
-                        id_f=np.ascontiguousarray(trans_batch["id_f"].to_numpy()),
+                        bin_edges=bin_edges,
                         n_frac_lookup=n_frac_lookup,
+                        g_lookup=g_lookup,
+                        inv_g_lookup=inv_g_lookup,
+                        id_f=np.ascontiguousarray(trans_batch["id_f"].to_numpy()),
+                        id_i=np.ascontiguousarray(trans_batch["id_i"].to_numpy()),
+                        a_fi=np.ascontiguousarray(trans_batch["A_fi"].to_numpy()),
+                        energy_fi=np.ascontiguousarray(trans_batch["energy_fi"].to_numpy()),
                     )
                 else:
-                    band_group_indices, group_starts, group_ends = _find_groups_from_ids(
-                        id_agg_f=np.ascontiguousarray(trans_batch["id_agg_f"].to_numpy()),
-                        id_agg_i=np.ascontiguousarray(trans_batch["id_agg_i"].to_numpy()),
-                        band_indices=band_indices,
-                    )
                     _band_profile_sampled_voigt(
                         profile_buffer=profile_buffer,
                         wn_grid=wn_arr,
                         id_f=np.ascontiguousarray(trans_batch["id_f"].to_numpy()),
                         id_i=np.ascontiguousarray(trans_batch["id_i"].to_numpy()),
-                        band_group_indices=band_group_indices,
-                        group_starts=group_starts,
-                        group_ends=group_ends,
+                        id_agg_f=np.ascontiguousarray(trans_batch["id_agg_f"].to_numpy()),
+                        id_agg_i=np.ascontiguousarray(trans_batch["id_agg_i"].to_numpy()),
+                        band_indices=band_indices,
                         n_lookup=n_frac_lookup,
                         g_lookup=g_lookup,
+                        inv_g_lookup=inv_g_lookup,
                         tau_lookup=tau_lookup,
                         a_fi=np.ascontiguousarray(trans_batch["A_fi"].to_numpy()),
                         energy_fi=np.ascontiguousarray(trans_batch["energy_fi"].to_numpy()),
@@ -1797,22 +2093,8 @@ class NLTEProcessor:
                         broad_gamma=broad_gamma,
                         species_mass=self.species_mass,
                     )
-                    # _process_band_batch(
-                    #     trans_batch=trans_batch,
-                    #     profile_buffer=profile_buffer,
-                    #     band_indices=band_indices,
-                    #     n_frac_lookup=n_frac_lookup,
-                    #     g_lookup=g_lookup,
-                    #     tau_lookup=tau_lookup,
-                    #     broad_n=broad_n,
-                    #     broad_gamma=broad_gamma,
-                    #     species_mass=self.species_mass,
-                    #     wn_grid=wn_arr,
-                    #     temperature_profile=temperature_slice,
-                    #     pressure_profile=pressure_slice,
-                    # )
                 # Do rates for batch - same regardless of line processing strategy.
-                agg_batch = _compute_agg_rates(trans_batch, g_lookup)
+                agg_batch = _compute_agg_rates(trans_batch=trans_batch, g_lookup=g_lookup, inv_g_lookup=inv_g_lookup)
                 if agg_batch is not None:
                     rates_list.append(agg_batch)
         # Contract the buffer based on n_bands_used, drop superfluous rows.
@@ -1835,11 +2117,10 @@ class NLTEProcessor:
             .select(["id_agg_f", "id_agg_i"])
             .to_numpy()
         )  # (n_bands_used, 2)
-        log.info(f"{self.species} Band keys = {band_keys}")
         self.profile_store.finalise_from_buffer(
             profile_buffer=profile_buffer,
             band_keys=band_keys,
-            save=False,
+            save=True,
             species=self.species,
         )
         # Done, finalise list of rates chunks.
@@ -1872,7 +2153,8 @@ class NLTEProcessor:
             ])
             .sort(["id_agg_i", "id_agg_f"])
         )
-        log.info(f"[I0] {self.species} Rates = \n{self.rates_grid}")
+        with pl.Config(tbl_rows=1000):
+            log.info(f"[I0] {self.species} Rates = \n{self.rates_grid}")
 
     def compute_continuum_rates_profiles(
             self,
@@ -2001,6 +2283,10 @@ class NLTEProcessor:
         g_lookup = np.zeros(max_state_id + 1, dtype=np.float64)
         g_lookup[state_ids] = states_frac["g"].to_numpy()
         g_lookup = np.ascontiguousarray(g_lookup)
+        inv_g_lookup = np.zeros_like(g_lookup)
+        zero_mask = g_lookup == 0.0
+        inv_g_lookup[~zero_mask] = 1.0 / g_lookup[~zero_mask]
+        inv_g_lookup = np.ascontiguousarray(inv_g_lookup)
 
         v_lookup = np.zeros(max_state_id + 1, dtype=np.float64)
         v_lookup[state_ids] = states_frac["v"].to_numpy()
@@ -2052,43 +2338,33 @@ class NLTEProcessor:
                     n_bands_max=n_bands_max,
                 )
                 if self.cont_do_super_lines:
-                    energy_fi = trans_batch["energy_fi"].to_numpy()
-                    a_fi = np.ascontiguousarray(trans_batch["A_fi"].to_numpy())
-                    bin_indices = np.ascontiguousarray(np.clip(
-                        np.searchsorted(bin_edges, energy_fi, side="right") - 1,
-                        0,
-                        n_grid - 1,
-                        dtype=np.int32
-                    ))
                     _accumulate_continuum_superline_band_batch(
                         profile_buffer=profile_buffer,
                         band_indices=band_indices,
-                        bin_indices=bin_indices,
+                        bin_edges=bin_edges,
                         n_frac_lookup=n_frac_lookup,
                         g_lookup=g_lookup,
+                        inv_g_lookup=inv_g_lookup,
                         v_lookup=v_lookup,
-                        abs_prefactor=np.ascontiguousarray(a_fi / (const_8_pi_c * energy_fi ** 2)),
-                        id_i=np.ascontiguousarray(trans_batch["id_i"].to_numpy()),
                         id_f=np.ascontiguousarray(trans_batch["id_f"].to_numpy()),
+                        id_i=np.ascontiguousarray(trans_batch["id_i"].to_numpy()),
+                        a_fi=np.ascontiguousarray(trans_batch["A_fi"].to_numpy()),
+                        energy_fi=np.ascontiguousarray(trans_batch["energy_fi"].to_numpy()),
                         reduced_mass=self.reduced_mass,
                         box_length=self.cont_box_length,
                     )
                 else:
-                    band_group_indices, group_starts, group_ends = _find_groups_from_ids(
-                        id_agg_f=np.ascontiguousarray(trans_batch["id_agg_f"].to_numpy()),
-                        id_agg_i=np.ascontiguousarray(trans_batch["id_agg_i"].to_numpy()),
-                        band_indices=band_indices,
-                    )
                     _continuum_band_profile_sampled_gauss_layered(
                         profile_buffer=profile_buffer,
                         wn_grid=wn_arr,
                         id_f=np.ascontiguousarray(trans_batch["id_f"].to_numpy()),
                         id_i=np.ascontiguousarray(trans_batch["id_i"].to_numpy()),
-                        band_group_indices=band_group_indices,
-                        group_starts=group_starts,
-                        group_ends=group_ends,
+                        id_agg_f=np.ascontiguousarray(trans_batch["id_agg_f"].to_numpy()),
+                        id_agg_i=np.ascontiguousarray(trans_batch["id_agg_i"].to_numpy()),
+                        band_indices=band_indices,
                         n_lookup=n_frac_lookup,
                         g_lookup=g_lookup,
+                        inv_g_lookup=inv_g_lookup,
                         v_lookup=v_lookup,
                         a_fi=np.ascontiguousarray(trans_batch["A_fi"].to_numpy()),
                         energy_fi=np.ascontiguousarray(trans_batch["energy_fi"].to_numpy()),
@@ -2097,21 +2373,8 @@ class NLTEProcessor:
                         reduced_mass=self.reduced_mass,
                         box_length=self.cont_box_length,
                     )
-                    # _process_continuum_band_batch(
-                    #     trans_batch=trans_batch,
-                    #     profile_buffer=profile_buffer,
-                    #     band_indices=band_indices,
-                    #     n_frac_lookup=n_frac_lookup,
-                    #     g_lookup=g_lookup,
-                    #     v_lookup=v_lookup,
-                    #     species_mass=self.species_mass,
-                    #     reduced_mass=self.reduced_mass,
-                    #     cont_box_length=self.cont_box_length,
-                    #     wn_grid=wn_arr,
-                    #     temperature_profile=temperature_slice,
-                    # )
                 # Do rates for batch - same regardless of line processing strategy.
-                agg_batch = _compute_agg_rates(trans_batch, g_lookup)
+                agg_batch = _compute_agg_rates(trans_batch=trans_batch, g_lookup=g_lookup, inv_g_lookup=inv_g_lookup)
                 if agg_batch is not None:
                     cont_rates_list.append(agg_batch)
         # Contract the buffer based on n_bands_used, drop superfluous rows.
@@ -2146,7 +2409,8 @@ class NLTEProcessor:
                 pl.col("B_fi").sum().alias("B_fi"),
                 pl.col("B_if").sum().alias("B_if"),
             ])
-            log.info(f"[I0] {self.species} Continuum rates = \n{self._cont_rates}")
+            with pl.Config(tbl_rows=1000):
+                log.info(f"[I0] {self.species} Continuum rates = \n{self._cont_rates}")
         else:
             self._cont_rates = None
             log.info(f"[I0] {self.species} No continuum rates computed on spectral grid.")
@@ -2335,7 +2599,7 @@ class NLTEProcessor:
             temperature_profile: u.Quantity,
             wn_grid: u.Quantity,
             wn_dx: u.Quantity,
-    ) -> u.Quantity:
+    ) -> None:
         n_layers = temperature_profile.shape[0]
 
         rates_filter = (pl.col("id_agg_f") <= self.id_agg_cutoff) & (pl.col("id_agg_i") <= self.id_agg_cutoff)
@@ -2440,19 +2704,20 @@ class NLTEProcessor:
                 #     x_data=wn_grid[abs_start_idx:abs_end_idx]
                 # )
                 abs_profile_norm = loglinear_normalise_quantity_1d_nonnegative(
-                    y_data=abs_profile, dx=wn_dx[abs_start_idx:abs_end_idx]
+                    y_data=abs_profile, dx=wn_dx[abs_start_idx:abs_end_idx - 1]
                 )
                 ste_profile_norm = loglinear_normalise_quantity_1d_nonnegative(
-                    y_data=ste_profile, dx=wn_dx[ste_start_idx:ste_end_idx]
+                    y_data=ste_profile, dx=wn_dx[ste_start_idx:ste_end_idx - 1]
                 )
                 v_fi[layer_idx] = loglinear_integral_quantity_1d_nonnegative(
-                    y_data=ste_profile_norm * b_fi * i_mean[layer_idx, ste_start_idx:ste_end_idx],
-                    dx=wn_dx[ste_start_idx:ste_end_idx]
-                )
+                    y_data=ste_profile_norm * i_mean[layer_idx, ste_start_idx:ste_end_idx],
+                    dx=wn_dx[ste_start_idx:ste_end_idx - 1]
+                ) * b_fi
                 v_if[layer_idx] = loglinear_integral_quantity_1d_nonnegative(
-                    y_data=abs_profile_norm * b_if * i_mean[layer_idx, abs_start_idx:abs_end_idx],
-                    dx=wn_dx[abs_start_idx:abs_end_idx]
-                )
+                    y_data=abs_profile_norm * i_mean[layer_idx, abs_start_idx:abs_end_idx],
+                    dx=wn_dx[abs_start_idx:abs_end_idx - 1]
+                ) * b_if
+                log.info(f"[L{layer_idx}] {self.species} V_fi = {v_fi[layer_idx]:.4E} V_if = {v_if[layer_idx]:.4E}.")
                 energy_dif_wmean[layer_idx] = np.average(
                     wn_grid[abs_start_idx:abs_end_idx].value,
                     weights=abs_profile_norm.value,
@@ -2467,7 +2732,8 @@ class NLTEProcessor:
             t_ex_profile = (ac_h_c_on_kB * energy_dif_wmean / np.log(1 / n_ratio)).to(u.K)
             if np.any(t_ex_profile < 0):
                 log.warning(f"{self.species} T_ex for ({id_agg_f}-{id_agg_i}) band contains negatives!")
-            t_ex_profile = np.clip(t_ex_profile.value, a_min=0.0, a_max=20000) << u.K  # Failsafe
+            # t_ex_profile = np.where(np.isnan(t_ex_profile), temperature_profile, t_ex_profile)
+            t_ex_profile = np.clip(abs(t_ex_profile), a_min=0.0 * u.K, a_max=temperature_profile * 3.0)   # Failsafe
             log.info(f"DEBUG: {id_agg_f}-{id_agg_i} T_ex = {t_ex_profile}")
             # log.info(f"DEBUG: {id_agg_f}-{id_agg_i}: C_if = {c_if}, C_fi = {c_fi}, V_if = {v_if}, V_fi = {v_fi},"
             #          f" A_fi = {a_fi}.")
@@ -2538,7 +2804,7 @@ class NLTEProcessor:
         n_agg_final = np.zeros((n_nlte_layers, self.n_agg_states))
         np.add.at(n_agg_final.T, id_agg_np, n_scaled.T)
 
-        # TODO: This is broken when ther are null states in the grouping!
+        # TODO: This is broken when there are null states in the grouping!
         # self._nlte_pop_frac[nlte_layer_slice] = n_scaled[:, cutoff_mask].sum(axis=1)
         self._nlte_pop_frac[nlte_layer_slice] = n_agg_final[:, :self.id_agg_cutoff + 1].sum(axis=1)
         log.info(f"NLTE pop frac = {self._nlte_pop_frac}.")
@@ -2560,7 +2826,7 @@ class NLTEProcessor:
 
         self.states = self.states.with_columns(nlte_col_exprs)
         self.pop_matrix = np.vstack((self.pop_matrix, t_ex_pop_grid))
-        return t_ex_profile
+        # return t_ex_profile
 
     def precompute_all_cross_terms(
             self,
@@ -2622,7 +2888,29 @@ class NLTEProcessor:
                 lambda_layer_grid[chi_mask] * species_eta[chi_mask] / global_chi[chi_mask]
         )
         psi_approx_eta = np.clip(abs(psi_approx_eta), 0, i_layer_grid)
+        log.info(f"I_l negatives = {np.any(i_layer_grid < 0)}, nans? {np.any(np.isnan(i_layer_grid))}")
         i_prec: u.Quantity = (i_layer_grid - psi_approx_eta) * 4 * np.pi * u.sr
+        log.info(f"I_prec negatives {np.any(i_prec < 0)}, nans? {np.any(np.isnan(i_prec))}")
+
+        np.save(rf"/mnt/c/PhD/programs/TIRAMISU/tests/i_prec_{self.species}_L{layer_idx}.npy", i_prec.value)
+        np.save(rf"/mnt/c/PhD/programs/TIRAMISU/tests/psi_approx_eta_{self.species}_L{layer_idx}.npy", psi_approx_eta.value)
+        np.save(rf"/mnt/c/PhD/programs/TIRAMISU/tests/i_layer_grid_{self.species}_L{layer_idx}.npy", i_layer_grid.value)
+
+        # DEBUG
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(4, 6), dpi=300)
+        plt.plot(wn_grid, i_layer_grid.value * 5 * np.pi, color="#33BBEE", label="4pi * I_layer")
+        plt.plot(wn_grid, i_prec.value, color="#EE3377", label="I_prec")
+        plt.xlabel(f"Wavenumbers ({wn_grid.unit:latex})", fontsize=16)
+        plt.xlim(left=wn_grid.value[0], right=wn_grid.value[-1])
+        plt.ylabel(f"Intensity ({i_prec.unit:latex})", fontsize=16)
+        plt.yscale("log")
+        plt.ylim(bottom=1e-12)
+        plt.legend(loc="best")
+        plt.tight_layout()
+        plt.show()
+        plt.close()
+        ############
 
         n_dim = self.id_agg_cutoff + 1
         y_matrix = np.zeros((n_dim, n_dim), dtype=np.float64) << (1 / u.s)
@@ -2637,296 +2925,307 @@ class NLTEProcessor:
             )
             psi_approx_cross = np.zeros((n_dim, num_grid), dtype=np.float64) << a_ox_cross_cache.unit / global_chi.unit
             shielded_lambda = np.clip(lambda_layer_grid, 0, 1)
-            # psi_approx_cross_unit = u.J / (u.m ** 2 * u.sr)  # Absolute profiles
-            # psi_approx_cross_unit = u.J / (u.m ** 2)  # Normalised profiles
+
             psi_approx_cross[:, chi_mask] = (
                     shielded_lambda[chi_mask] * a_ox_cross_cache[:, chi_mask] / global_chi[chi_mask]
-            )  # .to(psi_approx_cross_unit, equivalencies=u.spectral())
-            # np.save(r"/mnt/c/PhD/NLTE/theory/cross_coupling/psi_approx_cross_abs.npy", psi_approx_cross.value)
-            # np.save(r"/mnt/c/PhD/NLTE/theory/cross_coupling/psi_approx_cross_norm.npy", psi_approx_cross.value)
-
-        for trans_row in self.rates_grid.iter_rows(named=False):
-            # 0 = id_agg_f, 1 = id_agg_i, 2 = A_fi, 3 = B_fi, 4 = B_if.
-            if trans_row[0] > self.id_agg_cutoff or trans_row[1] > self.id_agg_cutoff:
-                # Short-circuit for bands involving states above cutoff; these pops are fixed and including them on RHS
-                # biases towards fixed distribution above cutoff.
-                continue
-            a_fi = trans_row[2] * einstein_a_unit
-            b_fi = trans_row[3] * einstein_b_unit
-            b_if = trans_row[4] * einstein_b_unit
-            # log.info(f"[L{layer_idx}] Trans: {trans_row}.")
-
-            # These are pop-normalised within the band, but redundant due to normalisation.
-            abs_profile, abs_start_idx = self.profile_store.get_profile(
-                layer_idx=nlte_layer_idx, key=(trans_row[0], trans_row[1]), profile_type="abs"
-            )
-            # abs_profile = abs_profile * self.pop_matrix[-1, layer_idx, trans_row[1]] << u.cm ** 2
-            abs_profile: u.Quantity = abs_profile << u.cm ** 2
-            ste_profile, ste_start_idx = self.profile_store.get_profile(
-                layer_idx=nlte_layer_idx, key=(trans_row[0], trans_row[1]), profile_type="ste"
-            )
-            # ste_profile = ste_profile * self.pop_matrix[-1, layer_idx, trans_row[0]] << u.cm ** 2
-            ste_profile: u.Quantity = ste_profile << u.cm ** 2
-
-            abs_end_idx = abs_start_idx + len(abs_profile)
-            ste_end_idx = ste_start_idx + len(ste_profile)
-
-            # Normalised profiles with units [cm].
-            # abs_profile_norm = simpson_normalise_quantity_1d(
-            #     y_data=abs_profile, x_data=wn_grid[abs_start_idx:abs_end_idx]
-            # )
-            # ste_profile_norm = simpson_normalise_quantity_1d(
-            #     y_data=ste_profile, x_data=wn_grid[ste_start_idx:ste_end_idx]
-            # )
-            abs_profile_norm = loglinear_normalise_quantity_1d_nonnegative(
-                y_data=abs_profile, dx=wn_dx[abs_start_idx:abs_end_idx]
-            )
-            ste_profile_norm = loglinear_normalise_quantity_1d_nonnegative(
-                y_data=ste_profile, dx=wn_dx[ste_start_idx:ste_end_idx]
             )
 
-            # U_fi is the integral of A_fi*phi_fi; phi_fi is integral normalised, so we can skip this.
-            u_fi = a_fi
-            u_fi = u_fi.decompose()
+        if self.debug:
+            for trans_row in self.rates_grid.iter_rows(named=False):
+                # 0 = id_agg_f, 1 = id_agg_i, 2 = A_fi, 3 = B_fi, 4 = B_if.
+                if trans_row[0] > self.id_agg_cutoff or trans_row[1] > self.id_agg_cutoff:
+                    # Short-circuit for bands involving states above cutoff; these pops are fixed and including them on RHS
+                    # biases towards fixed distribution above cutoff.
+                    continue
+                a_fi = trans_row[2] * einstein_a_unit
+                b_fi = trans_row[3] * einstein_b_unit
+                b_if = trans_row[4] * einstein_b_unit
+                log.info(f"[L{layer_idx}] Trans: {trans_row}.")
 
-            # Cross terms:
-            # chi_if: u.Quantity = np.zeros(num_grid) << (abs_profile_norm.unit * b_if.unit)
-            # chi_if[abs_start_idx: abs_end_idx] += (
-            #         self.pop_matrix[-1, layer_idx, trans_row[1]]
-            #         * abs_profile_norm
-            #         * b_if
-            # )
-            # chi_if[ste_start_idx: ste_end_idx] -= (
-            #         self.pop_matrix[-1, layer_idx, trans_row[0]]
-            #         * ste_profile_norm
-            #         * b_fi
-            # )
-            chi_if: u.Quantity = np.zeros(num_grid) << abs_profile.unit
-            chi_if[abs_start_idx: abs_end_idx] += (
-                    self.pop_matrix[-1, layer_idx, trans_row[1]]
-                    * abs_profile
-            )
-            chi_if[ste_start_idx: ste_end_idx] -= (
-                    self.pop_matrix[-1, layer_idx, trans_row[0]]
-                    * ste_profile
-            )
-            chi_if *= chem_profile[self.species][layer_idx]
-            # chi_if = np.where(chi_if < 0, 0, chi_if)
-            chi_if = np.clip(chi_if, a_min=0, a_max=None) << chi_if.unit
-            if full_prec:
-                # psi_approx_cross_if = np.abs(chi_if[None, :] * psi_approx_cross) * 4 * np.pi * u.sr  # Abs. profiles.
-                psi_approx_cross_if = np.abs(chi_if[None, :] * psi_approx_cross)  # Normalised profiles.
-                # psi_integrals = simpson_quantity_2d(y_data=psi_approx_cross_if, x_data=wn_grid)  # .decompose()
-                psi_integrals = loglinear_integral_quantity_2d_nonnegative(y_data=psi_approx_cross_if, dx=wn_dx)
-
-                # np.save(fr"/mnt/c/PhD/NLTE/theory/cross_coupling/psi_approx_cross_{trans_row[1]}{trans_row[0]}_abs.npy", psi_approx_cross_if.value)
-                # np.save(fr"/mnt/c/PhD/NLTE/theory/cross_coupling/psi_approx_cross_{trans_row[1]}{trans_row[0]}_norm.npy", psi_approx_cross_if.value)
-
-                # o_pops = self.pop_matrix[-1, layer_idx, :]
-
-                # below_cutoff = np.arange(self.n_agg_states) <= self.id_agg_cutoff
-                nonzero_integral_mask = psi_integrals.value != 0
-                # nonzero_pop_mask = o_pops != 0
-
-                # # If below cutoff, update Y-row elements where integrals are non-zero.
-                # below_mask = below_cutoff & nonzero_integral_mask
-                # # If above cutoff, update Y-row elements with sum of where integrals and fixed pop factor are non-zero.
-                # # above_mask = ~below_cutoff & nonzero_integral_mask & nonzero_pop_mask
-
-                # log.info(f"[L{layer_idx}] chi_psi_{trans_row[1], trans_row[0]} = {psi_integrals}")
-
-                y_matrix[trans_row[1], nonzero_integral_mask] -= psi_integrals[nonzero_integral_mask]
-                y_matrix[trans_row[0], nonzero_integral_mask] += psi_integrals[nonzero_integral_mask]
-
-                # if trans_row[1] <= self.id_agg_cutoff:
-                #     # rhs_matrix[trans_row[1]] += np.sum(psi_integrals[above_mask] * o_pops[above_mask])
-                #     y_matrix[trans_row[1], below_mask] -= psi_integrals[below_mask]
-                #
-                # if trans_row[0] <= self.id_agg_cutoff:
-                #     # rhs_matrix[trans_row[0]] -= np.sum(psi_integrals[above_mask] * o_pops[above_mask])
-                #     y_matrix[trans_row[0], below_mask] += psi_integrals[below_mask]
-            else:
-                # Here we compute (1 - Chi_if*Psi^{*})*Ufi, where Psi^{*} = Lambda^{*}[1/Chi_nu]. Expanding out the
-                # brackets, the first term has no wavenumber dependence, so we can skip the integral. The Chi_if*Psi^{*}
-                # term has a wavenumber dependence however, so we compute Lambda^{*}[Chi_if/Chi_nu]*phi_fi. The Lambda
-                # operator is dimensionless here and the normalised spontaneous emission profile has units of [cm];
-                # taking the yields the desired dimensionless factor to reduce A_fi by.
-                spe_profile, spe_start_idx = self.profile_store.get_profile(
+                # These are pop-normalised within the band, but redundant due to normalisation.
+                abs_profile, abs_start_idx = self.profile_store.get_profile(
+                    layer_idx=nlte_layer_idx, key=(trans_row[0], trans_row[1]), profile_type="abs"
+                )
+                # abs_profile = abs_profile * self.pop_matrix[-1, layer_idx, trans_row[1]] << u.cm ** 2
+                abs_profile: u.Quantity = abs_profile << u.cm ** 2
+                ste_profile, ste_start_idx = self.profile_store.get_profile(
                     layer_idx=nlte_layer_idx, key=(trans_row[0], trans_row[1]), profile_type="ste"
                 )
-                spe_profile = spe_profile << u.erg * u.cm / (u.s * u.sr)
-                spe_end_idx = spe_start_idx + len(spe_profile)
-                # spe_profile_norm = simpson_normalise_quantity_1d(
-                #     y_data=spe_profile, x_data=wn_grid[spe_start_idx:spe_end_idx]
-                # )
-                spe_profile_norm = loglinear_normalise_1d_nonnegative(
-                    y_data=spe_profile, dx=wn_dx[spe_start_idx:spe_end_idx]
+                # ste_profile = ste_profile * self.pop_matrix[-1, layer_idx, trans_row[0]] << u.cm ** 2
+                ste_profile: u.Quantity = ste_profile << u.cm ** 2
+
+                abs_end_idx = abs_start_idx + len(abs_profile)
+                ste_end_idx = ste_start_idx + len(ste_profile)
+
+                # Normalised profiles with units [cm].
+                abs_profile_norm = loglinear_normalise_quantity_1d_nonnegative(
+                    y_data=abs_profile, dx=wn_dx[abs_start_idx:abs_end_idx - 1]
                 )
-                self_prec = np.zeros(num_grid)
-                self_prec[chi_mask] = (
-                        lambda_layer_grid[chi_mask]
-                        * chi_if[chi_mask]
-                        # * ac.h
-                        / global_chi[chi_mask]
-                )
-                self_prec = self_prec[spe_start_idx:spe_end_idx] * spe_profile_norm
-                # self_prec = simpson_quantity(y_data=self_prec, x_data=wn_grid[spe_start_idx:spe_end_idx])
-                self_prec = loglinear_integral_quantity_1d(y_data=self_prec, dx=wn_dx[spe_start_idx:spe_end_idx])
-                u_fi *= 1 - self_prec
-            # End cross.
-            # log.info(f"[L{layer_idx}] U_{trans_row[0], trans_row[1]} = {u_fi}")
-
-            # v_fi_prec = simpson_quantity(
-            #     y_data=ste_profile_norm * i_prec[ste_start_idx: ste_end_idx],
-            #     x_data=wn_grid[ste_start_idx: ste_end_idx]
-            # ) * b_fi
-            v_fi_prec = loglinear_integral_quantity_1d(
-                y_data=ste_profile_norm * i_prec[ste_start_idx: ste_end_idx],
-                dx=wn_dx[ste_start_idx: ste_end_idx]
-            ) * b_fi
-            v_fi_prec = v_fi_prec.decompose()
-            # log.info(f"[L{layer_idx}] V_{trans_row[0], trans_row[1]}_prec = {v_fi_prec}")
-
-            # v_if_prec = simpson_quantity(
-            #     y_data=abs_profile_norm * i_prec[abs_start_idx: abs_end_idx],
-            #     x_data=wn_grid[abs_start_idx: abs_end_idx]
-            # ) * b_if
-            v_if_prec = loglinear_integral_quantity_1d(
-                y_data=abs_profile_norm * i_prec[abs_start_idx: abs_end_idx],
-                dx=wn_dx[abs_start_idx: abs_end_idx]
-            ) * b_if
-            v_if_prec = v_if_prec.decompose()
-            # log.info(f"[L{layer_idx}] V_{trans_row[1], trans_row[0]}_prec = {v_if_prec}")
-
-            y_matrix[trans_row[0], trans_row[1]] += v_if_prec
-            y_matrix[trans_row[1], trans_row[0]] += u_fi + v_fi_prec
-            y_matrix[trans_row[0], trans_row[0]] -= u_fi + v_fi_prec
-            y_matrix[trans_row[1], trans_row[1]] -= v_if_prec
-            # Use below if including fixed rates on RHS for states above cutoff.
-            # if trans_row[0] <= self.id_agg_cutoff and trans_row[1] <= self.id_agg_cutoff:
-            #     y_matrix[trans_row[0], trans_row[1]] += v_if_prec
-            #     y_matrix[trans_row[1], trans_row[0]] += u_fi + v_fi_prec
-            #     y_matrix[trans_row[0], trans_row[0]] -= u_fi + v_fi_prec
-            #     y_matrix[trans_row[1], trans_row[1]] -= v_if_prec
-            # elif trans_row[0] > self.id_agg_cutoff:
-            #     # ID_u above cutoff.
-            #     # Move fixed y_matrix[trans_row[1], trans_row[0]] to RHS, include fixed trans_row[0] pop.
-            #     rhs_matrix[trans_row[1]] -= (u_fi + v_fi_prec) * self.pop_matrix[-1, layer_idx, trans_row[0]]
-            #     y_matrix[trans_row[1], trans_row[1]] -= v_if_prec
-            # else:
-            #     # ID_l above cutoff.
-            #     # Move fixed y_matrix[trans_row[0], trans_row[1]] to RHS, include fixed trans_row[1] pop.
-            #     rhs_matrix[trans_row[0]] -= v_if_prec * self.pop_matrix[-1, layer_idx, trans_row[1]]
-            #     y_matrix[trans_row[0], trans_row[0]] -= u_fi + v_fi_prec
-
-        if self._cont_rates is not None:
-            # log.info(f"Cont rates = {self.cont_rates}")
-            # log.info((
-            #     f"Cont profile store keys = "
-            #     f"{self.cont_profile_store.get_keys(layer_idx=nlte_layer_idx, profile_type="abs")}"
-            # ))
-            for cont_trans_row in self._cont_rates.iter_rows(named=False):
-                if cont_trans_row[0] > self.id_agg_cutoff:
-                    # Short-circuit for bands involving states above cutoff; these pops are fixed and including them on
-                    # RHS biases towards fixed distribution above cutoff.
-                    continue
-
-                a_ci = cont_trans_row[1] * einstein_a_unit
-                # b_ci = cont_trans_row[2] * einstein_b_unit
-                b_ic = cont_trans_row[3] * einstein_b_unit
-
-                # log.info(f"{self.species}: Cont. profile for state {cont_trans_row[0]}.")
-                # if cont_trans_row[0] in self.cont_profile_grid[nlte_layer_idx]:
-                cont_abs_profile, cont_abs_start_idx = self._cont_profile_store.get_profile(
-                    layer_idx=nlte_layer_idx, key=cont_trans_row[0], profile_type="abs"
-                )
-                # cont_abs_profile = cont_abs_profile * self.pop_matrix[-1, layer_idx, cont_trans_row[0]] << u.cm ** 2
-                cont_abs_profile: u.Quantity = cont_abs_profile << u.cm ** 2
-                cont_abs_end_idx = cont_abs_start_idx + len(cont_abs_profile)
-
-                # cont_abs_profile_norm = simpson_normalise_quantity_1d(
-                #     y_data=cont_abs_profile, x_data=wn_grid[cont_abs_start_idx:cont_abs_end_idx]
-                # )
-                cont_abs_profile_norm = loglinear_normalise_quantity_1d_nonnegative(
-                    y_data=cont_abs_profile, dx=wn_dx[cont_abs_start_idx:cont_abs_end_idx]
+                ste_profile_norm = loglinear_normalise_quantity_1d_nonnegative(
+                    y_data=ste_profile, dx=wn_dx[ste_start_idx:ste_end_idx - 1]
                 )
 
-                # Cross terms:
-                # chi_ic = np.zeros(num_grid) << (cont_abs_profile_norm.unit * b_ic.unit)
-                # chi_ic[cont_abs_start_idx: cont_abs_end_idx] += (
-                #         self.pop_matrix[-1, layer_idx, cont_trans_row[0]]
-                #         * cont_abs_profile_norm
-                #         * b_ic
-                #         * chem_profile[self.species][layer_idx]
-                # )
-                # chi_ic = np.where(chi_ic < 0, 0, chi_ic)
-                chi_ic: u.Quantity = np.zeros(num_grid) << cont_abs_profile.unit
-                chi_ic[cont_abs_start_idx: cont_abs_end_idx] += (
-                        self.pop_matrix[-1, layer_idx, cont_trans_row[0]]
-                        * cont_abs_profile
-                        * chem_profile[self.species][layer_idx]
+                # U_fi is the integral of A_fi*phi_fi; phi_fi is integral normalised, so we can skip this.
+                u_fi = a_fi
+                u_fi = u_fi.decompose()
+
+                chi_if: u.Quantity = np.zeros(num_grid) << abs_profile.unit
+                chi_if[abs_start_idx: abs_end_idx] += (
+                        self.pop_matrix[-1, layer_idx, trans_row[1]]
+                        * abs_profile
                 )
+                chi_if[ste_start_idx: ste_end_idx] -= (
+                        self.pop_matrix[-1, layer_idx, trans_row[0]]
+                        * ste_profile
+                )
+                chi_if *= chem_profile[self.species][layer_idx]
                 # chi_if = np.where(chi_if < 0, 0, chi_if)
-                chi_ic = np.clip(chi_ic, a_min=0, a_max=None) << chi_ic.unit
+                chi_if = np.clip(chi_if, a_min=0, a_max=None) << chi_if.unit
                 if full_prec:
-                    # psi_approx_cross_ic = np.abs(chi_ic[None, :] * psi_approx_cross) * 4 * np.pi * u.sr
-                    psi_approx_cross_ic = np.abs(chi_ic[None, :] * psi_approx_cross)
-                    # psi_integrals = simpson_quantity_2d(y_data=psi_approx_cross_ic, x_data=wn_grid).decompose()
-                    psi_integrals = loglinear_integral_quantity_2d_nonnegative(y_data=psi_approx_cross_ic, dx=wn_dx)
+                    psi_approx_cross_if = np.abs(chi_if[None, :] * psi_approx_cross)
+                    psi_integrals = loglinear_integral_quantity_2d_nonnegative(y_data=psi_approx_cross_if, dx=wn_dx)
 
-                    # log.info(f"[L{layer_idx}] chi_psi_{cont_trans_row[0]}c = {psi_integrals}")
-
-                    # o_pops = self.pop_matrix[-1, layer_idx, :]
-
-                    # below_cutoff = np.arange(self.n_agg_states) <= self.id_agg_cutoff
                     nonzero_integral_mask = psi_integrals.value != 0
-                    # nonzero_pop_mask = o_pops != 0
 
-                    # If below cutoff, update Y-row elements where integrals aare non-zero.
-                    # below_mask = below_cutoff & nonzero_integral_mask
-                    # If above cutoff, update Y-row elements with sum of where integrals and fixed pop factor are non-zero.
-                    # above_mask = ~below_cutoff & nonzero_integral_mask & nonzero_pop_mask
-
-                    y_matrix[cont_trans_row[0], nonzero_integral_mask] += psi_integrals[nonzero_integral_mask]
-
-                    # if cont_trans_row[0] <= self.id_agg_cutoff:
-                    #     # rhs_matrix[cont_trans_row[0]] -= np.sum(psi_integrals[above_mask] * o_pops[above_mask])
-                    #     y_matrix[cont_trans_row[0], below_mask] += psi_integrals[below_mask]
-                # End cross.
-                # v_ic_prec = simpson_quantity(
-                #     y_data=cont_abs_profile_norm * i_prec[cont_abs_start_idx: cont_abs_end_idx],
-                #     x_data=wn_grid[cont_abs_start_idx: cont_abs_end_idx]
-                # ) * b_ic
-                v_ic_prec = loglinear_integral_quantity_1d(
-                    y_data=cont_abs_profile_norm * i_prec[cont_abs_start_idx: cont_abs_end_idx],
-                    dx=wn_dx[cont_abs_start_idx: cont_abs_end_idx]
-                ) * b_ic
-                v_ic_prec = v_ic_prec.decompose()
-                # log.info(f"[L{layer_idx}] V_{cont_trans_row[0]}c_prec = {v_ic_prec}")
-
-                limiting_species_num_dens = min(
-                    (
-                        chem_profile[self.dissociation_products[0]][layer_idx]
-                        if self.dissociation_products[0] in chem_profile.species
-                        else 0
-                    ),
-                    (
-                        chem_profile[self.dissociation_products[1]][layer_idx]
-                        if self.dissociation_products[1] in chem_profile.species
-                        else 0
-                    ),
-                )
-                if limiting_species_num_dens == 0:
-                    limiting_scale_factor = 0
+                    y_matrix[trans_row[1], nonzero_integral_mask] -= psi_integrals[nonzero_integral_mask]
+                    y_matrix[trans_row[0], nonzero_integral_mask] += psi_integrals[nonzero_integral_mask]
                 else:
-                    mol_num_dens = chem_profile[self.species][layer_idx]
-                    i_pop = self.pop_matrix[-1, layer_idx, cont_trans_row[0]]
-                    limiting_scale_factor = i_pop * mol_num_dens / limiting_species_num_dens
+                    # Here we compute (1 - Chi_if*Psi^{*})*Ufi, where Psi^{*} = Lambda^{*}[1/Chi_nu]. Expanding out the
+                    # brackets, the first term has no wavenumber dependence, so we can skip the integral. The Chi_if*Psi^{*}
+                    # term has a wavenumber dependence however, so we compute Lambda^{*}[Chi_if/Chi_nu]*phi_fi. The Lambda
+                    # operator is dimensionless here and the normalised spontaneous emission profile has units of [cm];
+                    # taking the yields the desired dimensionless factor to reduce A_fi by.
+                    spe_profile, spe_start_idx = self.profile_store.get_profile(
+                        layer_idx=nlte_layer_idx, key=(trans_row[0], trans_row[1]), profile_type="ste"
+                    )
+                    spe_profile = spe_profile << u.erg * u.cm / (u.s * u.sr)
+                    spe_end_idx = spe_start_idx + len(spe_profile)
+                    spe_profile_norm = loglinear_normalise_1d_nonnegative(
+                        y_data=spe_profile, dx=wn_dx[spe_start_idx:spe_end_idx - 1]
+                    )
+                    self_prec = np.zeros(num_grid)
+                    self_prec[chi_mask] = (
+                            lambda_layer_grid[chi_mask]
+                            * chi_if[chi_mask]
+                            # * ac.h
+                            / global_chi[chi_mask]
+                    )
+                    self_prec = self_prec[spe_start_idx:spe_end_idx] * spe_profile_norm
+                    self_prec = loglinear_integral_quantity_1d(
+                        y_data=self_prec, dx=wn_dx[spe_start_idx:spe_end_idx - 1]
+                    )
+                    u_fi *= 1 - self_prec
+                # End cross.
+                # DEBUG:
+                integrand = ste_profile_norm * i_prec[ste_start_idx: ste_end_idx]
+                plt.plot(wn_grid[ste_start_idx: ste_end_idx], integrand)
+                plt.xlim(left=wn_grid[ste_start_idx].value, right=wn_grid[ste_end_idx-1].value)
+                plt.title()
+                plt.xlabel(r"Wavenumbers (cm$^{-1}$)")
+                plt.ylabel(f"Integrand ({integrand.unit:latex})")
+                if np.all(integrand >= 0):
+                    plt.yscale("log")
+                plt.show()
+                plt.close()
+                log.info(f"DEBUG: ste/abs start/end idxs = {ste_start_idx, ste_end_idx, abs_start_idx, abs_end_idx}.")
+                ##############################
 
-                y_matrix[cont_trans_row[0], cont_trans_row[0]] -= v_ic_prec
-                # y_matrix[cont_trans_row[0], cont_trans_row[0]] += a_ci * z_ci * limiting_scale_factor
-                y_matrix[cont_trans_row[0], cont_trans_row[0]] += a_ci * limiting_scale_factor
-                y_matrix[cont_trans_row[0], cont_trans_row[0]] += v_ic_prec * limiting_scale_factor
+                log.info(f"[L{layer_idx}] U_{trans_row[0], trans_row[1]} = {u_fi}")
+                v_fi_prec = loglinear_integral_quantity_1d(
+                    y_data=ste_profile_norm * i_prec[ste_start_idx: ste_end_idx],
+                    dx=wn_dx[ste_start_idx: ste_end_idx - 1]
+                ) * b_fi
+                v_fi_prec = v_fi_prec.decompose()
+                log.info(f"[L{layer_idx}] V_{trans_row[0], trans_row[1]}_prec = {v_fi_prec}")
+
+                v_if_prec = loglinear_integral_quantity_1d(
+                    y_data=abs_profile_norm * i_prec[abs_start_idx: abs_end_idx],
+                    dx=wn_dx[abs_start_idx: abs_end_idx - 1]
+                ) * b_if
+                v_if_prec = v_if_prec.decompose()
+                log.info(f"[L{layer_idx}] V_{trans_row[1], trans_row[0]}_prec = {v_if_prec}")
+
+                y_matrix[trans_row[0], trans_row[1]] += v_if_prec
+                y_matrix[trans_row[1], trans_row[0]] += u_fi + v_fi_prec
+                y_matrix[trans_row[0], trans_row[0]] -= u_fi + v_fi_prec
+                y_matrix[trans_row[1], trans_row[1]] -= v_if_prec
+
+            if self._cont_rates is not None:
+                # log.info(f"Cont rates = {self.cont_rates}")
+                # log.info((
+                #     f"Cont profile store keys = "
+                #     f"{self.cont_profile_store.get_keys(layer_idx=nlte_layer_idx, profile_type="abs")}"
+                # ))
+                for cont_trans_row in self._cont_rates.iter_rows(named=False):
+                    if cont_trans_row[0] > self.id_agg_cutoff:
+                        # Short-circuit for bands involving states above cutoff; these pops are fixed and including them on
+                        # RHS biases towards fixed distribution above cutoff.
+                        continue
+
+                    a_ci = cont_trans_row[1] * einstein_a_unit
+                    # b_ci = cont_trans_row[2] * einstein_b_unit
+                    b_ic = cont_trans_row[3] * einstein_b_unit
+
+                    log.info(f"{self.species}: Cont. profile for state {cont_trans_row[0]}.")
+                    cont_abs_profile, cont_abs_start_idx = self._cont_profile_store.get_profile(
+                        layer_idx=nlte_layer_idx, key=cont_trans_row[0], profile_type="abs"
+                    )
+                    cont_abs_profile: u.Quantity = cont_abs_profile << u.cm ** 2
+                    cont_abs_end_idx = cont_abs_start_idx + len(cont_abs_profile)
+
+                    cont_abs_profile_norm = loglinear_normalise_quantity_1d_nonnegative(
+                        y_data=cont_abs_profile, dx=wn_dx[cont_abs_start_idx:cont_abs_end_idx - 1]
+                    )
+
+                    # Cross terms:
+                    chi_ic: u.Quantity = np.zeros(num_grid) << cont_abs_profile.unit
+                    chi_ic[cont_abs_start_idx: cont_abs_end_idx] += (
+                            self.pop_matrix[-1, layer_idx, cont_trans_row[0]]
+                            * cont_abs_profile
+                            * chem_profile[self.species][layer_idx]
+                    )
+                    chi_ic = np.clip(chi_ic, a_min=0, a_max=None) << chi_ic.unit
+                    if full_prec:
+                        psi_approx_cross_ic = np.abs(chi_ic[None, :] * psi_approx_cross)
+                        psi_integrals = loglinear_integral_quantity_2d_nonnegative(
+                            y_data=psi_approx_cross_ic, dx=wn_dx
+                        )
+
+                        log.info(f"[L{layer_idx}] chi_psi_{cont_trans_row[0]}c = {psi_integrals}")
+                        nonzero_integral_mask = psi_integrals.value != 0
+
+                        # This may be the wrong way round as [0] is i; confirm against numba kernel.
+                        y_matrix[cont_trans_row[0], nonzero_integral_mask] += psi_integrals[nonzero_integral_mask]
+                    # End cross.
+                    v_ic_prec = loglinear_integral_quantity_1d(
+                        y_data=cont_abs_profile_norm * i_prec[cont_abs_start_idx: cont_abs_end_idx],
+                        dx=wn_dx[cont_abs_start_idx: cont_abs_end_idx - 1]
+                    ) * b_ic
+                    v_ic_prec = v_ic_prec.decompose()
+                    log.info(f"[L{layer_idx}] V_{cont_trans_row[0]}c_prec = {v_ic_prec}")
+
+                    limiting_species_num_dens = min(
+                        (
+                            chem_profile[self.dissociation_products[0]][layer_idx]
+                            if self.dissociation_products[0] in chem_profile.species
+                            else 0
+                        ),
+                        (
+                            chem_profile[self.dissociation_products[1]][layer_idx]
+                            if self.dissociation_products[1] in chem_profile.species
+                            else 0
+                        ),
+                    )
+                    if limiting_species_num_dens == 0:
+                        limiting_scale_factor = 0
+                    else:
+                        mol_num_dens = chem_profile[self.species][layer_idx]
+                        i_pop = self.pop_matrix[-1, layer_idx, cont_trans_row[0]]
+                        limiting_scale_factor = i_pop * mol_num_dens / limiting_species_num_dens
+
+                    y_matrix[cont_trans_row[0], cont_trans_row[0]] -= v_ic_prec
+                    # y_matrix[cont_trans_row[0], cont_trans_row[0]] += a_ci * z_ci * limiting_scale_factor
+                    y_matrix[cont_trans_row[0], cont_trans_row[0]] += a_ci * limiting_scale_factor
+                    # y_matrix[cont_trans_row[0], cont_trans_row[0]] += v_ci_prec * limiting_scale_factor
+        else:
+            id_agg_f = self.rates_grid["id_agg_f"].to_numpy().astype(np.int32)
+            id_agg_i = self.rates_grid["id_agg_i"].to_numpy().astype(np.int32)
+            rates_grid_arr = self.rates_grid.select(["A_fi", "B_fi", "B_if"]).to_numpy().astype(np.float64)
+
+            n_rates = id_agg_f.shape[0]
+
+            abs_store = self.profile_store.abs_profiles[nlte_layer_idx]
+            ste_store = self.profile_store.ste_profiles[nlte_layer_idx]
+            spe_store = self.profile_store.spe_profiles[nlte_layer_idx]
+
+            abs_profile_idx = np.zeros(n_rates, dtype=np.int64)
+            ste_profile_idx = np.zeros(n_rates, dtype=np.int64)
+            spe_profile_idx = np.zeros(n_rates, dtype=np.int64)
+
+            for r in range(n_rates):
+                if id_agg_f[r] > self.id_agg_cutoff or id_agg_i[r] > self.id_agg_cutoff:
+                    continue
+                key = (int(id_agg_f[r]), int(id_agg_i[r]))
+                abs_profile_idx[r] = abs_store.key_lookup[key]
+                ste_profile_idx[r] = ste_store.key_lookup[key]
+                spe_profile_idx[r] = spe_store.key_lookup[key]
+            n_lookup = np.asarray(self.pop_matrix[-1, layer_idx, :], dtype=np.float64)
+            y_matrix_val = y_matrix.value  # in-place mutation target
+            chem_scale_factor = chem_profile[self.species][layer_idx]
+
+            if full_prec:
+                psi_approx_cross_val = psi_approx_cross.value
+            else:
+                psi_approx_cross_val = np.empty((0, 0), dtype=np.float64)
+
+            _build_y_matrix_core(
+                id_agg_f=id_agg_f,
+                id_agg_i=id_agg_i,
+                rates_grid_arr=rates_grid_arr,
+                id_agg_cutoff=self.id_agg_cutoff,
+                n_lookup=n_lookup,
+                chem_scale_factor=chem_scale_factor,
+                lambda_layer_grid=lambda_layer_grid,
+                global_chi=global_chi.value,
+                i_prec=i_prec.value,
+                wn_dx=wn_dx.value,
+                abs_profiles=abs_store.profiles,
+                abs_offsets=abs_store.offsets,
+                abs_start_idxs=abs_store.start_idxs,
+                abs_profile_idx=abs_profile_idx,
+                ste_profiles=ste_store.profiles,
+                ste_offsets=ste_store.offsets,
+                ste_start_idxs=ste_store.start_idxs,
+                ste_profile_idx=ste_profile_idx,
+                spe_profiles=spe_store.profiles,
+                spe_offsets=spe_store.offsets,
+                spe_start_idxs=spe_store.start_idxs,
+                spe_profile_idx=spe_profile_idx,
+                full_prec=full_prec,
+                psi_approx_cross=psi_approx_cross_val,
+                y_matrix=y_matrix_val,
+            )
+            if self._cont_rates is not None:
+                # id_agg_c = self._cont_rates["id_agg_f"].to_numpy().astype(np.int32)
+                id_agg_i = self._cont_rates["id_agg_i"].to_numpy().astype(np.int32)
+                rates_grid_arr = self._cont_rates.select(["A_fi", "B_fi", "B_if"]).to_numpy().astype(np.float64)
+
+                n_rates = id_agg_i.shape[0]
+
+                abs_store = self._cont_profile_store.abs_profiles[nlte_layer_idx]
+
+                abs_profile_idx = np.zeros(n_rates, dtype=np.int64)
+
+                for r in range(n_rates):
+                    if id_agg_i[r] > self.id_agg_cutoff:
+                        continue
+                    # TODO: Check -1 key carried forward.
+                    key = (-1, int(id_agg_i[r]))
+                    abs_profile_idx[r] = abs_store.key_lookup[key]
+
+                limiting_species_num_dens = min([
+                    chem_profile[dis_prod][layer_idx] if dis_prod in chem_profile.species else 0
+                    for dis_prod in self.dissociation_products
+                ])
+
+                _build_y_matrix_cont(
+                    id_agg_i=id_agg_i,
+                    rates_grid_arr=rates_grid_arr,
+                    id_agg_cutoff=self.id_agg_cutoff,
+                    n_lookup=n_lookup,
+                    chem_scale_factor=chem_scale_factor,
+                    lambda_layer_grid=lambda_layer_grid,
+                    i_prec=i_prec.value,
+                    wn_dx=wn_dx.value,
+                    abs_profiles=abs_store.profiles,
+                    abs_offsets=abs_store.offsets,
+                    abs_start_idxs=abs_store.start_idxs,
+                    abs_profile_idx=abs_profile_idx,
+                    limiting_species_num_dens=limiting_species_num_dens,
+                    full_prec=full_prec,
+                    psi_approx_cross=psi_approx_cross,
+                    y_matrix=y_matrix_val,
+                )
         # Add collisional and chemical rates.
         y_matrix, rhs_matrix = self.add_col_chem_rates(
             y_matrix=y_matrix,
@@ -2936,7 +3235,7 @@ class NLTEProcessor:
             # chem_profile=chem_profile,
             # density_profile=density_profile,
         )
-        log.info(f"[L{layer_idx}] {self.species} Y matrix construction duration = {time.perf_counter() - rates_start}")
+        log.info(f"[L{layer_idx}] {self.species} Y matrix construction duration = {time.perf_counter() - rates_start:.5f}")
         return y_matrix.value, rhs_matrix.value
 
     def add_col_chem_rates(
@@ -2982,17 +3281,14 @@ class NLTEProcessor:
             layer_idx: int,
             n_iter: int,
     ) -> npt.NDArray[np.float64]:
-        # y_reduced_idx_map = [
-        #     idx for idx in range(0, len(y_matrix))
-        #     if sum(abs(y_matrix[idx])) != 0
-        # ]
         y_reduced_idx_map = np.where(np.abs(y_matrix).sum(axis=1) != 0)[0]
         y_matrix_reduced = y_matrix[np.ix_(y_reduced_idx_map, y_reduced_idx_map)]
-        # log.debug((
-        #     f"[L{layer_idx}] {species} Y matrix (before row-normalisation) =\n{y_matrix_reduced}"
-        #     f"[L{layer_idx}] {species} Y matrix cond. "
-        #     f"(before row-normalisation) = {np.linalg.cond(y_matrix_reduced)}"
-        # ))
+        log.info((
+            f"[L{layer_idx}] {self.species} Y matrix (before row-normalisation) =\n"
+            f"{np.array2string(y_matrix_reduced, precision=3)}"
+            f"[L{layer_idx}] {self.species} Y matrix cond. (before row-normalisation) ="
+            f" {np.linalg.cond(y_matrix_reduced)}"
+        ))
         norm_factors = abs(y_matrix_reduced).sum(axis=1)[:, None]
         y_matrix_reduced /= norm_factors
         check_rows = np.array([
@@ -3009,6 +3305,7 @@ class NLTEProcessor:
         rhs_rect = rhs_matrix[y_reduced_idx_map] / norm_factors[:, 0]
         rhs_rect = np.append(rhs_rect, 1)
 
+        log.info(f"DEBUG: {self.species} Y matrix =\n{np.array2string(y_rect, precision=3)}")
         nppinv_pops = np.linalg.pinv(y_rect) @ rhs_rect
         nppinv_pops = nppinv_pops / nppinv_pops.sum()
 

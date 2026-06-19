@@ -808,19 +808,18 @@ class XSecCollection(dict):
             # np.save(r"/mnt/c/PhD/NLTE/theory/opacity/LTE_tau.npy", dtau)
             i_mean_interfaces = (i_up + i_down)
             i_mean = 0.5 * (i_mean_interfaces[:-1] + i_mean_interfaces[1:])
+            log.info(f"Any i_mean < 0 = {np.any(i_mean < 0)}; i_mean == 0 = {np.any(i_mean == 0)}.")
             for species in nlte_processors.keys():
-                # xsec_data = self[species]
                 processor = nlte_processors[species]
-                # if is_nlte_xsec(xsec_data):
                 log.info(f"[I{self._n_iter}] Approximating T_ex for {species}.")
-                # processor = xsec_data.get_nlte_processor()
+
                 if not processor.approximate_t_ex:
                     continue
 
                 if processor.debug_pop_matrix is not None:
                     continue
 
-                t_ex_profile = processor.compute_approximate_t_ex(
+                processor.compute_approximate_t_ex(
                     i_mean=i_mean,
                     chem_profile=chem_profile,
                     density_profile=density_profile,
@@ -951,8 +950,8 @@ class XSecCollection(dict):
                 # Solve equilibrium for non-LTE layers.
                 if layer_idx >= self.n_lte_layers:
                     nlte_layer_idx = layer_idx - self.n_lte_layers
-                    layer_temp = temperature[layer_idx]
-                    layer_pressure = pressure[layer_idx]
+                    # layer_temp = temperature[layer_idx]
+                    # layer_pressure = pressure[layer_idx]
 
                     # Integrate over all angles. This can be done independent of the transitions.
                     i_layer_grid = 0.5 * np.sum(
@@ -965,6 +964,7 @@ class XSecCollection(dict):
                     )
                     y_mats = {}
                     rhs_mats = {}
+                    # TODO: skip if species abundance is 0?
                     for species in nlte_processors.keys():
                         # xsec_data = self[species]
                         # if is_nlte_xsec(xsec_data):
