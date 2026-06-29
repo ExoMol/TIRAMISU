@@ -1140,18 +1140,18 @@ class ProfileStore:
                         key_idx_map=store.key_idx_map,
                     )
 
-    def get_profiles(
-            self, layer_idx: int, key: t.Tuple[int, int]
-    ) -> t.Tuple[
-        t.Tuple[npt.NDArray[np.float64], int],
-        t.Tuple[npt.NDArray[np.float64], int],
-        t.Tuple[npt.NDArray[np.float64], int]
-    ]:
-        return (
-            self.abs_profiles[layer_idx].get_profile(key),
-            self.ste_profiles[layer_idx].get_profile(key),
-            self.spe_profiles[layer_idx].get_profile(key),
-        )
+    # def get_profiles(
+    #         self, layer_idx: int, key: t.Tuple[int, int]
+    # ) -> t.Tuple[
+    #     t.Tuple[npt.NDArray[np.float64], int],
+    #     t.Tuple[npt.NDArray[np.float64], int],
+    #     t.Tuple[npt.NDArray[np.float64], int]
+    # ]:
+    #     return (
+    #         self.abs_profiles[layer_idx].get_profile(key),
+    #         self.ste_profiles[layer_idx].get_profile(key),
+    #         self.spe_profiles[layer_idx].get_profile(key),
+    #     )
 
     @lru_cache(maxsize=1000)
     def get_profile(
@@ -1324,13 +1324,13 @@ class ContinuumProfileStore:
         else:
             raise RuntimeError(f"ContinuumProfileStore profile type {profile_type} not implemented.")
 
-    def get_keys(self, layer_idx: int, profile_type: str):
-        if profile_type == "abs":
-            return self.abs_profiles[layer_idx].key_lookup.keys()
-        else:
-            raise RuntimeError(f"ContinuumProfileStore profile type {profile_type} not implemented.")
+    # def get_keys(self, layer_idx: int, profile_type: str):
+    #     if profile_type == "abs":
+    #         return self.abs_profiles[layer_idx].key_lookup.keys()
+    #     else:
+    #         raise RuntimeError(f"ContinuumProfileStore profile type {profile_type} not implemented.")
 
-    def build_profiles(
+    def build_abs(
             self, layer_idx: int, pop_matrix: npt.NDArray[np.float64], wn_grid: npt.NDArray[np.float64]
     ) -> npt.NDArray[np.float64]:
         abs_profile = self.abs_profiles[layer_idx].build_xsec(pop_matrix=pop_matrix, wn_grid=wn_grid, is_abs=True)

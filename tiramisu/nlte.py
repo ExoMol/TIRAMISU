@@ -18,17 +18,16 @@ from astropy import units as u, constants as ac
 from scipy.integrate import cumulative_simpson
 from scipy.optimize import least_squares
 
-from .accelerator import HybridAccelerator
 from .atomic_nuclear_data import get_reduced_mass
 from .chemistry import SpeciesFormula, ChemicalProfile
 from .colchem import CollisionalRatesDatabase, RateTransition
-from .config import output_dir
+from .config import output_dir, _LOG_FLOAT_FMT, _LOG_ARRAY_FMT
 from .numerics import (loglinear_normalise_1d_nonnegative, loglinear_normalise_quantity_2d_nonnegative,
                        loglinear_normalise_quantity_1d_nonnegative, loglinear_integral_quantity_1d,
                        loglinear_integral_quantity_1d_nonnegative, loglinear_integral_quantity_2d_nonnegative,
-                       loglinear_integral_1d, loglinear_integral_2d_nonnegative, loglinear_integral_1d_nonnegative)
+                       loglinear_integral_1d, loglinear_integral_1d_nonnegative)
 from .profiles import (ProfileStore, ContinuumProfileStore, abs_emi_xsec, continuum_xsec, const_8_pi_c,
-                       _accumulate_superline_band_batch, const_h_c_on_4_pi, _broaden_superline_band_buffer,
+                       _accumulate_superline_band_batch, _broaden_superline_band_buffer,
                        calc_einstein_bs, _accumulate_continuum_superline_band_batch,
                        _broaden_continuum_superline_band_buffer, _iter_trans_batches, _band_profile_sampled_voigt,
                        _continuum_band_profile_sampled_gauss_layered)
@@ -1537,9 +1536,9 @@ class NLTEProcessor:
         "debug_pop_matrix",
         # Private:
         "_states", "_n_agg_states", "_agg_states", "_id_agg_cutoff", "_rates_grid", "_profile_store", "_pop_matrix",
-        "_mol_chi_matrix", "_mol_eta_matrix", "_cont_states", "_cont_rates", "_cont_profile_store", "_accelerator",
-        "_nlte_pop_frac", "_agg_lookup_cache", "_a_ox_vals", "_col_chem_c_matrix", "_col_chem_rhs_c", "_n_layers",
-        "_n_lte_layers",
+        "_mol_chi_matrix", "_mol_eta_matrix", "_cont_states", "_cont_rates", "_cont_profile_store", "_nlte_pop_frac",
+        "_agg_lookup_cache", "_a_ox_vals", "_col_chem_c_matrix", "_col_chem_rhs_c", "_n_layers", "_n_lte_layers",
+        "_y_matrix", "_y_reduced_idx_map", "_rhs_matrix",
     ]
 
     def __init__(
@@ -1588,7 +1587,6 @@ class NLTEProcessor:
         # Required, set during runtime/setup.
         self._n_layers: int | None = None
         self._n_lte_layers: int | None = None
-        self._accelerator: HybridAccelerator | None = None
         self._states: pl.DataFrame | None = None
         self._n_agg_states: int | None = None
         self._agg_states: pl.DataFrame | None = None
@@ -1598,6 +1596,9 @@ class NLTEProcessor:
         self._mol_chi_matrix: u.Quantity | None = None
         self._mol_eta_matrix: u.Quantity | None = None
         self._pop_matrix: npt.NDArray[np.float64] | None = None
+        self._y_matrix: npt.NDArray[np.float64] | None = None
+        self._y_reduced_idx_map: npt.NDArray[int] | None = None
+        self._rhs_matrix: npt.NDArray[np.float64] | None = None
 
         # Continuum properties.
         if isinstance(cont_states_file, str):
@@ -1730,16 +1731,6 @@ class NLTEProcessor:
         self._pop_matrix = value
 
     @property
-    def accelerator(self) -> HybridAccelerator:
-        if self._accelerator is None:
-            raise RuntimeError(f"{self.species} NLTEProcessor field 'accelerator' not initialised.")
-        return self._accelerator
-
-    @accelerator.setter
-    def accelerator(self, value: HybridAccelerator) -> None:
-        self._accelerator = value
-
-    @property
     def mol_chi_matrix(self) -> u.Quantity:
         if self._mol_chi_matrix is None:
             raise RuntimeError(f"{self.species} NLTEProcessor field 'mol_chi_matrix' not initialised.")
@@ -1759,11 +1750,44 @@ class NLTEProcessor:
     def mol_eta_matrix(self, value: u.Quantity) -> None:
         self._mol_eta_matrix = value
 
+    @property
+    def y_matrix(self) -> u.Quantity:
+        if self._y_matrix is None:
+            raise RuntimeError(f"{self.species} NLTEProcessor field 'y_matrix' not initialised.")
+        return self._y_matrix
+
+    @y_matrix.setter
+    def y_matrix(self, value: u.Quantity) -> None:
+        self._y_matrix = value
+
+    @property
+    def y_reduced_idx_map(self) -> u.Quantity:
+        if self._y_reduced_idx_map is None:
+            raise RuntimeError(f"{self.species} NLTEProcessor field 'y_reduced_idx_map' not initialised.")
+        return self._y_reduced_idx_map
+
+    @y_reduced_idx_map.setter
+    def y_reduced_idx_map(self, value: u.Quantity) -> None:
+        self._y_reduced_idx_map = value
+
+    @property
+    def rhs_matrix(self) -> u.Quantity:
+        if self._rhs_matrix is None:
+            raise RuntimeError(f"{self.species} NLTEProcessor field 'rhs_matrix' not initialised.")
+        return self._rhs_matrix
+
+    @rhs_matrix.setter
+    def rhs_matrix(self, value: u.Quantity) -> None:
+        self._rhs_matrix = value
+
     # Methods.
 
-    def get_latest_pop_grid(self) -> npt.NDArray[np.float64]:
+    def get_latest_pop_grid(self, layer_idx: int = None) -> npt.NDArray[np.float64]:
         if self.pop_matrix is not None:
-            return self.pop_matrix[-1]
+            if layer_idx is None:
+                return self.pop_matrix[-1]
+            else:
+                return self.pop_matrix[-1, layer_idx]
         else:
             raise RuntimeError(f"No population matrix available for species {self.species}.")
 
@@ -2555,7 +2579,6 @@ class NLTEProcessor:
         """Setup NLTE calculations."""
         assert self.n_layers is not None
         assert self.n_lte_layers is not None
-        assert self.accelerator is not None
         assert self.n_layers == temperature_profile.shape[0] == pressure_profile.shape[0] == density_profile.shape[0]
 
         if self.dissociation_products is not None and any(
@@ -2650,7 +2673,7 @@ class NLTEProcessor:
         energy_dif_wmean_global = (mol_chi_norm @ wn_grid) / mol_chi_norm.sum(axis=1)
         n_ratio_old = (c_if_approx + v_if_rate) / (c_fi_approx + a_fi_approx + v_fi_rate)
         t_ex_profile_old = (ac_h_c_on_kB * energy_dif_wmean_global / np.log(1 / n_ratio_old)).to(u.K)
-        log.info(f"T_ex profile global fit = {t_ex_profile_old}")
+        log.info(f"T_ex profile global fit = {np.array2string(t_ex_profile_old, formatter=_LOG_ARRAY_FMT)}")
         # Get pairs of valid band keys: choosing adjacent IDs do not always exist, i.e.: in species with distinct
         # isomers whose states are close in energy.
         agg_energies = self.agg_states.sort("id_agg")["energy_agg"].to_numpy()
@@ -2717,7 +2740,8 @@ class NLTEProcessor:
                     y_data=abs_profile_norm * i_mean[layer_idx, abs_start_idx:abs_end_idx],
                     dx=wn_dx[abs_start_idx:abs_end_idx - 1]
                 ) * b_if
-                log.info(f"[L{layer_idx}] {self.species} V_fi = {v_fi[layer_idx]:.4E} V_if = {v_if[layer_idx]:.4E}.")
+                # log.info(f"[L{layer_idx}] {self.species} V_fi = {v_fi[layer_idx]:{_LOG_FLOAT_FMT}}"
+                #          f" V_if = {v_if[layer_idx]:{_LOG_FLOAT_FMT}}.")
                 energy_dif_wmean[layer_idx] = np.average(
                     wn_grid[abs_start_idx:abs_end_idx].value,
                     weights=abs_profile_norm.value,
@@ -2732,9 +2756,9 @@ class NLTEProcessor:
             t_ex_profile = (ac_h_c_on_kB * energy_dif_wmean / np.log(1 / n_ratio)).to(u.K)
             if np.any(t_ex_profile < 0):
                 log.warning(f"{self.species} T_ex for ({id_agg_f}-{id_agg_i}) band contains negatives!")
-            # t_ex_profile = np.where(np.isnan(t_ex_profile), temperature_profile, t_ex_profile)
-            t_ex_profile = np.clip(abs(t_ex_profile), a_min=0.0 * u.K, a_max=temperature_profile * 3.0)   # Failsafe
-            log.info(f"DEBUG: {id_agg_f}-{id_agg_i} T_ex = {t_ex_profile}")
+            t_ex_profile = np.where(np.isnan(t_ex_profile), temperature_profile, t_ex_profile)
+            t_ex_profile = np.clip(abs(t_ex_profile), a_min=0.0 * u.K, a_max=temperature_profile * 3.0)  # Failsafe
+            log.info(f"DEBUG: {id_agg_f}-{id_agg_i} T_ex = {np.array2string(t_ex_profile, formatter=_LOG_ARRAY_FMT)}")
             # log.info(f"DEBUG: {id_agg_f}-{id_agg_i}: C_if = {c_if}, C_fi = {c_fi}, V_if = {v_if}, V_fi = {v_fi},"
             #          f" A_fi = {a_fi}.")
             t_ex_profiles[pair_idx] = t_ex_profile
@@ -2873,7 +2897,7 @@ class NLTEProcessor:
             wn_grid: u.Quantity,
             wn_dx: u.Quantity,
             full_prec: bool,
-    ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    ) -> None:
         """
         Build statistical equilibrium matrix.
         """
@@ -2888,33 +2912,11 @@ class NLTEProcessor:
                 lambda_layer_grid[chi_mask] * species_eta[chi_mask] / global_chi[chi_mask]
         )
         psi_approx_eta = np.clip(abs(psi_approx_eta), 0, i_layer_grid)
-        log.info(f"I_l negatives = {np.any(i_layer_grid < 0)}, nans? {np.any(np.isnan(i_layer_grid))}")
         i_prec: u.Quantity = (i_layer_grid - psi_approx_eta) * 4 * np.pi * u.sr
-        log.info(f"I_prec negatives {np.any(i_prec < 0)}, nans? {np.any(np.isnan(i_prec))}")
-
-        np.save(rf"/mnt/c/PhD/programs/TIRAMISU/tests/i_prec_{self.species}_L{layer_idx}.npy", i_prec.value)
-        np.save(rf"/mnt/c/PhD/programs/TIRAMISU/tests/psi_approx_eta_{self.species}_L{layer_idx}.npy", psi_approx_eta.value)
-        np.save(rf"/mnt/c/PhD/programs/TIRAMISU/tests/i_layer_grid_{self.species}_L{layer_idx}.npy", i_layer_grid.value)
-
-        # DEBUG
-        import matplotlib.pyplot as plt
-        plt.figure(figsize=(4, 6), dpi=300)
-        plt.plot(wn_grid, i_layer_grid.value * 5 * np.pi, color="#33BBEE", label="4pi * I_layer")
-        plt.plot(wn_grid, i_prec.value, color="#EE3377", label="I_prec")
-        plt.xlabel(f"Wavenumbers ({wn_grid.unit:latex})", fontsize=16)
-        plt.xlim(left=wn_grid.value[0], right=wn_grid.value[-1])
-        plt.ylabel(f"Intensity ({i_prec.unit:latex})", fontsize=16)
-        plt.yscale("log")
-        plt.ylim(bottom=1e-12)
-        plt.legend(loc="best")
-        plt.tight_layout()
-        plt.show()
-        plt.close()
-        ############
 
         n_dim = self.id_agg_cutoff + 1
-        y_matrix = np.zeros((n_dim, n_dim), dtype=np.float64) << (1 / u.s)
-        rhs_matrix = np.zeros(n_dim, dtype=np.float64) << (1 / u.s)
+        self.y_matrix = np.zeros((n_dim, n_dim), dtype=np.float64) << (1 / u.s)
+        self.rhs_matrix = np.zeros(n_dim, dtype=np.float64) << (1 / u.s)
         rates_start = time.perf_counter()
 
         psi_approx_cross = np.empty([])
@@ -2987,8 +2989,8 @@ class NLTEProcessor:
 
                     nonzero_integral_mask = psi_integrals.value != 0
 
-                    y_matrix[trans_row[1], nonzero_integral_mask] -= psi_integrals[nonzero_integral_mask]
-                    y_matrix[trans_row[0], nonzero_integral_mask] += psi_integrals[nonzero_integral_mask]
+                    self.y_matrix[trans_row[1], nonzero_integral_mask] -= psi_integrals[nonzero_integral_mask]
+                    self.y_matrix[trans_row[0], nonzero_integral_mask] += psi_integrals[nonzero_integral_mask]
                 else:
                     # Here we compute (1 - Chi_if*Psi^{*})*Ufi, where Psi^{*} = Lambda^{*}[1/Chi_nu]. Expanding out the
                     # brackets, the first term has no wavenumber dependence, so we can skip the integral. The Chi_if*Psi^{*}
@@ -3017,17 +3019,17 @@ class NLTEProcessor:
                     u_fi *= 1 - self_prec
                 # End cross.
                 # DEBUG:
-                integrand = ste_profile_norm * i_prec[ste_start_idx: ste_end_idx]
-                plt.plot(wn_grid[ste_start_idx: ste_end_idx], integrand)
-                plt.xlim(left=wn_grid[ste_start_idx].value, right=wn_grid[ste_end_idx-1].value)
-                plt.title()
-                plt.xlabel(r"Wavenumbers (cm$^{-1}$)")
-                plt.ylabel(f"Integrand ({integrand.unit:latex})")
-                if np.all(integrand >= 0):
-                    plt.yscale("log")
-                plt.show()
-                plt.close()
-                log.info(f"DEBUG: ste/abs start/end idxs = {ste_start_idx, ste_end_idx, abs_start_idx, abs_end_idx}.")
+                # integrand = ste_profile_norm * i_prec[ste_start_idx: ste_end_idx]
+                # plt.plot(wn_grid[ste_start_idx: ste_end_idx], integrand)
+                # plt.xlim(left=wn_grid[ste_start_idx].value, right=wn_grid[ste_end_idx-1].value)
+                # plt.title(f"V_{trans_row[0], trans_row[1]}_prec")
+                # plt.xlabel(r"Wavenumbers (cm$^{-1}$)")
+                # plt.ylabel(f"Integrand ({integrand.unit:latex})")
+                # if np.all(integrand >= 0):
+                #     plt.yscale("log")
+                # plt.show()
+                # plt.close()
+                # log.info(f"DEBUG: ste/abs start/end idxs = {ste_start_idx, ste_end_idx, abs_start_idx, abs_end_idx}.")
                 ##############################
 
                 log.info(f"[L{layer_idx}] U_{trans_row[0], trans_row[1]} = {u_fi}")
@@ -3036,19 +3038,19 @@ class NLTEProcessor:
                     dx=wn_dx[ste_start_idx: ste_end_idx - 1]
                 ) * b_fi
                 v_fi_prec = v_fi_prec.decompose()
-                log.info(f"[L{layer_idx}] V_{trans_row[0], trans_row[1]}_prec = {v_fi_prec}")
+                log.info(f"[L{layer_idx}] V_{trans_row[0], trans_row[1]}_prec = {v_fi_prec:{_LOG_FLOAT_FMT}}")
 
                 v_if_prec = loglinear_integral_quantity_1d(
                     y_data=abs_profile_norm * i_prec[abs_start_idx: abs_end_idx],
                     dx=wn_dx[abs_start_idx: abs_end_idx - 1]
                 ) * b_if
                 v_if_prec = v_if_prec.decompose()
-                log.info(f"[L{layer_idx}] V_{trans_row[1], trans_row[0]}_prec = {v_if_prec}")
+                log.info(f"[L{layer_idx}] V_{trans_row[1], trans_row[0]}_prec = {v_if_prec:{_LOG_FLOAT_FMT}}")
 
-                y_matrix[trans_row[0], trans_row[1]] += v_if_prec
-                y_matrix[trans_row[1], trans_row[0]] += u_fi + v_fi_prec
-                y_matrix[trans_row[0], trans_row[0]] -= u_fi + v_fi_prec
-                y_matrix[trans_row[1], trans_row[1]] -= v_if_prec
+                self.y_matrix[trans_row[0], trans_row[1]] += v_if_prec
+                self.y_matrix[trans_row[1], trans_row[0]] += u_fi + v_fi_prec
+                self.y_matrix[trans_row[0], trans_row[0]] -= u_fi + v_fi_prec
+                self.y_matrix[trans_row[1], trans_row[1]] -= v_if_prec
 
             if self._cont_rates is not None:
                 # log.info(f"Cont rates = {self.cont_rates}")
@@ -3091,18 +3093,18 @@ class NLTEProcessor:
                             y_data=psi_approx_cross_ic, dx=wn_dx
                         )
 
-                        log.info(f"[L{layer_idx}] chi_psi_{cont_trans_row[0]}c = {psi_integrals}")
+                        # log.info(f"[L{layer_idx}] chi_psi_{cont_trans_row[0]}c = {psi_integrals}")
                         nonzero_integral_mask = psi_integrals.value != 0
 
                         # This may be the wrong way round as [0] is i; confirm against numba kernel.
-                        y_matrix[cont_trans_row[0], nonzero_integral_mask] += psi_integrals[nonzero_integral_mask]
+                        self.y_matrix[cont_trans_row[0], nonzero_integral_mask] += psi_integrals[nonzero_integral_mask]
                     # End cross.
                     v_ic_prec = loglinear_integral_quantity_1d(
                         y_data=cont_abs_profile_norm * i_prec[cont_abs_start_idx: cont_abs_end_idx],
                         dx=wn_dx[cont_abs_start_idx: cont_abs_end_idx - 1]
                     ) * b_ic
                     v_ic_prec = v_ic_prec.decompose()
-                    log.info(f"[L{layer_idx}] V_{cont_trans_row[0]}c_prec = {v_ic_prec}")
+                    log.info(f"[L{layer_idx}] V_{cont_trans_row[0]}c_prec = {v_ic_prec:{_LOG_FLOAT_FMT}}")
 
                     limiting_species_num_dens = min(
                         (
@@ -3123,10 +3125,10 @@ class NLTEProcessor:
                         i_pop = self.pop_matrix[-1, layer_idx, cont_trans_row[0]]
                         limiting_scale_factor = i_pop * mol_num_dens / limiting_species_num_dens
 
-                    y_matrix[cont_trans_row[0], cont_trans_row[0]] -= v_ic_prec
-                    # y_matrix[cont_trans_row[0], cont_trans_row[0]] += a_ci * z_ci * limiting_scale_factor
-                    y_matrix[cont_trans_row[0], cont_trans_row[0]] += a_ci * limiting_scale_factor
-                    # y_matrix[cont_trans_row[0], cont_trans_row[0]] += v_ci_prec * limiting_scale_factor
+                    self.y_matrix[cont_trans_row[0], cont_trans_row[0]] -= v_ic_prec
+                    # self.y_matrix[cont_trans_row[0], cont_trans_row[0]] += a_ci * z_ci * limiting_scale_factor
+                    self.y_matrix[cont_trans_row[0], cont_trans_row[0]] += a_ci * limiting_scale_factor
+                    # self.y_matrix[cont_trans_row[0], cont_trans_row[0]] += v_ci_prec * limiting_scale_factor
         else:
             id_agg_f = self.rates_grid["id_agg_f"].to_numpy().astype(np.int32)
             id_agg_i = self.rates_grid["id_agg_i"].to_numpy().astype(np.int32)
@@ -3150,7 +3152,7 @@ class NLTEProcessor:
                 ste_profile_idx[r] = ste_store.key_lookup[key]
                 spe_profile_idx[r] = spe_store.key_lookup[key]
             n_lookup = np.asarray(self.pop_matrix[-1, layer_idx, :], dtype=np.float64)
-            y_matrix_val = y_matrix.value  # in-place mutation target
+            y_matrix_val = self.y_matrix.value  # in-place mutation target
             chem_scale_factor = chem_profile[self.species][layer_idx]
 
             if full_prec:
@@ -3227,23 +3229,15 @@ class NLTEProcessor:
                     y_matrix=y_matrix_val,
                 )
         # Add collisional and chemical rates.
-        y_matrix, rhs_matrix = self.add_col_chem_rates(
-            y_matrix=y_matrix,
-            rhs_matrix=rhs_matrix,
-            layer_idx=layer_idx,
-            # layer_temp=layer_temperature,
-            # chem_profile=chem_profile,
-            # density_profile=density_profile,
+        self.add_col_chem_rates(layer_idx=layer_idx)
+        log.info(
+            f"[L{layer_idx}] {self.species} Y matrix construction duration = {time.perf_counter() - rates_start:.5f}"
         )
-        log.info(f"[L{layer_idx}] {self.species} Y matrix construction duration = {time.perf_counter() - rates_start:.5f}")
-        return y_matrix.value, rhs_matrix.value
 
     def add_col_chem_rates(
             self,
-            y_matrix: u.Quantity,
-            rhs_matrix: u.Quantity,
             layer_idx: int,
-    ) -> t.Tuple[u.Quantity, u.Quantity]:
+    ) -> None:
         """
         Apply precomputed collisional/chemical rate contributions for a single layer.
 
@@ -3251,41 +3245,23 @@ class NLTEProcessor:
 
         Parameters
         ----------
-        y_matrix : astropy.units.Quantity
-            Rate matrix for this layer, shape (n_states, n_states).
-        rhs_matrix : astropy.units.Quantity
-            RHS vector for this layer, shape (n_states,).
         layer_idx : int
             Index of the atmospheric layer being processed.
-
-        Returns
-        -------
-        y_matrix : astropy.units.Quantity
-            Updated rate matrix.
-        rhs_matrix : astropy.units.Quantity
-            Updated RHS vector.
         """
-        if self._col_chem_c_matrix is None:
-            return y_matrix, rhs_matrix
-
-        return (
-            (y_matrix.value + self._col_chem_c_matrix[layer_idx]) << y_matrix.unit,
-            (rhs_matrix.value + self._col_chem_rhs_c[layer_idx]) << rhs_matrix.unit,
-        )
+        if self._col_chem_c_matrix is not None:
+            self.y_matrix += self._col_chem_c_matrix[layer_idx] * self.y_matrix.unit
+            self.rhs_matrix += self._col_chem_rhs_c[layer_idx] * self.rhs_matrix.unit
 
     def solve_pops(
             self,
-            y_matrix: npt.NDArray[np.float64],
-            rhs_matrix: npt.NDArray[np.float64],
-            pop_grid_update: npt.NDArray[np.float64],
             layer_idx: int,
             n_iter: int,
-    ) -> npt.NDArray[np.float64]:
-        y_reduced_idx_map = np.where(np.abs(y_matrix).sum(axis=1) != 0)[0]
-        y_matrix_reduced = y_matrix[np.ix_(y_reduced_idx_map, y_reduced_idx_map)]
+    ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+        self.y_reduced_idx_map = np.where(np.abs(self.y_matrix).sum(axis=1) != 0)[0]
+        y_matrix_reduced = self.y_matrix[np.ix_(self.y_reduced_idx_map, self.y_reduced_idx_map)]
         log.info((
             f"[L{layer_idx}] {self.species} Y matrix (before row-normalisation) =\n"
-            f"{np.array2string(y_matrix_reduced, precision=3)}"
+            f"{np.array2string(y_matrix_reduced, formatter=_LOG_ARRAY_FMT)}"
             f"[L{layer_idx}] {self.species} Y matrix cond. (before row-normalisation) ="
             f" {np.linalg.cond(y_matrix_reduced)}"
         ))
@@ -3302,17 +3278,17 @@ class NLTEProcessor:
             )
 
         y_rect = np.vstack([y_matrix_reduced.copy(), np.ones(y_matrix_reduced.shape[1])])
-        rhs_rect = rhs_matrix[y_reduced_idx_map] / norm_factors[:, 0]
+        rhs_rect = self.rhs_matrix[self.y_reduced_idx_map] / norm_factors[:, 0]
         rhs_rect = np.append(rhs_rect, 1)
 
         log.info(f"DEBUG: {self.species} Y matrix =\n{np.array2string(y_rect, precision=3)}")
         nppinv_pops = np.linalg.pinv(y_rect) @ rhs_rect
-        nppinv_pops = nppinv_pops / nppinv_pops.sum()
+        nppinv_pops /= nppinv_pops.sum()
 
         if np.any(nppinv_pops < 0):
             log.error((
-                f"[L{layer_idx}] Numpy Pseudo Inverse pops. contain negatives. "
-                f"Falling back to least squares...\nNegatives = {nppinv_pops}"
+                f"[L{layer_idx}] Numpy Pseudo Inverse pops. contain negatives; falling back to least squares.\n"
+                f"Negatives = {np.array2string(nppinv_pops, formatter=_LOG_ARRAY_FMT)}"
             ))
             lsq_res = least_squares(
                 lambda x: np.dot(y_rect, x) - rhs_rect,
@@ -3325,9 +3301,10 @@ class NLTEProcessor:
                 xtol=1e-15,
             )
             least_squares_pops = lsq_res.x
+            least_squares_pops /= least_squares_pops.sum()
             log.debug((
                 f"[L{layer_idx}] Least Squares res = {lsq_res}\n"
-                f"Least Squares Pops. = {least_squares_pops}"
+                f"Least Squares Pops. = {np.array2string(least_squares_pops, formatter=_LOG_ARRAY_FMT)}"
             ))
             if any(least_squares_pops < 0):
                 raise RuntimeError(
@@ -3338,44 +3315,43 @@ class NLTEProcessor:
         else:
             pop_matrix = nppinv_pops
 
-        nlte_layer_idx = layer_idx - self.n_lte_layers
-        pop_old_norm = self.pop_matrix[-1, layer_idx, y_reduced_idx_map] / self.pop_matrix[
-            -1, layer_idx, y_reduced_idx_map].sum()
-        pop_matrix = self.accelerator.update(
-            pop_new=pop_matrix,
-            pop_old=pop_old_norm,
-            iteration=n_iter,
-            layer_idx=nlte_layer_idx
-        )
+        pop_old = self.pop_matrix[-1, layer_idx, self.y_reduced_idx_map]
+
+        return pop_matrix, pop_old
+
+    def update_pops(
+            self,
+            layer_idx: int,
+            pop_updated: npt.NDArray[np.float64],
+    ):
         # Normalise to required NLTE population fraction.
-        # nlte_pop_frac = self.states.select(
-        #     pl.col(f"n_nlte_L{layer_idx}").filter(pl.col("id_agg") <= self.id_agg_cutoff).sum()
-        # ).item()
-        pop_matrix = self._nlte_pop_frac[layer_idx] * pop_matrix / pop_matrix.sum()
-        log.info(f"[L{layer_idx}] DEBUG: Pops. sum = {pop_matrix.sum()} (should be {self._nlte_pop_frac[layer_idx]})")
+        pop_scaled = self._nlte_pop_frac[layer_idx] * pop_updated / pop_updated.sum()
+        # log.info(f"[L{layer_idx}] DEBUG: Pops. sum = {pop_matrix.sum()} (should be {self._nlte_pop_frac[layer_idx]})")
 
         log.info(f"[L{layer_idx}] {self.species} New pops.:")
-        for idx, y_idx in enumerate(y_reduced_idx_map):
+        for idx, y_idx in enumerate(self.y_reduced_idx_map):
             log.info((
                 f"[L{layer_idx}]"
                 f" n{self.agg_states.filter(pl.col("id_agg") == y_idx).select(self.agg_col_names).row(0)}"
-                f" = {pop_matrix[idx]}"
+                f" = {pop_scaled[idx]:{_LOG_FLOAT_FMT}}"
             ))
-        full_pops = np.zeros(self.n_agg_states)
-        full_pops[y_reduced_idx_map] = pop_matrix
-        full_pops[self.id_agg_cutoff + 1:] = self.pop_matrix[-1, layer_idx, self.id_agg_cutoff + 1:]  # TEST!
-        pop_grid_update[layer_idx] = full_pops
-        log.info(f"[L{layer_idx}] DEBUG: full_pops sum = {full_pops.sum()}")
+        # Store all updated pops, any zeros that were excldued from the Y-matrix calculation and pops above cutoff.
+        pop_updated_full = np.zeros(self.n_agg_states)
+        pop_updated_full[self.y_reduced_idx_map] = pop_scaled
+        pop_updated_full[self.id_agg_cutoff + 1:] = self.pop_matrix[-1, layer_idx, self.id_agg_cutoff + 1:]  # TEST!
+        # log.info(f"[L{layer_idx}] DEBUG: full_pops sum = {full_pops.sum()}")
 
         n_agg_lte_col = f"n_agg_L{layer_idx}"
         n_lte_col = f"n_L{layer_idx}"
         n_agg_nlte_col = f"n_agg_nlte_L{layer_idx}"
         n_nlte_col = f"n_nlte_L{layer_idx}"
         self.states = self.states.with_columns(
-            pl.Series(full_pops).gather(self.states["id_agg"]).alias(n_agg_nlte_col)
+            pl.Series(pop_updated_full).gather(self.states["id_agg"]).alias(n_agg_nlte_col)
         )
-        # TODO: In the case where T_ex has been approximated, the LTE pops above the cutoff have been rescaled! Use
-        #  those somehow - in non-T_ex runs, n_nlte_col doesn't exist the first iteration to pull from - rebalance in
+        # TODO: In the case where T_ex has been approximated, the LTE pops above the cutoff have been rescaled!
+        #  Use those somehow - if the degree of NLTE decreases from the first T_ex run then states above cutoff are
+        #  froxen into a more NLTE distribution.
+        #  In non-T_ex runs, n_nlte_col doesn't exist the first iteration to pull from - rebalance in
         #  the n_lte_col directly?
         self.states = self.states.with_columns(
             pl.when(pl.col(n_agg_lte_col) == 0)
@@ -3383,24 +3359,16 @@ class NLTEProcessor:
             # If above cutoff, leave the states in LTE.
             .when(pl.col("id_agg") > self.id_agg_cutoff)
             .then(pl.col(n_lte_col))
-            # TODO: These need to be rebalanced as they're normalised to 1. Probably also need to modify y-matrix
-            #  construction to use fixed coded pops for states above the cutoff. If they are not multiplying by
-            #  any populations in the solution vector, I guess they have to go on the RHS, i.e. solving for not quite 0?
-            #  Same applies to form./dest. rates in col/chem?
             .otherwise(pl.col(n_lte_col) * pl.col(n_agg_nlte_col) / pl.col(n_agg_lte_col))
             .alias(n_nlte_col)
         )
-        # self.states = self.states.with_columns(
-        #     (pl.col(n_nlte_col) / pl.col(n_nlte_col).sum()).alias(n_nlte_col)
-        # )
-        # log_col_names = ["id", "energy", "g", "tau"] + self.agg_col_names + [n_agg_lte_col, n_agg_nlte_col, n_nlte_col]
         log_col_names = ["id", "energy", "g", "tau", n_lte_col, n_agg_lte_col, n_agg_nlte_col, n_nlte_col]
         log.info((
             f"[L{layer_idx}] {self.species} NLTE States = \n{self.states.select(log_col_names)}\n"
             f"[L{layer_idx}] Sum of LTE populations = {self.states[n_lte_col].sum()}.\n"
             f"[L{layer_idx}] Sum of non-LTE populations = {self.states[n_nlte_col].sum()}."
         ))
-        return pop_grid_update
+        return pop_updated_full
 
     def update_layer_global_chi_eta(
             self,
@@ -3411,7 +3379,7 @@ class NLTEProcessor:
             layer_idx: int,
             nlte_layer_idx: int,
             layer_pop_grid: npt.NDArray[np.float64] = None,
-    ) -> t.Tuple[u.Quantity, u.Quantity]:
+    ) -> None:
         if layer_pop_grid is None:
             # Use for T_ex approximation when all new popualtions stored internally.
             layer_pop_grid = self.pop_matrix[-1, layer_idx]
@@ -3420,63 +3388,28 @@ class NLTEProcessor:
         abs_xsec, emi_xsec = self.profile_store.build_abs_emi(
             layer_idx=nlte_layer_idx, pop_matrix=layer_pop_grid, wn_grid=wn_grid.value,
         )
-        log.info(f"[L{layer_idx}] {self.species} CBP duration = {time.perf_counter() - start_time:.6f}")
-        ################### DEBUG
-        # import matplotlib.pyplot as plt
-        # plt.figure(figsize=(8, 4), dpi=300)
-        # plt.plot(wn_grid, abs_xsec, label="Old", linewidth=0.5, color="#33BBEE88")
-        # plt.plot(wn_grid, new_abs_xsec, label="New", linewidth=0.5, color="#EE773388")
-        # plt.text(x=0.8, y=0.8, s=f"L{layer_idx}, T={int(layer_temp.value)}, P={layer_pressure.value:.2e}",
-        #          va="center", ha="center", transform=plt.gca().transAxes)
-        # plt.xlim(left=wn_grid.value.min(), right=wn_grid.value.max())
-        # plt.xlabel("Wavenumbers (cm$^{-1}$)", fontsize=18)
-        # plt.ylabel("Absorption Cross-section\n(cm$^{2}$molecule$^{-1}$)", fontsize=18)
-        # plt.yscale("log")
-        # plt.legend(loc="best")
-        # plt.tight_layout()
-        # plt.show()
-        # plt.close()
-        #
-        # plt.figure(figsize=(8, 4), dpi=300)
-        # plt.plot(wn_grid, emi_xsec, label="Old", linewidth=0.5, color="#33BBEE88")
-        # plt.plot(wn_grid, new_emi_xsec, label="New", linewidth=0.5, color="#EE773388")
-        # plt.text(x=0.8, y=0.8, s=f"L{layer_idx}, T={int(layer_temp.value)}, P={layer_pressure.value:.2e}",
-        #          va="center", ha="center", transform=plt.gca().transAxes)
-        # plt.xlim(left=wn_grid.value.min(), right=wn_grid.value.max())
-        # plt.xlabel("Wavenumbers (cm$^{-1}$)", fontsize=18)
-        # plt.ylabel("Emission Cross-section\n(erg$\\,$cm$\\,$s$^{-1}$sr$^{-1}$molecule$^{-1}$)", fontsize=18)
-        # plt.yscale("log")
-        # plt.legend(loc="best")
-        # plt.tight_layout()
-        # plt.show()
-        # plt.close()
-        # if layer_idx == 44:
-        #     np.save(
-        #         fr"/mnt/c/PhD/NLTE/Models/KELT-20b/approximation/ohx1e0_L44_abs_old.npy",
-        #         abs_xsec
-        #     )
-        #     np.save(
-        #         fr"/mnt/c/PhD/NLTE/Models/KELT-20b/approximation/ohx1e0_L44_abs_new.npy",
-        #         new_abs_xsec
-        #     )
-        #     exit()
-        ################### DEBUG END
+        log.info(f"[L{layer_idx}] {self.species} CBP duration = {time.perf_counter() - start_time:.5f}")
+
         if np.any(abs_xsec < 0):
             log.warning(
                 f"[L{layer_idx}] {self.species} Negative contribution in absorption (stimulated emission dominates)"
             )
 
         if self._cont_states is not None and self.cont_trans_files is not None:
-            # for key in self.cont_profile_grid[nlte_layer_idx].keys():
-            for key in self._cont_profile_store.get_keys(layer_idx=nlte_layer_idx, profile_type="abs"):
-                # Key for continuum profiles is [-1, lower_id] to match bound-bound tuple signature.
-                n_i = layer_pop_grid[key[1]]
-                # log.info(f"{self.species} Cont. profile for band {key} with pop {n_i}.")
-                cont_abs_profile, cont_abs_start_idx = self._cont_profile_store.get_profile(
-                    layer_idx=nlte_layer_idx, key=key, profile_type="abs",
-                )
-                cont_abs_end_idx = cont_abs_start_idx + len(cont_abs_profile)
-                abs_xsec[cont_abs_start_idx: cont_abs_end_idx] += cont_abs_profile * n_i
+            cont_abs_xsec = self._cont_profile_store.build_abs(
+                layer_idx=nlte_layer_idx, pop_matrix=layer_pop_grid, wn_grid=wn_grid.value,
+            )
+            abs_xsec += cont_abs_xsec
+
+            # for key in self._cont_profile_store.get_keys(layer_idx=nlte_layer_idx, profile_type="abs"):
+            #     # Key for continuum profiles is [-1, lower_id] to match bound-bound tuple signature.
+            #     n_i = layer_pop_grid[key[1]]
+            #     # log.info(f"{self.species} Cont. profile for band {key} with pop {n_i}.")
+            #     cont_abs_profile, cont_abs_start_idx = self._cont_profile_store.get_profile(
+            #         layer_idx=nlte_layer_idx, key=key, profile_type="abs",
+            #     )
+            #     cont_abs_end_idx = cont_abs_start_idx + len(cont_abs_profile)
+            #     abs_xsec[cont_abs_start_idx: cont_abs_end_idx] += cont_abs_profile * n_i
 
         # Update layer chi globally and then for species.
         abs_xsec = abs_xsec << u.cm ** 2
@@ -3491,29 +3424,25 @@ class NLTEProcessor:
         )
         self.mol_eta_matrix[layer_idx] = emi_xsec
 
-        return layer_global_chi_matrix, layer_global_eta_matrix
-
-    def update_pops(
+    def commit_pops(
             self,
-            pop_grid_updated: npt.NDArray[np.float64],
-            n_iter: int
-    ) -> bool:
+            pop_update_grid: npt.NDArray[np.float64],
+    ) -> None:
+        """
+        Stores the updated populations from all layers for this iteration.
+
+        Parameters
+        ----------
+        pop_update_grid : ndarray
+            Updated populations across all layer from the current complete iteration.
+        """
         self.pop_matrix = np.vstack((
-            self.pop_matrix, pop_grid_updated.reshape((1, self.pop_matrix.shape[1], self.pop_matrix.shape[2]))
+            self.pop_matrix, pop_update_grid.reshape((1, self.pop_matrix.shape[1], self.pop_matrix.shape[2]))
         ))
         # TEMP!
+        # if self.debug:
         with open((output_dir / f"{self.species}_pop_matrix.pickle").resolve(), "wb") as pickle_file:
             pickle.dump(self.pop_matrix, pickle_file, protocol=pickle.HIGHEST_PROTOCOL)
-
-        # TODO: Flag when levels oscillate between 0 and extremely small values, blocking convergence, fix to 0?
-        max_pop_change = self.accelerator.get_max_change()
-        converged = self.accelerator.converged()
-        log.info(f"[I{n_iter}] {self.species} Max. pop. change {max_pop_change:.6e}{' CONVERGED' if converged else ''}")
-
-        max_pop_changes = self.accelerator.get_max_changes()
-        log.info(f"[I{n_iter}] {self.species} Max. pop. changes = {max_pop_changes}")
-
-        return converged
 
     def finalise(self, temperature_profile: u.Quantity, pressure_profile: u.Quantity, wn_grid: u.Quantity) -> None:
         """

@@ -10,7 +10,7 @@ import numpy as np
 import astropy.units as u
 import astropy.constants as ac
 
-from .accelerator import HybridAccelerator
+from .accelerator import MultiSpeciesAccelerator
 from .chemistry import SpeciesFormula, SpeciesIdentType, ChemicalProfile
 from .nlte import (
     blackbody,
@@ -20,6 +20,7 @@ from .nlte import (
     formal_solve_general,
     NLTEProcessor,
 )
+from .config import _LOG_FLOAT_FMT, _LOG_ARRAY_FMT
 from .numerics import loglinear_integral_1d
 
 log = logging.getLogger(__name__)
@@ -457,7 +458,6 @@ class ExomolNLTEXsec(ExomolHDF5Xsec):
             raise RuntimeError(f"NLTEProcessor instance not configured for {self.species} ExomolNLTEXsec instance.")
         processor.n_layers = n_layers
         processor.n_lte_layers = n_lte_layers
-        processor.accelerator = HybridAccelerator(n_layers=n_layers - n_lte_layers)
 
     def opacity(
             self,
@@ -508,7 +508,8 @@ class HMinusIon(XSecData):
             [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         ])
 
-    def _k_bound_free(self, lam: npt.NDArray[np.float64], temperature: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    def _k_bound_free(self, lam: npt.NDArray[np.float64], temperature: npt.NDArray[np.float64]) -> npt.NDArray[
+        np.float64]:
         """
         John (1988), "Continuous absorption by the negative hydrogen ion reconsidered", via ADS
         https://ui.adsabs.harvard.edu/abs/1988A%26A...193..189J/abstract
@@ -553,7 +554,8 @@ class HMinusIon(XSecData):
 
         return k_bf
 
-    def _k_free_free(self, lam: npt.NDArray[np.float64], temperature: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    def _k_free_free(self, lam: npt.NDArray[np.float64], temperature: npt.NDArray[np.float64]) -> npt.NDArray[
+        np.float64]:
         """
         John (1988), "Continuous absorption by the negative hydrogen ion reconsidered", via ADS
         https://ui.adsabs.harvard.edu/abs/1988A%26A...193..189J/abstract
@@ -604,7 +606,7 @@ class HMinusIon(XSecData):
                 axis=0,
             )
 
-            return 10**-29 * k
+            return 10 ** -29 * k
 
         k_ff = np.zeros((temperature.shape[0], lam.shape[0]))
 
@@ -647,7 +649,7 @@ class XSecCollection(dict):
         # Public:
         "n_layers", "intensity_threshold", "n_lte_layers", "incident_radiation_field", "debug",
         # Private:
-        "_global_source_func_matrix", "_global_chi_matrix", "_global_eta_matrix", "_intensity_matrix",
+        "_accelerator", "_global_source_func_matrix", "_global_chi_matrix", "_global_eta_matrix", "_intensity_matrix",
         "_is_converged", "_full_prec", "_do_tridiag", "_damping_enabled", "_n_iter",
         "_negative_source_func_cap", "_negative_absorption_factor",
     ]
@@ -665,6 +667,7 @@ class XSecCollection(dict):
         self.n_lte_layers = n_lte_layers
         self.incident_radiation_field = incident_radiation_field
         self.debug = debug
+        self._accelerator = None
         self._global_source_func_matrix = None
         self._global_chi_matrix = None
         self._global_eta_matrix = None
@@ -678,6 +681,16 @@ class XSecCollection(dict):
         self._negative_absorption_factor = 0.1
 
         super().__init__()
+
+    @property
+    def accelerator(self) -> MultiSpeciesAccelerator:
+        if self._accelerator is None:
+            raise RuntimeError(f"{self.species} XSecCollection field 'accelerator' not initialised.")
+        return self._accelerator
+
+    @accelerator.setter
+    def accelerator(self, value: MultiSpeciesAccelerator) -> None:
+        self._accelerator = value
 
     @property
     def available_species(self) -> t.List[SpeciesFormula]:
@@ -791,6 +804,13 @@ class XSecCollection(dict):
             # Early exit when no NLTE species.
             return output_opacities
 
+        # ----------------------------------------------- NLTE WORKFLOW -----------------------------------------------
+        # Configure species accelerator.
+        n_nlte_layers = self.n_layers - self.n_lte_layers
+        self.accelerator = MultiSpeciesAccelerator(
+            species_layers={species: n_nlte_layers for species in nlte_processors.keys()}
+        )
+
         n_angular_points = 50
         mu_values, mu_weights = np.polynomial.legendre.leggauss(n_angular_points)
         mu_values, mu_weights = (mu_values + 1) * 0.5, mu_weights / 2
@@ -808,7 +828,6 @@ class XSecCollection(dict):
             # np.save(r"/mnt/c/PhD/NLTE/theory/opacity/LTE_tau.npy", dtau)
             i_mean_interfaces = (i_up + i_down)
             i_mean = 0.5 * (i_mean_interfaces[:-1] + i_mean_interfaces[1:])
-            log.info(f"Any i_mean < 0 = {np.any(i_mean < 0)}; i_mean == 0 = {np.any(i_mean == 0)}.")
             for species in nlte_processors.keys():
                 processor = nlte_processors[species]
                 log.info(f"[I{self._n_iter}] Approximating T_ex for {species}.")
@@ -828,15 +847,13 @@ class XSecCollection(dict):
                     wn_dx=wn_dx,
                 )
                 for layer_idx in range(self.n_lte_layers, n_layers):
-                    self._global_chi_matrix[layer_idx], self._global_eta_matrix[layer_idx] = (
-                        processor.update_layer_global_chi_eta(
-                            wn_grid=spectral_grid,
-                            layer_vmr=chem_profile[species][layer_idx],
-                            layer_global_chi_matrix=self._global_chi_matrix[layer_idx],
-                            layer_global_eta_matrix=self._global_eta_matrix[layer_idx],
-                            layer_idx=layer_idx,
-                            nlte_layer_idx=layer_idx - self.n_lte_layers,
-                        )
+                    processor.update_layer_global_chi_eta(
+                        wn_grid=spectral_grid,
+                        layer_vmr=chem_profile[species][layer_idx],
+                        layer_global_chi_matrix=self._global_chi_matrix[layer_idx],
+                        layer_global_eta_matrix=self._global_eta_matrix[layer_idx],
+                        layer_idx=layer_idx,
+                        nlte_layer_idx=layer_idx - self.n_lte_layers,
                     )
             zero_chi_mask = self._global_chi_matrix == 0
             self._global_source_func_matrix[~zero_chi_mask] = (
@@ -846,6 +863,8 @@ class XSecCollection(dict):
         # -------------------------- Iterative solution --------------------------
         while not self._is_converged:
             self._n_iter += 1
+            self.accelerator.reset_oscillation_flags()
+
             effective_source_func_matrix, effective_tau_mu = effective_source_tau_mu(
                 global_source_func_matrix=self._global_source_func_matrix,
                 global_chi_matrix=self._global_chi_matrix,
@@ -862,12 +881,6 @@ class XSecCollection(dict):
                 source_function_matrix=effective_source_func_matrix,
             )
             log.info(f"Coefficient duration = {time.perf_counter() - start_time:.3f}")
-            # log.info(
-            #     f"Coefs equal? {np.all(bezier_coefs_old == bezier_coefs)} {np.allclose(bezier_coefs_old, bezier_coefs, atol=1e-7)}"
-            # )
-            # log.info(
-            #     f"Control equal? {np.all(control_points_old == control_points)} {np.allclose(control_points_old, control_points, atol=1e-7)}"
-            # )
 
             # USEFUL BEZIER IDENTITIES
             alpha_plus_gamma = bezier_coefs[:, 1] + bezier_coefs[:, 3]
@@ -876,13 +889,10 @@ class XSecCollection(dict):
             i_in_matrix: u.Quantity = np.zeros_like(effective_tau_mu) << self._global_source_func_matrix.unit
             lambda_in_matrix = np.zeros_like(effective_tau_mu)
             ################
-            pop_grid_updates = {}
+            pop_update_dict = {}
             for species in nlte_processors.keys():
-                # xsec_data = self[species]
-                # if is_nlte_xsec(xsec_data):
-                #     processor = xsec_data.get_nlte_processor()
                 processor = nlte_processors[species]
-                pop_grid_updates[species] = processor.get_latest_pop_grid()
+                pop_update_dict[species] = processor.get_latest_pop_grid()
 
             # -------------------------- GAUSS-SEIDEL PASSES --------------------------
             # ------------------------------ INWARD PASS ------------------------------
@@ -950,8 +960,6 @@ class XSecCollection(dict):
                 # Solve equilibrium for non-LTE layers.
                 if layer_idx >= self.n_lte_layers:
                     nlte_layer_idx = layer_idx - self.n_lte_layers
-                    # layer_temp = temperature[layer_idx]
-                    # layer_pressure = pressure[layer_idx]
 
                     # Integrate over all angles. This can be done independent of the transitions.
                     i_layer_grid = 0.5 * np.sum(
@@ -962,15 +970,14 @@ class XSecCollection(dict):
                         (lambda_in_matrix[layer_idx] + lambda_out_matrix[layer_idx]) * mu_weights[:, None],
                         axis=0,
                     )
-                    y_mats = {}
-                    rhs_mats = {}
-                    # TODO: skip if species abundance is 0?
+                    # Store raw new populations (normnalised), for global oscilaltion checks in self.accelerator.
+                    # Pops are processed after acceleration in the update_pops call.
+                    pop_new_dict = {}
+                    pop_old_dict = {}
+                    # TODO: skip if species abundance is 0 on this layer?
                     for species in nlte_processors.keys():
-                        # xsec_data = self[species]
-                        # if is_nlte_xsec(xsec_data):
-                        #     processor = xsec_data.get_nlte_processor()
                         processor = nlte_processors[species]
-                        y_mats[species], rhs_mats[species] = processor.build_y_matrix(
+                        processor.build_y_matrix(
                             layer_idx=layer_idx,
                             nlte_layer_idx=nlte_layer_idx,
                             i_layer_grid=i_layer_grid,
@@ -982,33 +989,48 @@ class XSecCollection(dict):
                             wn_dx=wn_dx,
                             full_prec=self._full_prec,
                         )
-                    # Solve statistical equilibrium for all species and update layer opacities, etc.
-                    # These are solved in another loop so that all Y matrices are constructed using the same set of
-                    # global parameters, rather than biasing the solution each iteration based on update order.
-                    for species in nlte_processors.keys():
-                        # xsec_data = self[species]
-                        # if is_nlte_xsec(xsec_data):
-                        #     processor = xsec_data.get_nlte_processor()
-                        processor = nlte_processors[species]
-                        pop_grid_update = processor.solve_pops(
-                            y_matrix=y_mats[species],
-                            rhs_matrix=rhs_mats[species],
-                            pop_grid_update=pop_grid_updates[species],
+                        # We can solve for the pops here because we don't modify any of the properties used to construct
+                        # the Y matrices for the next species until the next loop.
+                        pop_new, pop_old = processor.solve_pops(
                             layer_idx=layer_idx,
                             n_iter=self._n_iter,
                         )
-                        pop_grid_updates[species] = pop_grid_update
+                        # We store these because pop_old is sliced according to the y_idx_map.
+                        pop_new_dict[species] = pop_new
+                        pop_old_dict[species] = pop_old
+                        self.accelerator.register_raw(
+                            species=species,
+                            layer_idx=nlte_layer_idx,
+                            pop_new=pop_new,
+                            pop_old=pop_old,
+                            iteration=self._n_iter,
+                        )
+                    # Once we've got the raw new populations we can apply acceleratoree updates, allowing for global
+                    # damping if any species are oscillating. Global properties are then updated.
+                    for species in nlte_processors.keys():
+                        processor = nlte_processors[species]
+                        pop_updated = self.accelerator.apply(
+                            species=species,
+                            layer_idx=nlte_layer_idx,
+                            pop_new=pop_new_dict[species],
+                            pop_old=pop_old_dict[species],
+                            iteration=self._n_iter,
+                        )
+                        pop_updated_full = processor.update_pops(
+                            layer_idx=layer_idx,
+                            pop_updated=pop_updated,
+                        )
+                        pop_update_dict[species][layer_idx] = pop_updated_full
 
-                        self._global_chi_matrix[layer_idx], self._global_eta_matrix[layer_idx] = (
-                            processor.update_layer_global_chi_eta(
-                                wn_grid=spectral_grid,
-                                layer_vmr=chem_profile[species][layer_idx],
-                                layer_global_chi_matrix=self._global_chi_matrix[layer_idx],
-                                layer_global_eta_matrix=self._global_eta_matrix[layer_idx],
-                                layer_idx=layer_idx,
-                                nlte_layer_idx=nlte_layer_idx,
-                                layer_pop_grid=pop_grid_update[layer_idx],
-                            )
+                        # Global matrices updated inplace.
+                        processor.update_layer_global_chi_eta(
+                            wn_grid=spectral_grid,
+                            layer_vmr=chem_profile[species][layer_idx],
+                            layer_global_chi_matrix=self._global_chi_matrix[layer_idx],
+                            layer_global_eta_matrix=self._global_eta_matrix[layer_idx],
+                            layer_idx=layer_idx,
+                            nlte_layer_idx=nlte_layer_idx,
+                            layer_pop_grid=pop_updated_full,
                         )
                     #########
                     # Update all physical properties now all Non-LTE species' opacities have been updated.
@@ -1029,16 +1051,6 @@ class XSecCollection(dict):
                     )
                     # np.save(fr"/mnt/c/PhD/NLTE/theory/opacity/nLTE_tau_I{self.n_iter}_L{nlte_layer_idx}.npy",
                     #         effective_tau_mu)
-                    # start_time = time.perf_counter()
-                    # bezier_coefs_old, control_points_old = bezier_coefficients_old(
-                    #     tau_mu_matrix=effective_tau_mu,
-                    #     source_function_matrix=effective_source_func_matrix.value,
-                    # )
-                    # control_points_old = control_points_old << source_func_unit
-                    # log.info(f"[L{layer_idx}] (OLD) Coefficient (post) duration = {time.perf_counter() - start_time}")
-                    # log.info(f"Test control points before = {control_points_old[layer_idx, 0]}")
-                    # check_old_control_points = control_points[layer_idx - 1: layer_idx + 2, 0].copy()
-                    # log.info(f"Test control points before = {check_old_control_points}")
                     start_time = time.perf_counter()
                     update_layer_coefficients(
                         layer_idx=layer_idx,
@@ -1047,9 +1059,6 @@ class XSecCollection(dict):
                         coefficients=bezier_coefs,
                         control_points=control_points
                     )
-                    # log.info(f"TEST control points after = {control_points[layer_idx - 1: layer_idx + 2, 0]}")
-                    # log.info(f"TEST Still the same? {np.all(control_points[layer_idx - 1: layer_idx + 2, 0] == check_old_control_points)}")
-                    # control_points = control_points << source_func_unit
                     if layer_idx > 0:
                         one_plus_exp_neg_delta_tau[layer_idx] = 1 + bezier_coefs[layer_idx, 0]
                         alpha_plus_gamma[layer_idx] = bezier_coefs[layer_idx, 1] + bezier_coefs[layer_idx, 3]
@@ -1076,19 +1085,16 @@ class XSecCollection(dict):
                             lambda_out_matrix[layer_idx] = alpha_plus_gamma[layer_idx]
             # ---------------------------- PASSES COMPLETE ----------------------------
             # Commit pop_grid_updates to each species.
-            all_converged = True
             for species in nlte_processors.keys():
-                # xsec_data = self[species]
-                # if is_nlte_xsec(xsec_data):
-                #     processor = xsec_data.get_nlte_processor()
                 processor = nlte_processors[species]
-                converged = processor.update_pops(
-                    pop_grid_updated=pop_grid_updates[species],
-                    n_iter=self._n_iter
-                )
-                all_converged &= converged
+                processor.commit_pops(pop_update_grid=pop_update_dict[species])
+                converged = self.accelerator.converged(species=species)
+                max_changes = self.accelerator.get_max_changes(species=species)
+                log.info(f"[I{self._n_iter}] {species} Max. pop. change = {max_changes.max():{_LOG_FLOAT_FMT}}"
+                         f"{' CONVERGED' if converged else ''}\n"
+                         f"Per layer chnages = {np.array2string(max_changes, formatter=_LOG_ARRAY_FMT)}")
 
-            self._is_converged = all_converged
+            self._is_converged = self.accelerator.converged()
         log.info(f"[I{self._n_iter}] Convergence achieved!")
 
         # TODO: Default resolving power grid?
