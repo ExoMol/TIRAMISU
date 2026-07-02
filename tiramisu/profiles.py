@@ -15,7 +15,8 @@ from pyarrow import parquet as pq
 from dask import dataframe as dd
 from numpy import typing as npt
 
-from .config import _DEFAULT_NUM_THREADS, _INTENSITY_CUTOFF
+from .config import _DEFAULT_NUM_THREADS, _INTENSITY_CUTOFF, _PARQUET_BATCH_SIZE, _DASK_BLOCK_SIZE, _LOG_VERBOSE_1, \
+    _LOG_VERBOSE_2
 from .numerics import loglinear_normalise_2d_nonnegative
 
 log = logging.getLogger(__name__)
@@ -58,7 +59,6 @@ def _iter_trans_batches(
         wn_min: float,
         wn_max: float,
         parquet_batch_size: int,
-        dask_blocksize: str,
         dask_dtypes: dict,
         do_super_lines: bool,
 ) -> t.Iterator[pl.DataFrame]:
@@ -75,8 +75,6 @@ def _iter_trans_batches(
     states_f
     wn_min
     wn_max
-    parquet_batch_size
-    dask_blocksize
     dask_dtypes
     do_super_lines
 
@@ -123,7 +121,7 @@ def _iter_trans_batches(
             names=trans_columns,
             usecols=[0, 1, 2],
             dtype=dask_dtypes,
-            blocksize=dask_blocksize,
+            blocksize=_DASK_BLOCK_SIZE,
         )
         for delayed_batch in ddf.to_delayed():
             yield _process(pl.from_pandas(delayed_batch.compute()))
@@ -488,168 +486,6 @@ def _accumulate_continuum_superline_band_batch(
             profile_buffer[1, band_t, l, bin_t] += abs_tl * alpha_box_lookup[id_f[t]]
 
 
-def _process_band_batch(
-        trans_batch: pl.DataFrame,
-        profile_buffer: npt.NDArray[np.float64],
-        band_indices: npt.NDArray[np.int32],
-        n_frac_lookup: npt.NDArray[np.float64],
-        g_lookup: npt.NDArray[np.float64],
-        tau_lookup: npt.NDArray[np.float64],
-        broad_n: npt.NDArray[np.float64],
-        broad_gamma: npt.NDArray[np.float64],
-        species_mass: float,
-        wn_grid: npt.NDArray[np.float64],
-        temperature_profile: npt.NDArray[np.float64],
-        pressure_profile: npt.NDArray[np.float64],
-) -> None:
-    """
-    Called from :func:`~xsec.NLTEProcessor.compute_rates_profiles`. Input trans_batch is joined on states prior to this
-    function call and must be sorted on the columns ["id_f_agg", "id_i_agg"] so numpy slicing maintains group order.
-
-    Computes the band profiles for every band across all layers, on the fixed wn_grid. Absorption, stimulated and
-    spontaneous emission are computed separately and returned in a profile buffer to be accumulated with the results of
-    other transition files or file chunks.
-
-    Parameters
-    ----------
-    trans_batch : polars.DataFrame
-        Polars DataFrame of raw transitions (id_f, id_i, A_fi) and joined states data.
-    profile_buffer : ndarray, shape (3, n_bands, n_layers, n_grid)
-    band_indices : ndarray, shape (n_trans, )
-    n_frac_lookup : ndarray, shape (n_states + 1, n_layers)
-        Lookup table for n_frac, avoiding extremely memory intensive joins.
-    g_lookup : ndarray, shape (n_states + 1, )
-        Lookup table for g, avoiding extremely memory intensive joins.
-    tau_lookup : ndarray, shape (n_states + 1, )
-        Lookup table for tau (lifetimes), avoiding extremely memory intensive joins.
-    broad_n : ndarray, shape (n_broadeners,)
-        Pressure broadening exponent n.
-    broad_gamma : ndarray, shape (n_broadeners, n_layers)
-        Pressure broadening gamma, per layer due to mixing of broadeners.
-    species_mass : float
-        Mass of the species for broadening, in Daltons.
-    wn_grid : ndarray, shape (n_grid,)
-        The full wavenumber grid.
-    temperature_profile : ndarray, shape (n_nlte_layers,)
-        Kinetic temperatures for NLTE layers, plain float values in Kelvin.
-    pressure_profile : ndarray, shape (n_nlte_layers,)
-        Pressures for NLTE layers, plain float values in Pascals.
-    """
-    # Compute band profiles for all bands and all layers at once.
-    start_time = time.perf_counter()
-    id_agg_f = trans_batch["id_agg_f"].to_numpy()
-    id_agg_i = trans_batch["id_agg_i"].to_numpy()
-    # Finds indices where either id_agg value changes.
-    group_boundaries = np.where(
-        (id_agg_f[1:] != id_agg_f[:-1]) |
-        (id_agg_i[1:] != id_agg_i[:-1])
-    )[0] + 1
-    group_starts = np.concatenate([[0], group_boundaries], dtype=np.int32)
-    group_ends = np.concatenate([group_boundaries, [len(id_agg_f)]], dtype=np.int32)
-    band_group_indices = np.ascontiguousarray(band_indices[group_starts])
-
-    _band_profile_sampled_voigt(
-        profile_buffer=profile_buffer,
-        wn_grid=wn_grid,
-        id_f=np.ascontiguousarray(trans_batch["id_f"].to_numpy()),
-        id_i=np.ascontiguousarray(trans_batch["id_i"].to_numpy()),
-        band_group_indices=band_group_indices,
-        group_starts=group_starts,
-        group_ends=group_ends,
-        n_lookup=n_frac_lookup,
-        g_lookup=g_lookup,
-        tau_lookup=tau_lookup,
-        a_fi=np.ascontiguousarray(trans_batch["A_fi"].to_numpy()),
-        energy_fi=np.ascontiguousarray(trans_batch["energy_fi"].to_numpy()),
-        temperatures=temperature_profile,
-        pressures=pressure_profile,
-        broad_n=broad_n,
-        broad_gamma=broad_gamma,
-        species_mass=species_mass,
-    )
-    log.info(f"Numba accumulate duration = {time.perf_counter() - start_time:.3f}s.")
-
-
-def _process_continuum_band_batch(
-        trans_batch: pl.DataFrame,
-        profile_buffer: npt.NDArray[np.float64],
-        band_indices: npt.NDArray[np.int32],
-        n_frac_lookup: npt.NDArray[np.float64],
-        g_lookup: npt.NDArray[np.float64],
-        v_lookup: npt.NDArray[np.float64],
-        species_mass: float,
-        reduced_mass: float,
-        cont_box_length: float,
-        wn_grid: npt.NDArray[np.float64],
-        temperature_profile: npt.NDArray[np.float64],
-) -> None:
-    """
-    Called from :func:`~xsec.NLTEProcessor.compute_continuum_rates_profiles`. Input trans_batch is joined on states
-    prior to this function call and must be sorted on the column ["id_i_agg"] so numpy slicing maintains group order.
-    The column "id_f_agg" is not used here as the continuum is state is not tracked.
-
-    Computes the band profiles for every band across all layers, on the fixed wn_grid. Absorption is computed separately
-    and returned in a profile buffer to be accumulated with the results of other transition files or file chunks.
-    Stimulated and spontaneous emission are not yet implemented.
-
-    Parameters
-    ----------
-    trans_batch : polars.DataFrame
-        Polars DataFrame of raw transitions (id_f, id_i, A_fi).
-    profile_buffer : ndarray, shape (3, n_bands, n_layers, n_grid)
-    band_indices : ndarray, shape (n_trans, )
-    n_frac_lookup : ndarray, shape (n_states + 1, n_layers)
-        Lookup table for n_frac, avoiding extremely memory intensive joins.
-    g_lookup : ndarray, shape (n_states + 1, )
-        Lookup table for g, avoiding extremely memory intensive joins.
-    v_lookup : ndarray, shape (n_states + 1, )
-        Lookup table for v for box broadening, avoiding extremely memory intensive joins.
-    species_mass : float
-        Mass of the species for Doppler broadening, in Daltons.
-    reduced_mass : float
-        Reduced mass of the species for box broadening, in Daltons.
-    cont_box_length : float
-        Box length off to use in continuum box broadening.
-    wn_grid : ndarray, shape (n_grid,)
-        The full wavenumber grid.
-    temperature_profile : ndarray, shape (n_nlte_layers,)
-        Kinetic temperatures for NLTE layers, plain float values in Kelvin.
-    """
-    trans_batch = trans_batch.fill_null(strategy="zero")
-
-    start_time = time.perf_counter()
-    id_agg_f = trans_batch["id_agg_f"].to_numpy()
-    id_agg_i = trans_batch["id_agg_i"].to_numpy()
-    # Finds indices where either id_agg value changes.
-    group_boundaries = np.where(
-        # (id_agg_f_arr[1:] != id_agg_f_arr[:-1]) |
-        (id_agg_i[1:] != id_agg_i[:-1])
-    )[0] + 1
-    group_starts = np.concatenate([[0], group_boundaries])
-    group_ends = np.concatenate([group_boundaries, [len(id_agg_f)]])
-    band_group_indices = np.ascontiguousarray(band_indices[group_starts])
-
-    _continuum_band_profile_sampled_gauss_layered(
-        profile_buffer=profile_buffer,
-        wn_grid=wn_grid,
-        id_f=np.ascontiguousarray(trans_batch["id_f"].to_numpy()),
-        id_i=np.ascontiguousarray(trans_batch["id_i"].to_numpy()),
-        band_group_indices=band_group_indices,
-        group_starts=group_starts,
-        group_ends=group_ends,
-        n_lookup=n_frac_lookup,
-        g_lookup=g_lookup,
-        v_lookup=v_lookup,
-        a_fi=np.ascontiguousarray(trans_batch["A_fi"].to_numpy()),
-        energy_fi=np.ascontiguousarray(trans_batch["energy_fi"].to_numpy()),
-        temperatures=temperature_profile,
-        species_mass=species_mass,
-        reduced_mass=reduced_mass,
-        box_length=cont_box_length,
-    )
-    log.info(f"Numba accumulate continuum duration = {time.perf_counter() - start_time:.3f}s.")
-
-
 # ------------------------------------- COMPACT PROFILE & STORE CLASSES -------------------------------------
 
 @numba.njit(parallel=True, cache=True, error_model="numpy")
@@ -960,76 +796,7 @@ class CompactProfile:
 
         self.offsets[n_valid] = total_len
         self.profiles = profiles_out
-        log.info(f"Finalised CompactProfile with {total_len} points for {n_valid} bands.")
-
-    # def finalise(self, profile_matrix: npt.NDArray[np.float64]) -> None:
-    #     """
-    #     Used when super-lines is disabled.
-    #
-    #     The starting indices within self.profiles of each individual profile is contained within self.offsets. An extra
-    #     terminator is stored at the end of self.offsets equal to the total length of self.profiles; this is so the start
-    #     and end indices of a given profile can always be obtained by looking at the current and next offset.
-    #
-    #     The starting position of each profile on the main wavenumber grid is stored at the corresponding index in
-    #     self.start_idxs.
-    #
-    #     The upper and lower state IDs are stored in self.key_idx_map; the index of theh first dimension of this array
-    #     matches the corresponding index in self.offsets and self.start_idxs. This is used for fast cross-section
-    #     reconstruction in :func:`tiramisu.nlte.CompactProfile.build_xsec`. A fast dictionary lookup for accessing
-    #     individual bands is stored in self.key_lookup, used by :func:`tiramisu.nlte.CompactProfile.get_profile`.
-    #
-    #     Parameters
-    #     ----------
-    #     profile_matrix : ndarray, shape (n_agg_states, n_agg_states, n_grid)
-    #         Array containing the profiles for every band in the layer on the same fixed grid.
-    #     """
-    #     if profile_matrix.ndim == 3:
-    #         n0, n1, n_grid = profile_matrix.shape
-    #         flat = profile_matrix.reshape(n0 * n1, n_grid)
-    #         # Generate keys: (i, j) pairs in ndindex order
-    #         keys = np.array([(i, j) for i in range(n0) for j in range(n1)], dtype=np.int64)
-    #     elif profile_matrix.ndim == 2:
-    #         flat = profile_matrix  # (n_agg, n_grid)
-    #         keys = np.array([(-1, i) for i in range(flat.shape[0])], dtype=np.int64)
-    #     else:
-    #         raise ValueError(f"Unsupported number of columns in CompactProfile input ({profile_matrix.ndim}).")
-    #
-    #     n_profiles, n_grid = flat.shape
-    #     start_idxs, end_idxs, valid = _analyse_profiles(profile_matrix_2d=flat, cutoff=_INTENSITY_CUTOFF)
-    #
-    #     lengths = np.where(valid, end_idxs - start_idxs, 0)
-    #     # Prefix sum gives each profile's offset in the output array.
-    #     offsets_full = np.zeros(n_profiles + 1, dtype=np.int64)
-    #     offsets_full[1:] = np.cumsum(lengths)
-    #     total_len = offsets_full[-1]
-    #
-    #     profiles_out = np.empty(total_len, dtype=np.float64)
-    #     _write_profiles(
-    #         profile_matrix_2d=flat,
-    #         profiles_out=profiles_out,
-    #         offsets_full=offsets_full,
-    #         start_idxs=start_idxs,
-    #         end_idxs=end_idxs,
-    #         valid=valid
-    #     )
-    #     # Build compact index arrays (only valid entries).
-    #     n_valid = int(valid.sum())
-    #     self.offsets = np.empty(n_valid + 1, dtype=np.int64)
-    #     self.start_idxs = np.empty(n_valid, dtype=np.int64)
-    #     self.key_idx_map = np.empty((n_valid, 2), dtype=np.int64)
-    #
-    #     store_idx = 0
-    #     for i in range(n_profiles):
-    #         if not valid[i]:
-    #             continue
-    #         self.offsets[store_idx] = offsets_full[i]
-    #         self.start_idxs[store_idx] = start_idxs[i]
-    #         self.key_idx_map[store_idx] = keys[i]
-    #         self.key_lookup[tuple(keys[i])] = store_idx
-    #         store_idx += 1
-    #     self.offsets[n_valid] = total_len
-    #     self.profiles = profiles_out
-    #     log.info(f"Finalised CompactProfile with {total_len} points for {n_valid} bands.")
+        log.log(_LOG_VERBOSE_2, f"Finalised CompactProfile with {total_len} points for {n_valid} bands.")
 
     def get_profile(self, key: t.Tuple[int, int] | int) -> t.Tuple[npt.NDArray[np.float64], int] | None:
         profile_idx = self.key_lookup.get(key)
@@ -1373,7 +1140,6 @@ def abs_emi_xsec(
     """
     trans_columns = ["id_f", "id_i", "A_fi"]
     dask_dtypes = {"id_f": "int64", "id_i": "int64", "A_fi": "float64", }
-    dask_blocksize = "512MB"
 
     # Plain float arrays - no astropy units - passed directly to Numba.
     temperature_slice = temperature_profile[n_lte_layers:].value  # (n_nlte_layers,)
@@ -1436,7 +1202,6 @@ def abs_emi_xsec(
     profile_buffer = np.ascontiguousarray(profile_buffer)
 
     process_time = time.perf_counter()
-    parquet_batch_size = 20_000_000
 
     for trans_file in trans_files:
         log.info(f"Processing file {trans_file}.")
@@ -1447,13 +1212,12 @@ def abs_emi_xsec(
                 states_f=states_f,
                 wn_min=wn_min,
                 wn_max=wn_max,
-                parquet_batch_size=parquet_batch_size,
-                dask_blocksize=dask_blocksize,
+                parquet_batch_size=_PARQUET_BATCH_SIZE // 10,
                 dask_dtypes=dask_dtypes,
                 do_super_lines=do_super_lines,
         ):
             if trans_batch.height == 0:
-                log.info("No valid trans in batch.")
+                log.log(_LOG_VERBOSE_1, "No valid trans in batch.")
                 continue
 
             if do_super_lines:
@@ -1500,7 +1264,7 @@ def abs_emi_xsec(
     else:
         abs_xsec = profile_buffer[0]
         emi_xsec = profile_buffer[1]
-    log.info(f"DEBUG: new rates/profiles duration = {time.perf_counter() - process_time:.3f}.")
+    log.log(_LOG_VERBOSE_2, f"New rates/profiles duration = {time.perf_counter() - process_time:.3f}.")
     return abs_xsec, emi_xsec
 
 
@@ -1539,7 +1303,6 @@ def continuum_xsec(
     """
     trans_columns = ["id_f", "id_i", "A_fi"]
     dask_dtypes = {"id_f": "int64", "id_i": "int64", "A_fi": "float64"}
-    dask_blocksize = "512MB"
 
     # Plain float arrays - no astropy units - passed directly to Numba.
     temperature_slice = temperature_profile[n_lte_layers:].value  # (n_nlte_layers,)
@@ -1599,7 +1362,6 @@ def continuum_xsec(
     profile_buffer = np.ascontiguousarray(profile_buffer)
 
     process_time = time.perf_counter()
-    parquet_batch_size = 20_000_000
 
     for trans_file in cont_trans_files:
         log.info(f"Processing file {trans_file}.")
@@ -1610,13 +1372,12 @@ def continuum_xsec(
                 states_f=states_f,
                 wn_min=wn_min,
                 wn_max=wn_max,
-                parquet_batch_size=parquet_batch_size,
-                dask_blocksize=dask_blocksize,
+                parquet_batch_size=_PARQUET_BATCH_SIZE // 10,
                 dask_dtypes=dask_dtypes,
                 do_super_lines=do_super_lines,
         ):
             if trans_batch.height == 0:
-                log.info("No valid trans in batch.")
+                log.log(_LOG_VERBOSE_1, "No valid trans in batch.")
                 continue
 
             if do_super_lines:
@@ -1661,7 +1422,7 @@ def continuum_xsec(
         )
     else:
         abs_xsec = profile_buffer[0]
-    log.info(f"DEBUG: new rates/profiles duration = {time.perf_counter() - process_time:.3f}.")
+    log.log(_LOG_VERBOSE_2, f"New rates/profiles duration = {time.perf_counter() - process_time:.3f}.")
     return abs_xsec
 
 

@@ -7,11 +7,16 @@ import numba
 from logging.handlers import QueueHandler, QueueListener
 
 _DEFAULT_NUM_THREADS = 20
-_DEFAULT_CHUNK_SIZE = 10000000
+_DEFAULT_CHUNK_SIZE = 10_000_000
+_PARQUET_BATCH_SIZE = 200_000_000
+_DASK_BLOCK_SIZE = "512MB"
 _N_GH_QUAD_POINTS = 30
 _INTENSITY_CUTOFF = 1e-100
 _LOG_FLOAT_FMT = "6.3E"
 _LOG_ARRAY_FMT = {'float': lambda x: format(x, _LOG_FLOAT_FMT)}
+_LOG_VERBOSE_1 = logging.INFO - 1
+_LOG_VERBOSE_2 = logging.INFO - 2
+_LOG_VERBOSE_3 = logging.INFO - 3
 
 os.environ["RUST_BACKTRACE"] = "1"
 
@@ -27,10 +32,10 @@ ctx = mp.get_context("spawn")
 log_queue = ctx.Queue()
 
 
-def setup_logging_main(logfile: str = "nlte.log"):
+def setup_logging_main(logfile: str = "nlte.log", level: int = logging.INFO):
     root = logging.getLogger()
     root.handlers.clear()
-    root.setLevel(logging.INFO)
+    root.setLevel(level)
 
     # Queue handler (thread/process safe).
     # queue_handler = QueueHandler(log_queue)

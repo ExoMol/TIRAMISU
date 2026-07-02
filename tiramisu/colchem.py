@@ -460,7 +460,7 @@ class CollisionalRatesDatabase:
         - For temperature-independent species (e.g., OH), rates are vectorized over all layers.
         """
         if not CollisionalRatesDatabase.has_rates(species):
-            log.info(f"No collisional rates configured for {species}")
+            log.warning(f"No collisional rates configured for {species}")
             n_layers = len(temperature_profile)
             return np.zeros(n_layers) << rate_unit, np.zeros(n_layers) << rate_unit, 0 << 1 / u.cm
 

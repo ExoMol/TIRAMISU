@@ -3,6 +3,8 @@ import numpy.typing as npt
 from dataclasses import dataclass
 import logging
 
+from .config import _LOG_VERBOSE_1, _LOG_VERBOSE_2
+
 log = logging.getLogger(__name__)
 
 
@@ -15,9 +17,9 @@ class AccelerationConfig:
 
     # Adaptive damping
     omega_start: float = 1.0
-    omega_min: float = 0.5
+    omega_min: float = 0.25
     omega_max: float = 1.0
-    omega_increase_factor: float = 1.1  # Recovering from oscillation; return preference to new step.
+    omega_increase_factor: float = 1.05  # Recovering from oscillation; return preference to new step.
     omega_decrease_factor: float = 0.7  # Oscillating; prefer pops from previous iteration.
 
     # Ng acceleration
@@ -59,7 +61,10 @@ class LayerAccelerator:
 
         # History storage - grows dynamically as iterations proceed
         # Each element is the max change for that iteration
+        # Raw change stores new raw pops - previous accepted.
         self.change_history = []  # List of floats, one per iteration
+        # register_raw initially stores the raw new pops to compare against previous iterations; but once apply is
+        # called this is changed to the accepted value.
 
         # Ng history - stores population arrays
         self.ng_history = []  # List of arrays, one per iteration
@@ -80,7 +85,6 @@ class LayerAccelerator:
         """
         self.register_raw(pop_new, pop_old, iteration)
         return self.apply(pop_new, pop_old, iteration)
-
 
     def _compute_change(self, pop_new: npt.NDArray[np.float64], pop_old: npt.NDArray[np.float64]) -> float:
 
@@ -106,81 +110,6 @@ class LayerAccelerator:
 
         if len(self.residual_history) > max_hist:
             self.residual_history.pop(0)
-
-    # def update(
-    #         self, pop_new: npt.NDArray[np.float64], pop_old: npt.NDArray[np.float64], iteration: int
-    # ) -> npt.NDArray[np.float64]:
-    #     """
-    #     Apply Ng/DIIS acceleration or damping for this layer, dependent on several convergence criteria checks.
-    #
-    #     Parameters
-    #     ----------
-    #     pop_new : ndarray
-    #         Newly solved populations.
-    #     pop_old : ndarray
-    #         Previous iteration populations.
-    #     iteration : int
-    #         Current iteration number (0-indexed).
-    #
-    #     Returns
-    #     -------
-    #         Accelerated/damped populations.
-    #     """
-    #     residual = pop_new - pop_old
-    #     max_change = self._compute_change(pop_new, pop_old)
-    #
-    #     # Store convergence history only.
-    #     if iteration >= len(self.change_history):
-    #         self.change_history.append(max_change)
-    #     else:
-    #         self.change_history[iteration] = max_change
-    #
-    #     # Warmup phase.
-    #     if iteration < self.config.warmup_iterations:
-    #         accepted = pop_new.copy()
-    #
-    #         self._store_iteration(accepted, residual)
-    #         self.last_iteration = iteration
-    #
-    #         return accepted
-    #
-    #     # Always compute damped baseline first.
-    #     pop_damped = self._apply_damping(pop_new, pop_old)
-    #     accepted = pop_damped
-    #
-    #     # Attempt Ng/DIIS.
-    #     if self._should_use_ng(iteration):
-    #         try:
-    #             pop_ng_raw = self._apply_ng(pop_new)
-    #             # Ng damping.
-    #             pop_ng = (
-    #                     self.config.ng_mix * pop_ng_raw
-    #                     + (1.0 - self.config.ng_mix) * pop_damped
-    #             )
-    #             pop_ng /= pop_ng.sum()
-    #
-    #             if self._accept_ng(
-    #                     pop_ng=pop_ng,
-    #                     pop_damped=pop_damped,
-    #                     pop_old=pop_old,
-    #             ):
-    #                 accepted = pop_ng
-    #                 log.info(f"[nL{self.layer_idx}] Accepted Ng acceleration.")
-    #             else:
-    #                 log.debug(f"[nL{self.layer_idx}] Rejected Ng acceleration.")
-    #                 self.ng_disabled_until_iter = iteration + self.config.ng_disable_iterations
-    #
-    #         except RuntimeError as e:
-    #             log.warning(f"[nL{self.layer_idx}] Ng failed: {e}.")
-    #             self.ng_disabled_until_iter = iteration + self.config.ng_disable_iterations
-    #
-    #     # Store ACCEPTED iterate only (default is damped unless Ng meets all criteria).
-    #     accepted_residual = accepted - pop_old
-    #
-    #     self._store_iteration(accepted, accepted_residual)
-    #     self.last_iteration = iteration
-    #
-    #     return accepted
 
     def _should_use_ng(self, iteration: int) -> bool:
 
@@ -376,7 +305,6 @@ class LayerAccelerator:
 
         return pop_ng
 
-
     def register_raw(
             self,
             pop_new: npt.NDArray[np.float64],
@@ -401,10 +329,12 @@ class LayerAccelerator:
         """
         max_change = self._compute_change(pop_new, pop_old)
 
-        if iteration >= len(self.change_history):
-            self.change_history.append(max_change)
-        else:
-            self.change_history[iteration] = max_change
+        self.change_history.append(max_change)
+
+        # if iteration >= len(self.change_history):
+        #     self.change_history.append(max_change)
+        # else:
+        #     self.change_history[iteration] = max_change
 
     def apply(
             self,
@@ -463,9 +393,9 @@ class LayerAccelerator:
 
                 if self._accept_ng(pop_ng=pop_ng, pop_damped=pop_damped, pop_old=pop_old):
                     accepted = pop_ng
-                    log.info(f"[nL{self.layer_idx}] Accepted Ng acceleration.")
+                    log.log(_LOG_VERBOSE_2, f"[nL{self.layer_idx}] Accepted Ng acceleration.")
                 else:
-                    log.debug(f"[nL{self.layer_idx}] Rejected Ng acceleration.")
+                    log.log(_LOG_VERBOSE_2, f"[nL{self.layer_idx}] Rejected Ng acceleration.")
                     self.ng_disabled_until_iter = iteration + self.config.ng_disable_iterations
 
             except RuntimeError as e:
@@ -475,6 +405,12 @@ class LayerAccelerator:
         accepted_residual = accepted - pop_old
         self._store_iteration(accepted, accepted_residual)
         self.last_iteration = iteration
+
+        # Crucial step: if this is not updated, only the raw changes are stored and the convergence checks never see the
+        # actual accepted changes per layer after damping/Ng is applied! So the accepted pops stored might be converged,
+        # but the accelerator would be checking differences in pops that were never accepted.
+        accepted_change = self._compute_change(accepted, pop_old)
+        self.change_history[-1] = accepted_change
 
         return accepted
 
@@ -519,7 +455,8 @@ class LayerAccelerator:
                     self.config.omega_min
                 )
                 if self.omega < old_omega:
-                    log.info(f"[nL{self.layer_idx}] Oscillating - omega={old_omega:.2f}->{self.omega:.2f}")
+                    log.log(_LOG_VERBOSE_2,
+                            f"[nL{self.layer_idx}] Oscillating - omega={old_omega:.2f}->{self.omega:.2f}")
             else:
                 # Monotonic - reduce damping (approach omega=1).
                 omega_max = (
@@ -531,7 +468,10 @@ class LayerAccelerator:
                     old_omega = self.omega
                     self.omega = omega_max
 
-                    log.debug(f"[nL{self.layer_idx}] Reducing omega for Ng: {old_omega:.2f}->{self.omega:.2f}.")
+                    log.info(
+                        _LOG_VERBOSE_2,
+                        f"[nL{self.layer_idx}] Reducing omega for Ng: {old_omega:.2f}->{self.omega:.2f}."
+                    )
                 if self.omega < omega_max:
                     old_omega = self.omega
 
@@ -540,12 +480,16 @@ class LayerAccelerator:
                         omega_max
                     )
                     if self.omega > old_omega:
-                        log.debug(f"[nL{self.layer_idx}] Smooth - omega={old_omega:.2f}->{self.omega:.2f}")
+                        log.log(
+                            _LOG_VERBOSE_2,
+                            f"[nL{self.layer_idx}] Smooth - omega={old_omega:.2f}->{self.omega:.2f}"
+                        )
 
         # Apply cross-species damping floor for this iteration only; does not alter self.omega.
         effective_omega = self.omega
         if omega_floor is not None and omega_floor < effective_omega:
-            log.debug(
+            log.log(
+                _LOG_VERBOSE_2,
                 f"[nL{self.layer_idx}] Cross-species omega floor applied: "
                 f"{effective_omega:.2f}->{omega_floor:.2f}"
             )
@@ -622,10 +566,28 @@ class LayerAccelerator:
         return True
 
     def converged(self) -> bool:
-        """Check if this layer has converged."""
+        """
+        Check if this layer has converged.
+
+        Convergence is obtained if:
+            - The most recent maximum population change is less than the convergence threshold.
+            - The 4 most recent maximum population changes show minimal fluctuations about their mean, with the mean
+             being less than twice the convergence threshold.
+
+        The latter criterion is allowed for cases where populations oscillate between two solutions. This likely occurs
+        due to the coupling between species oscillating population s back and forth in a manner than cannot be damped
+        below the scale of the oscillations, i.e.: the changes in one species trigger changes in another, which revert
+        the first species' changes, and these alterations overshoot a stable minima between them.
+        """
         if len(self.change_history) == 0:
             return False
-        return self.change_history[-1] < self.config.convergence_threshold
+        # return self.change_history[-1] < self.config.convergence_threshold
+        if self.change_history[-1] < self.config.convergence_threshold:
+            return True
+        recent = self.change_history[-4:]
+        tight_changes = max(recent) - min(recent) < 0.1 * np.mean(recent)
+        close_mean_changes = np.mean(recent) < 2.0 * self.config.convergence_threshold
+        return tight_changes and close_mean_changes
 
     def get_max_change(self) -> float:
         """Get current max change for this layer."""
@@ -754,8 +716,9 @@ class MultiSpeciesAccelerator:
             # Once any species is oscillating on this layer, the floor applies to all.
             if is_oscillating:
                 self._oscillating_layers[layer_idx] = True
-                log.debug(
-                    f"[L{layer_idx}] Cross-species oscillation detected from {species}; damping floor applied."
+                log.log(
+                    _LOG_VERBOSE_2,
+                    f"[nL{layer_idx}] Cross-species oscillation detected from {species}; damping floor applied."
                 )
 
     def apply(
@@ -849,115 +812,3 @@ class MultiSpeciesAccelerator:
     def get_max_changes(self, species: str) -> npt.NDArray[np.float64]:
         """Return per-layer maximum changes for a given species."""
         return np.array([la.get_max_change() for la in self.accelerators[species]])
-
-
-# -------------------------------------------------------- OLD --------------------------------------------------------
-
-# class HybridAccelerator:
-#     """
-#     Convergence acceleration/damping manager for separate layers of a given species.
-#     """
-#
-#     __slots__ = ["n_layers", "config", "layer_accelerators"]
-#
-#     def __init__(
-#             self,
-#             n_layers: int,
-#             config: AccelerationConfig = None,
-#     ):
-#         """
-#
-#         Parameters
-#         ----------
-#         n_layers: int
-#             Number of layers to track; should be the number of non-LTE layers for a given species.
-#         config: dict
-#             Acceleration configuration.
-#         """
-#         if config is None:
-#             config = AccelerationConfig()
-#
-#         self.n_layers = n_layers
-#         self.config = config
-#         self.layer_accelerators = [
-#             LayerAccelerator(layer_idx=layer_idx, config=config)
-#             for layer_idx in range(n_layers)
-#         ]
-#
-#     def update(
-#             self,
-#             pop_new: npt.NDArray[np.float64],
-#             pop_old: npt.NDArray[np.float64],
-#             iteration: int,
-#             layer_idx: int,
-#     ) -> npt.NDArray[np.float64]:
-#         """
-#         Apply acceleration for a specific layer. Populations should be normalised to 1 for consistency; scale by partial
-#         normlisation factor outside of this utility.
-#
-#         Parameters
-#         ----------
-#         pop_new: np.ndarray
-#             Populations from new iteration.
-#         pop_old: np.ndarray
-#             Populations from previous iteration.
-#         iteration: int
-#             Current iteration number.
-#         layer_idx: int
-#             Layer index.
-#
-#         Returns
-#         -------
-#             Accelerated/damped populations.
-#         """
-#         return self.layer_accelerators[layer_idx].update(
-#             pop_new=pop_new,
-#             pop_old=pop_old,
-#             iteration=iteration,
-#         )
-#
-#     def converged(self, layer_idx: int = None) -> bool:
-#         """
-#
-#         Parameters
-#         ----------
-#         layer_idx: int
-#             If provided, checks specific layer. If None, checks if all layers have converged.
-#
-#         Returns
-#         -------
-#             True if converged.
-#         """
-#         if layer_idx is not None:
-#             return self.layer_accelerators[layer_idx].converged()
-#         else:
-#             return all(acc.converged() for acc in self.layer_accelerators)
-#
-#     def get_max_change(self, layer_idx: int = None) -> float:
-#         """
-#
-#         Parameters
-#         ----------
-#         layer_idx: int
-#             If provided, get for specific layer. If None, get maximum across all layers.
-#
-#         Returns
-#         -------
-#             Maximum population change.
-#         """
-#         if layer_idx is not None:
-#             return self.layer_accelerators[layer_idx].get_max_change()
-#         else:
-#             return max(
-#                 acc.get_max_change()
-#                 for acc in self.layer_accelerators
-#             )
-#
-#     def get_max_changes(self) -> npt.NDArray[np.float64]:
-#         """
-#
-#         Returns
-#         -------
-#             Array containing the maximum population changes across all layers.
-#         """
-#         return np.array([acc.get_max_change() for acc in self.layer_accelerators])

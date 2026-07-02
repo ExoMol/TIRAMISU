@@ -21,7 +21,8 @@ from scipy.optimize import least_squares
 from .atomic_nuclear_data import get_reduced_mass
 from .chemistry import SpeciesFormula, ChemicalProfile
 from .colchem import CollisionalRatesDatabase, RateTransition
-from .config import output_dir, _LOG_FLOAT_FMT, _LOG_ARRAY_FMT
+from .config import output_dir, _LOG_FLOAT_FMT, _LOG_ARRAY_FMT, _PARQUET_BATCH_SIZE, _LOG_VERBOSE_1, _LOG_VERBOSE_2, \
+    _LOG_VERBOSE_3
 from .numerics import (loglinear_normalise_1d_nonnegative, loglinear_normalise_quantity_2d_nonnegative,
                        loglinear_normalise_quantity_1d_nonnegative, loglinear_integral_quantity_1d,
                        loglinear_integral_quantity_1d_nonnegative, loglinear_integral_quantity_2d_nonnegative,
@@ -1533,7 +1534,8 @@ class NLTEProcessor:
         "species", "states_file", "trans_files", "agg_col_nums", "agg_col_names", "species_mass", "reduced_mass",
         "broadening_params", "cont_states_file", "cont_trans_files", "cont_box_length", "cont_broad_col_num",
         "dissociation_products", "do_super_lines", "cont_do_super_lines", "approximate_t_ex", "debug",
-        "debug_pop_matrix",
+        "debug_pop_matrix", "save_rates_profiles", "rates_pickle", "profile_pickle", "cont_rates_pickle",
+        "cont_profile_pickle",
         # Private:
         "_states", "_n_agg_states", "_agg_states", "_id_agg_cutoff", "_rates_grid", "_profile_store", "_pop_matrix",
         "_mol_chi_matrix", "_mol_eta_matrix", "_cont_states", "_cont_rates", "_cont_profile_store", "_nlte_pop_frac",
@@ -1549,7 +1551,7 @@ class NLTEProcessor:
             agg_col_nums: t.List[int],
             broadening_params: t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]] | None = None,
             cont_states_file: pathlib.Path | None = None,
-            cont_trans_files: pathlib.Path | t.List[pathlib.Path] = None,
+            cont_trans_files: pathlib.Path | t.List[pathlib.Path] | None = None,
             cont_box_length: float | None = None,
             cont_broad_col_num: int | None = None,
             dissociation_products: t.Tuple[str] | None = None,
@@ -1557,7 +1559,12 @@ class NLTEProcessor:
             cont_do_super_lines: bool = True,
             approximate_t_ex: bool = True,
             debug: bool = False,
-            debug_pop_matrix: npt.NDArray[np.float64] = None,
+            debug_pop_matrix: npt.NDArray[np.float64] | None = None,
+            save_rates_profiles: bool = False,
+            rates_pickle: pathlib.Path | None = None,
+            profile_pickle: pathlib.Path | None = None,
+            cont_rates_pickle: pathlib.Path | None = None,
+            cont_profile_pickle: pathlib.Path | None = None,
     ):
         self.species = SpeciesFormula(species)
 
@@ -1633,6 +1640,7 @@ class NLTEProcessor:
         self.approximate_t_ex = approximate_t_ex
         self.debug: bool = debug
         self.debug_pop_matrix: npt.NDArray[np.float64] | None = debug_pop_matrix
+        self.save_rates_profiles = save_rates_profiles
         self._agg_lookup_cache = None
         self._nlte_pop_frac = None
         self._a_ox_vals = None
@@ -1888,7 +1896,7 @@ class NLTEProcessor:
         # self.agg_states = self.agg_states.sort([null_check_col, "energy_agg"], descending=False).with_columns(
         #     pl.int_range(0, self.n_agg_states, dtype=pl.Int64).alias("id_agg")
         # )
-        log.info(f"{self.species} aggregated states =\n {self.agg_states}")
+        log.log(_LOG_VERBOSE_1, f"{self.species} aggregated states =\n {self.agg_states}")
         # self.id_agg_cutoff = self.agg_states.select(
         #     pl.col("id_agg").filter(pl.col("energy_agg") <= energy_cutoff).max()
         # ).item()
@@ -1916,7 +1924,6 @@ class NLTEProcessor:
         # Clean up null check column.
         # self.states = self.states.drop(null_check_col)
         # self.agg_states = self.agg_states.drop(null_check_col)
-        log.debug(f"Working states = {self.states}")
 
         # Vectorised compute for LTE populations.
         g_np = self.states["g"].to_numpy()
@@ -1945,7 +1952,7 @@ class NLTEProcessor:
         self.states = self.states.with_columns(lte_col_exprs)
 
         log_columns = read_col_names + ["id_agg"]
-        log.info(f"[I0] {self.species} States = {self.states.select(log_columns)}")
+        log.log(_LOG_VERBOSE_1, f"{self.species} States = {self.states.select(log_columns)}")
         self._build_agg_state_lookup()
         # Done.
 
@@ -1966,12 +1973,24 @@ class NLTEProcessor:
         assert temperature_profile.shape[0] == pressure_profile.shape[0] == self.n_layers
 
         n_nlte_layers = self.n_layers - self.n_lte_layers
+
+        if self.profile_pickle is not None and self.rates_pickle is not None:
+            self.profile_store = pickle.load(open(self.profile_pickle, "rb"))
+            self.rates_grid = pickle.load(open(self.rates_pickle, "rb"))
+
+            assert type(self.rates_grid) == pl.DataFrame
+            assert self.profile_store.n_layers == n_nlte_layers
+            assert len(self.profile_store.abs_profiles) == n_nlte_layers
+            assert len(self.profile_store.ste_profiles) == n_nlte_layers
+            assert len(self.profile_store.spe_profiles) == n_nlte_layers
+            # Any additional debugging metrics here?
+            return
+
         rates_list = []
         self.profile_store = ProfileStore(n_layers=n_nlte_layers)
 
         trans_columns = ["id_f", "id_i", "A_fi"]
         dask_dtypes = {"id_f": "int32", "id_i": "int32", "A_fi": "float64"}
-        dask_blocksize = "512MB"
 
         # Plain float arrays — no astropy units — passed directly to Numba.
         temperature_slice = temperature_profile[self.n_lte_layers:].to_value(u.K)  # (n_nlte_layers,)
@@ -1984,8 +2003,6 @@ class NLTEProcessor:
             ).alias(f"n_frac_nL{nlte_idx}")
             for nlte_idx in range(n_nlte_layers)
         )
-        # invariant_cols_i = ["id", "energy", "g", "id_agg"] + n_frac_cols
-        # invariant_cols_f = ["id", "energy", "g", "id_agg", "tau"] + n_frac_cols
         invariant_cols = ["id", "energy", "id_agg"]
         states_i = (
             states_frac
@@ -2055,7 +2072,6 @@ class NLTEProcessor:
         band_registry_cols = band_registry.columns
 
         process_time = time.perf_counter()
-        parquet_batch_size = 200_000_000
         # New
         for trans_file in self.trans_files:
             log.info(f"Processing file {trans_file}.")
@@ -2066,13 +2082,12 @@ class NLTEProcessor:
                     states_f=states_f,
                     wn_min=wn_min,
                     wn_max=wn_max,
-                    parquet_batch_size=parquet_batch_size,
-                    dask_blocksize=dask_blocksize,
+                    parquet_batch_size=_PARQUET_BATCH_SIZE,
                     dask_dtypes=dask_dtypes,
                     do_super_lines=self.do_super_lines,
             ):
                 if trans_batch.height == 0:
-                    log.info("No valid trans in batch.")
+                    log.log(_LOG_VERBOSE_1, "No valid trans in batch.")
                     continue
                 # Assign new band indices to any new bands; extend profile buffer if needed.
                 band_registry, profile_buffer, n_bands_used, n_bands_max, band_indices = _update_band_registry(
@@ -2148,24 +2163,24 @@ class NLTEProcessor:
             species=self.species,
         )
         # Done, finalise list of rates chunks.
-        log.info(f"DEBUG: new rates/profiles duration = {time.perf_counter() - process_time:.3f}.")
+        log.log(_LOG_VERBOSE_2, f"{self.species} rates/profiles duration = {time.perf_counter() - process_time:.3f}.")
         # DEBUG!
-        log.info("Doing debug xsecs.")
-        debug_layer_idx = 66 - self.n_lte_layers
-        debug_abs, debug_emi = self.profile_store.build_abs_emi(
-            layer_idx=debug_layer_idx,
-            pop_matrix=self.pop_matrix[-1, debug_layer_idx],
-            wn_grid=wn_grid,
-        )
-        np.save(
-            fr"/mnt/c/PhD/programs/TIRAMISU/tests/outputs/h2o_super_abs.npy",
-            debug_abs
-        )
-        np.save(
-            fr"/mnt/c/PhD/programs/TIRAMISU/tests/outputs/h2o_super_emi.npy",
-            debug_emi
-        )
-        log.info("Debug xsecs done.")
+        # log.debug("Doing debug xsecs.")
+        # debug_layer_idx = 66 - self.n_lte_layers
+        # debug_abs, debug_emi = self.profile_store.build_abs_emi(
+        #     layer_idx=debug_layer_idx,
+        #     pop_matrix=self.pop_matrix[-1, debug_layer_idx],
+        #     wn_grid=wn_grid,
+        # )
+        # np.save(
+        #     fr"/mnt/c/PhD/programs/TIRAMISU/tests/outputs/h2o_super_abs.npy",
+        #     debug_abs
+        # )
+        # np.save(
+        #     fr"/mnt/c/PhD/programs/TIRAMISU/tests/outputs/h2o_super_emi.npy",
+        #     debug_emi
+        # )
+        # log.debug("Debug xsecs done.")
         ################################################################
         self.rates_grid = (
             pl.concat(rates_list)
@@ -2178,7 +2193,15 @@ class NLTEProcessor:
             .sort(["id_agg_i", "id_agg_f"])
         )
         with pl.Config(tbl_rows=1000):
-            log.info(f"[I0] {self.species} Rates = \n{self.rates_grid}")
+            log.log(_LOG_VERBOSE_1, f"{self.species} rates = \n{self.rates_grid}")
+        # Save bands to disk.
+        if self.save_rates_profiles:
+            band_file = f"{self.species}_wn{int(wn_min)}-{int(wn_max)}_G{n_grid}_B{n_bands_used}_L{n_nlte_layers}.profilestore.pickle"
+            with open((output_dir / band_file).resolve(), "wb") as band_pickle:
+                pickle.dump(self.profile_store, band_pickle, protocol=pickle.HIGHEST_PROTOCOL)
+            rates_file = f"{self.species}_wn{int(wn_min)}-{int(wn_max)}_G{n_grid}_B{n_bands_used}_L{n_nlte_layers}.ratesgrid.pickle"
+            with open((output_dir / rates_file).resolve(), "wb") as rates_pickle:
+                pickle.dump(self.profile_store, rates_pickle, protocol=pickle.HIGHEST_PROTOCOL)
 
     def compute_continuum_rates_profiles(
             self,
@@ -2203,7 +2226,18 @@ class NLTEProcessor:
         assert self.cont_states_file is not None
         assert self.cont_box_length is not None
 
-        log.info(f"Loading continuum absorption rates and profiles.")
+        n_nlte_layers = self.n_layers - self.n_lte_layers
+
+        if self.cont_profile_pickle is not None and self.cont_rates_pickle is not None:
+            self._cont_profile_store = pickle.load(open(self.cont_profile_pickle, "rb"))
+            self._cont_rates = pickle.load(open(self.cont_rates_pickle, "rb"))
+
+            assert type(self._cont_rates) == pl.DataFrame
+            assert self._cont_profile_store.n_layers == n_nlte_layers
+            assert len(self._cont_profile_store.abs_profiles) == n_nlte_layers
+            return
+
+        log.log(_LOG_VERBOSE_2, f"[I0] {self.species} loading continuum absorption rates and profiles.")
 
         read_col_map = {num: "v" if num == self.cont_broad_col_num else name for num, name in
                         zip(self.agg_col_nums, self.agg_col_names)}
@@ -2254,13 +2288,11 @@ class NLTEProcessor:
                 (pl.col(f"n_L{layer_idx}") / pl.col(f"n_agg_L{layer_idx}")).alias(f"n_frac_nL{nlte_layer_idx}")
             )
 
-        n_nlte_layers = self.n_layers - self.n_lte_layers
         cont_rates_list = []
         self._cont_profile_store = ContinuumProfileStore(n_layers=n_nlte_layers)
 
         trans_columns = ["id_f", "id_i", "A_fi"]
         dask_dtypes = {"id_f": "int64", "id_i": "int64", "A_fi": "float64"}
-        dask_blocksize = "512MB"
 
         # Plain float arrays — no astropy units — passed directly to Numba.
         temperature_slice = temperature_profile[self.n_lte_layers:].to_value(u.K)  # (n_nlte_layers,)
@@ -2333,7 +2365,6 @@ class NLTEProcessor:
         band_registry_cols = band_registry.columns
 
         process_time = time.perf_counter()
-        parquet_batch_size = 200_000_000
 
         for cont_trans_file in self.cont_trans_files:
             log.info(f"Processing file {cont_trans_file}.")
@@ -2344,13 +2375,12 @@ class NLTEProcessor:
                     states_f=states_f,
                     wn_min=wn_min,
                     wn_max=wn_max,
-                    parquet_batch_size=parquet_batch_size,
-                    dask_blocksize=dask_blocksize,
+                    parquet_batch_size=_PARQUET_BATCH_SIZE,
                     dask_dtypes=dask_dtypes,
                     do_super_lines=self.cont_do_super_lines,
             ):
                 if trans_batch.height == 0:
-                    log.info("No valid trans in batch.")
+                    log.log(_LOG_VERBOSE_1, "No valid trans in batch.")
                     continue
                 # Assign new band indices to any new bands; extend profile buffer if needed.
                 band_registry, profile_buffer, n_bands_used, n_bands_max, band_indices = _update_band_registry(
@@ -2424,7 +2454,8 @@ class NLTEProcessor:
             save=False,
             species=self.species,
         )
-        log.info(f"DEBUG: new cont. rates/profiles duration = {time.perf_counter() - process_time:.3f}.")
+        log.log(_LOG_VERBOSE_2,
+                f"{self.species} cont. rates/profiles duration = {time.perf_counter() - process_time:.3f}.")
 
         if len(cont_rates_list) > 0:
             self._cont_rates = pl.concat(cont_rates_list)
@@ -2434,10 +2465,10 @@ class NLTEProcessor:
                 pl.col("B_if").sum().alias("B_if"),
             ])
             with pl.Config(tbl_rows=1000):
-                log.info(f"[I0] {self.species} Continuum rates = \n{self._cont_rates}")
+                log.log(_LOG_VERBOSE_1, f"{self.species} continuum rates = \n{self._cont_rates}")
         else:
             self._cont_rates = None
-            log.info(f"[I0] {self.species} No continuum rates computed on spectral grid.")
+            log.log(_LOG_VERBOSE_1, f"{self.species} No continuum rates computed on spectral grid.")
         # Done.
 
     def _build_a_ox_vals_cache(self) -> None:
@@ -2673,7 +2704,10 @@ class NLTEProcessor:
         energy_dif_wmean_global = (mol_chi_norm @ wn_grid) / mol_chi_norm.sum(axis=1)
         n_ratio_old = (c_if_approx + v_if_rate) / (c_fi_approx + a_fi_approx + v_fi_rate)
         t_ex_profile_old = (ac_h_c_on_kB * energy_dif_wmean_global / np.log(1 / n_ratio_old)).to(u.K)
-        log.info(f"T_ex profile global fit = {np.array2string(t_ex_profile_old, formatter=_LOG_ARRAY_FMT)}")
+        log.log(
+            _LOG_VERBOSE_3,
+            f"{self.species} T_ex profile global fit = {np.array2string(t_ex_profile_old, formatter=_LOG_ARRAY_FMT)}"
+        )
         # Get pairs of valid band keys: choosing adjacent IDs do not always exist, i.e.: in species with distinct
         # isomers whose states are close in energy.
         agg_energies = self.agg_states.sort("id_agg")["energy_agg"].to_numpy()
@@ -2682,9 +2716,9 @@ class NLTEProcessor:
         id_pairs = self.profile_store.get_sorted_band_keys(
             num_max=num_pairs, id_cutoff=self.id_agg_cutoff, agg_energies=agg_energies,
         )
-        log.info(f"Num pairs = {num_pairs}, {len(id_pairs)} returned.")
+        log.log(_LOG_VERBOSE_3, f"{self.species} num pairs = {num_pairs}, {len(id_pairs)} returned.")
         t_ex_profiles = np.zeros((len(id_pairs), n_layers), dtype=np.float64) << u.K
-        log.info(f"ID pairs for T_ex = {id_pairs}")
+        log.log(_LOG_VERBOSE_3, f"{self.species} ID pairs for T_ex = {id_pairs}")
         for pair_idx, (id_agg_f, id_agg_i) in enumerate(id_pairs):
             id_filter = (pl.col("id_agg_f") == id_agg_f) & (pl.col("id_agg_i") == id_agg_i)
             a_fi = self.rates_grid.select(
@@ -2758,13 +2792,14 @@ class NLTEProcessor:
                 log.warning(f"{self.species} T_ex for ({id_agg_f}-{id_agg_i}) band contains negatives!")
             t_ex_profile = np.where(np.isnan(t_ex_profile), temperature_profile, t_ex_profile)
             t_ex_profile = np.clip(abs(t_ex_profile), a_min=0.0 * u.K, a_max=temperature_profile * 3.0)  # Failsafe
-            log.info(f"DEBUG: {id_agg_f}-{id_agg_i} T_ex = {np.array2string(t_ex_profile, formatter=_LOG_ARRAY_FMT)}")
-            # log.info(f"DEBUG: {id_agg_f}-{id_agg_i}: C_if = {c_if}, C_fi = {c_fi}, V_if = {v_if}, V_fi = {v_fi},"
-            #          f" A_fi = {a_fi}.")
+            log.log(
+                _LOG_VERBOSE_2,
+                f"{id_agg_f}-{id_agg_i} T_ex = {np.array2string(t_ex_profile, formatter=_LOG_ARRAY_FMT)}"
+            )
             t_ex_profiles[pair_idx] = t_ex_profile
         # t_ex_profiles = np.stack(t_ex_profiles)
         t_ex_profile = t_ex_profiles.mean(axis=0)
-        log.info(f"T_ex = {t_ex_profile}")
+        log.log(_LOG_VERBOSE_1, f"{self.species} T_ex = {t_ex_profile}")
 
         g_np = self.states["g"].to_numpy()
         energy_np = self.states["energy"].to_numpy() << 1 / u.cm
@@ -2831,12 +2866,12 @@ class NLTEProcessor:
         # TODO: This is broken when there are null states in the grouping!
         # self._nlte_pop_frac[nlte_layer_slice] = n_scaled[:, cutoff_mask].sum(axis=1)
         self._nlte_pop_frac[nlte_layer_slice] = n_agg_final[:, :self.id_agg_cutoff + 1].sum(axis=1)
-        log.info(f"NLTE pop frac = {self._nlte_pop_frac}.")
+        log.log(_LOG_VERBOSE_2, f"{self.species} NLTE pop frac = {self._nlte_pop_frac}.")
 
         t_ex_pop_grid = np.zeros((1, self.pop_matrix.shape[1], self.pop_matrix.shape[2]))
         t_ex_pop_grid[0, :self.n_lte_layers] = self.pop_matrix[0, :self.n_lte_layers]
         t_ex_pop_grid[0, nlte_layer_slice] = n_agg_final
-        log.info(f"new pop grid sums = {t_ex_pop_grid[0].sum(axis=1)}")
+        log.log(_LOG_VERBOSE_2, f"{self.species} new pop grid sums = {t_ex_pop_grid[0].sum(axis=1)}")
 
         nlte_col_exprs = []
         for idx, layer_idx in enumerate(nlte_layers):
@@ -2942,7 +2977,7 @@ class NLTEProcessor:
                 a_fi = trans_row[2] * einstein_a_unit
                 b_fi = trans_row[3] * einstein_b_unit
                 b_if = trans_row[4] * einstein_b_unit
-                log.info(f"[L{layer_idx}] Trans: {trans_row}.")
+                log.debug(f"[L{layer_idx}] Trans: {trans_row}.")
 
                 # These are pop-normalised within the band, but redundant due to normalisation.
                 abs_profile, abs_start_idx = self.profile_store.get_profile(
@@ -3032,20 +3067,20 @@ class NLTEProcessor:
                 # log.info(f"DEBUG: ste/abs start/end idxs = {ste_start_idx, ste_end_idx, abs_start_idx, abs_end_idx}.")
                 ##############################
 
-                log.info(f"[L{layer_idx}] U_{trans_row[0], trans_row[1]} = {u_fi}")
+                log.debug(f"[L{layer_idx}] U_{trans_row[0], trans_row[1]} = {u_fi}")
                 v_fi_prec = loglinear_integral_quantity_1d(
                     y_data=ste_profile_norm * i_prec[ste_start_idx: ste_end_idx],
                     dx=wn_dx[ste_start_idx: ste_end_idx - 1]
                 ) * b_fi
                 v_fi_prec = v_fi_prec.decompose()
-                log.info(f"[L{layer_idx}] V_{trans_row[0], trans_row[1]}_prec = {v_fi_prec:{_LOG_FLOAT_FMT}}")
+                log.debug(f"[L{layer_idx}] V_{trans_row[0], trans_row[1]}_prec = {v_fi_prec:{_LOG_FLOAT_FMT}}")
 
                 v_if_prec = loglinear_integral_quantity_1d(
                     y_data=abs_profile_norm * i_prec[abs_start_idx: abs_end_idx],
                     dx=wn_dx[abs_start_idx: abs_end_idx - 1]
                 ) * b_if
                 v_if_prec = v_if_prec.decompose()
-                log.info(f"[L{layer_idx}] V_{trans_row[1], trans_row[0]}_prec = {v_if_prec:{_LOG_FLOAT_FMT}}")
+                log.debug(f"[L{layer_idx}] V_{trans_row[1], trans_row[0]}_prec = {v_if_prec:{_LOG_FLOAT_FMT}}")
 
                 self.y_matrix[trans_row[0], trans_row[1]] += v_if_prec
                 self.y_matrix[trans_row[1], trans_row[0]] += u_fi + v_fi_prec
@@ -3053,8 +3088,8 @@ class NLTEProcessor:
                 self.y_matrix[trans_row[1], trans_row[1]] -= v_if_prec
 
             if self._cont_rates is not None:
-                # log.info(f"Cont rates = {self.cont_rates}")
-                # log.info((
+                # log.debug(f"Cont rates = {self.cont_rates}")
+                # log.debug((
                 #     f"Cont profile store keys = "
                 #     f"{self.cont_profile_store.get_keys(layer_idx=nlte_layer_idx, profile_type="abs")}"
                 # ))
@@ -3068,7 +3103,7 @@ class NLTEProcessor:
                     # b_ci = cont_trans_row[2] * einstein_b_unit
                     b_ic = cont_trans_row[3] * einstein_b_unit
 
-                    log.info(f"{self.species}: Cont. profile for state {cont_trans_row[0]}.")
+                    log.debug(f"{self.species}: Cont. profile for state {cont_trans_row[0]}.")
                     cont_abs_profile, cont_abs_start_idx = self._cont_profile_store.get_profile(
                         layer_idx=nlte_layer_idx, key=cont_trans_row[0], profile_type="abs"
                     )
@@ -3093,7 +3128,7 @@ class NLTEProcessor:
                             y_data=psi_approx_cross_ic, dx=wn_dx
                         )
 
-                        # log.info(f"[L{layer_idx}] chi_psi_{cont_trans_row[0]}c = {psi_integrals}")
+                        # log.debug(f"[L{layer_idx}] chi_psi_{cont_trans_row[0]}c = {psi_integrals}")
                         nonzero_integral_mask = psi_integrals.value != 0
 
                         # This may be the wrong way round as [0] is i; confirm against numba kernel.
@@ -3104,7 +3139,7 @@ class NLTEProcessor:
                         dx=wn_dx[cont_abs_start_idx: cont_abs_end_idx - 1]
                     ) * b_ic
                     v_ic_prec = v_ic_prec.decompose()
-                    log.info(f"[L{layer_idx}] V_{cont_trans_row[0]}c_prec = {v_ic_prec:{_LOG_FLOAT_FMT}}")
+                    log.debug(f"[L{layer_idx}] V_{cont_trans_row[0]}c_prec = {v_ic_prec:{_LOG_FLOAT_FMT}}")
 
                     limiting_species_num_dens = min(
                         (
@@ -3230,7 +3265,8 @@ class NLTEProcessor:
                 )
         # Add collisional and chemical rates.
         self.add_col_chem_rates(layer_idx=layer_idx)
-        log.info(
+        log.log(
+            _LOG_VERBOSE_2,
             f"[L{layer_idx}] {self.species} Y matrix construction duration = {time.perf_counter() - rates_start:.5f}"
         )
 
@@ -3259,12 +3295,15 @@ class NLTEProcessor:
     ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
         self.y_reduced_idx_map = np.where(np.abs(self.y_matrix).sum(axis=1) != 0)[0]
         y_matrix_reduced = self.y_matrix[np.ix_(self.y_reduced_idx_map, self.y_reduced_idx_map)]
-        log.info((
-            f"[L{layer_idx}] {self.species} Y matrix (before row-normalisation) =\n"
-            f"{np.array2string(y_matrix_reduced, formatter=_LOG_ARRAY_FMT)}"
-            f"[L{layer_idx}] {self.species} Y matrix cond. (before row-normalisation) ="
-            f" {np.linalg.cond(y_matrix_reduced)}"
-        ))
+        log.log(
+            _LOG_VERBOSE_2,
+            (
+                f"[L{layer_idx}] {self.species} Y matrix (before row-normalisation) =\n"
+                f"{np.array2string(y_matrix_reduced.value, formatter=_LOG_ARRAY_FMT)}\n"
+                f"[L{layer_idx}] {self.species} Y matrix cond. (before row-normalisation) ="
+                f" {np.linalg.cond(y_matrix_reduced.value):{_LOG_FLOAT_FMT}}"
+            )
+        )
         norm_factors = abs(y_matrix_reduced).sum(axis=1)[:, None]
         y_matrix_reduced /= norm_factors
         check_rows = np.array([
@@ -3281,7 +3320,7 @@ class NLTEProcessor:
         rhs_rect = self.rhs_matrix[self.y_reduced_idx_map] / norm_factors[:, 0]
         rhs_rect = np.append(rhs_rect, 1)
 
-        log.info(f"DEBUG: {self.species} Y matrix =\n{np.array2string(y_rect, precision=3)}")
+        log.log(_LOG_VERBOSE_2, f"{self.species} Y matrix =\n{np.array2string(y_rect, precision=3)}")
         nppinv_pops = np.linalg.pinv(y_rect) @ rhs_rect
         nppinv_pops /= nppinv_pops.sum()
 
@@ -3302,10 +3341,13 @@ class NLTEProcessor:
             )
             least_squares_pops = lsq_res.x
             least_squares_pops /= least_squares_pops.sum()
-            log.debug((
-                f"[L{layer_idx}] Least Squares res = {lsq_res}\n"
-                f"Least Squares Pops. = {np.array2string(least_squares_pops, formatter=_LOG_ARRAY_FMT)}"
-            ))
+            log.log(
+                _LOG_VERBOSE_2,
+                (
+                    f"[L{layer_idx}] Least Squares res = {lsq_res}\n"
+                    f"Least Squares Pops. = {np.array2string(least_squares_pops, formatter=_LOG_ARRAY_FMT)}"
+                )
+            )
             if any(least_squares_pops < 0):
                 raise RuntimeError(
                     f"[L{layer_idx}] Least squares population bounds failed; negative pops."
@@ -3315,7 +3357,10 @@ class NLTEProcessor:
         else:
             pop_matrix = nppinv_pops
 
-        pop_old = self.pop_matrix[-1, layer_idx, self.y_reduced_idx_map]
+        pop_old = self.pop_matrix[-1, layer_idx, self.y_reduced_idx_map].copy()
+        # Important: If there are states above the cutoff (i.e.: self._nlte_pop_frac < 1) then these will be on a
+        # different scale if not normalised.
+        pop_old /= pop_old.sum()
 
         return pop_matrix, pop_old
 
@@ -3326,20 +3371,21 @@ class NLTEProcessor:
     ):
         # Normalise to required NLTE population fraction.
         pop_scaled = self._nlte_pop_frac[layer_idx] * pop_updated / pop_updated.sum()
-        # log.info(f"[L{layer_idx}] DEBUG: Pops. sum = {pop_matrix.sum()} (should be {self._nlte_pop_frac[layer_idx]})")
 
-        log.info(f"[L{layer_idx}] {self.species} New pops.:")
+        log.log(_LOG_VERBOSE_2, f"[L{layer_idx}] {self.species} New pops.:")
         for idx, y_idx in enumerate(self.y_reduced_idx_map):
-            log.info((
-                f"[L{layer_idx}]"
-                f" n{self.agg_states.filter(pl.col("id_agg") == y_idx).select(self.agg_col_names).row(0)}"
-                f" = {pop_scaled[idx]:{_LOG_FLOAT_FMT}}"
-            ))
+            log.log(
+                _LOG_VERBOSE_2,
+                (
+                    f"[L{layer_idx}]"
+                    f" n{self.agg_states.filter(pl.col("id_agg") == y_idx).select(self.agg_col_names).row(0)}"
+                    f" = {pop_scaled[idx]:{_LOG_FLOAT_FMT}}"
+                )
+            )
         # Store all updated pops, any zeros that were excldued from the Y-matrix calculation and pops above cutoff.
         pop_updated_full = np.zeros(self.n_agg_states)
         pop_updated_full[self.y_reduced_idx_map] = pop_scaled
         pop_updated_full[self.id_agg_cutoff + 1:] = self.pop_matrix[-1, layer_idx, self.id_agg_cutoff + 1:]  # TEST!
-        # log.info(f"[L{layer_idx}] DEBUG: full_pops sum = {full_pops.sum()}")
 
         n_agg_lte_col = f"n_agg_L{layer_idx}"
         n_lte_col = f"n_L{layer_idx}"
@@ -3363,11 +3409,14 @@ class NLTEProcessor:
             .alias(n_nlte_col)
         )
         log_col_names = ["id", "energy", "g", "tau", n_lte_col, n_agg_lte_col, n_agg_nlte_col, n_nlte_col]
-        log.info((
-            f"[L{layer_idx}] {self.species} NLTE States = \n{self.states.select(log_col_names)}\n"
-            f"[L{layer_idx}] Sum of LTE populations = {self.states[n_lte_col].sum()}.\n"
-            f"[L{layer_idx}] Sum of non-LTE populations = {self.states[n_nlte_col].sum()}."
-        ))
+        log.log(
+            _LOG_VERBOSE_2,
+            (
+                f"[L{layer_idx}] {self.species} NLTE States = \n{self.states.select(log_col_names)}\n"
+                f"[L{layer_idx}] Sum of LTE populations = {self.states[n_lte_col].sum()}.\n"
+                f"[L{layer_idx}] Sum of non-LTE populations = {self.states[n_nlte_col].sum()}."
+            )
+        )
         return pop_updated_full
 
     def update_layer_global_chi_eta(
@@ -3388,7 +3437,7 @@ class NLTEProcessor:
         abs_xsec, emi_xsec = self.profile_store.build_abs_emi(
             layer_idx=nlte_layer_idx, pop_matrix=layer_pop_grid, wn_grid=wn_grid.value,
         )
-        log.info(f"[L{layer_idx}] {self.species} CBP duration = {time.perf_counter() - start_time:.5f}")
+        log.log(_LOG_VERBOSE_2, f"[L{layer_idx}] {self.species} CBP duration = {time.perf_counter() - start_time:.5f}")
 
         if np.any(abs_xsec < 0):
             log.warning(
@@ -3400,16 +3449,6 @@ class NLTEProcessor:
                 layer_idx=nlte_layer_idx, pop_matrix=layer_pop_grid, wn_grid=wn_grid.value,
             )
             abs_xsec += cont_abs_xsec
-
-            # for key in self._cont_profile_store.get_keys(layer_idx=nlte_layer_idx, profile_type="abs"):
-            #     # Key for continuum profiles is [-1, lower_id] to match bound-bound tuple signature.
-            #     n_i = layer_pop_grid[key[1]]
-            #     # log.info(f"{self.species} Cont. profile for band {key} with pop {n_i}.")
-            #     cont_abs_profile, cont_abs_start_idx = self._cont_profile_store.get_profile(
-            #         layer_idx=nlte_layer_idx, key=key, profile_type="abs",
-            #     )
-            #     cont_abs_end_idx = cont_abs_start_idx + len(cont_abs_profile)
-            #     abs_xsec[cont_abs_start_idx: cont_abs_end_idx] += cont_abs_profile * n_i
 
         # Update layer chi globally and then for species.
         abs_xsec = abs_xsec << u.cm ** 2
@@ -3491,7 +3530,9 @@ class NLTEProcessor:
                 temperature_profile=temperature_profile,
                 wn_grid=wn_grid.value,
                 species_mass=self.species_mass,
-                cont_box_length=self.cont_box_length
+                reduced_mass=self.reduced_mass,
+                cont_box_length=self.cont_box_length,
+                do_super_lines=self.cont_do_super_lines,
             )
             abs_xsec += cont_xsec
         abs_xsec = abs_xsec << u.cm ** 2

@@ -20,7 +20,7 @@ from .nlte import (
     formal_solve_general,
     NLTEProcessor,
 )
-from .config import _LOG_FLOAT_FMT, _LOG_ARRAY_FMT
+from .config import _LOG_FLOAT_FMT, _LOG_ARRAY_FMT, _LOG_VERBOSE_2
 from .numerics import loglinear_integral_1d
 
 log = logging.getLogger(__name__)
@@ -409,6 +409,11 @@ class ExomolNLTEXsec(ExomolHDF5Xsec):
             approximate_t_ex: bool = True,
             debug: bool = False,
             debug_pop_matrix: npt.NDArray[np.float64] = None,
+            save_rates_profiles: bool = False,
+            rates_pickle: pathlib.Path | None = None,
+            profile_pickle: pathlib.Path | None = None,
+            cont_rates_pickle: pathlib.Path | None = None,
+            cont_profile_pickle: pathlib.Path | None = None,
     ) -> None:
         self.species = SpeciesFormula(species)
         self.load_in_memory = load_in_memory
@@ -430,6 +435,11 @@ class ExomolNLTEXsec(ExomolHDF5Xsec):
             approximate_t_ex=approximate_t_ex,
             debug=debug,
             debug_pop_matrix=debug_pop_matrix,
+            save_rates_profiles=save_rates_profiles,
+            rates_pickle=rates_pickle,
+            profile_pickle=profile_pickle,
+            cont_rates_pickle=cont_rates_pickle,
+            cont_profile_pickle=cont_profile_pickle,
         )
 
     def get_nlte_processor(self) -> NLTEProcessor:
@@ -880,7 +890,10 @@ class XSecCollection(dict):
                 tau_mu_matrix=effective_tau_mu,
                 source_function_matrix=effective_source_func_matrix,
             )
-            log.info(f"Coefficient duration = {time.perf_counter() - start_time:.3f}")
+            log.log(
+                _LOG_VERBOSE_2,
+                f"Gauss-Seidel/Bezier coefficient duration = {time.perf_counter() - start_time:.3f}"
+            )
 
             # USEFUL BEZIER IDENTITIES
             alpha_plus_gamma = bezier_coefs[:, 1] + bezier_coefs[:, 3]
@@ -1067,7 +1080,10 @@ class XSecCollection(dict):
                         alpha_plus_gamma[layer_idx + 1] = bezier_coefs[layer_idx + 1, 1] + bezier_coefs[
                             layer_idx + 1, 3]
 
-                    log.info(f"[L{layer_idx}] Coefficient update duration = {time.perf_counter() - start_time:.3f}")
+                    log.log(
+                        _LOG_VERBOSE_2,
+                        f"[L{layer_idx}] Coefficient update duration = {time.perf_counter() - start_time:.3f}"
+                    )
 
                     if layer_idx > 0:
                         i_out_matrix[layer_idx] = (
