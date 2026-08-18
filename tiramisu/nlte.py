@@ -22,7 +22,7 @@ from .atomic_nuclear_data import get_reduced_mass
 from .chemistry import SpeciesFormula, ChemicalProfile
 from .colchem import CollisionalRatesDatabase, RateTransition
 from .config import output_dir, _LOG_FLOAT_FMT, _LOG_ARRAY_FMT, _PARQUET_BATCH_SIZE, _LOG_VERBOSE_1, _LOG_VERBOSE_2, \
-    _LOG_VERBOSE_3
+    _LOG_VERBOSE_3, _VMR_THRESHOLD
 from .numerics import (loglinear_normalise_1d_nonnegative, loglinear_normalise_quantity_2d_nonnegative,
                        loglinear_normalise_quantity_1d_nonnegative, loglinear_integral_quantity_1d,
                        loglinear_integral_quantity_1d_nonnegative, loglinear_integral_quantity_2d_nonnegative,
@@ -53,7 +53,7 @@ const_2_hc = ac_2_hc.value
 const_2_h_on_c_sq = ac_2_h_on_c_sq.value
 const_h_on_kB = ac_h_on_kB.value
 const_2_pi_h_c_sq_on_sigma_sba = (
-    (2 * np.pi * ac.h * ac.c.cgs ** 2 / ac.sigma_sb).to(u.K ** 4 * u.cm ** 4, equivalencies=u.spectral()).value
+    (2 * np.pi * ac.h * ac.c.cgs ** 2 / ac.sigma_sb).to_value(u.K ** 4 * u.cm ** 4, equivalencies=u.spectral())
 )
 const_2_pi_c_kB = (2 * np.pi * ac.c.cgs * ac.k_B.cgs).value
 
@@ -510,18 +510,89 @@ def _build_y_matrix_cont(
 
 # -------------------------------------------- Bezier Coefficients & Setup --------------------------------------------
 
+@numba.njit(parallel=True, cache=True, error_model="numpy")
+def _effective_chi_source_dtau_core(
+        global_chi: npt.NDArray[np.float64],
+        global_source_func: npt.NDArray[np.float64],
+        global_eta: npt.NDArray[np.float64],
+        density: npt.NDArray[np.float64],
+        dz: npt.NDArray[np.float64],
+        c_cgs: float,
+        eta_to_source_func_scale: float,
+) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """
+    Fused, allocation-light core for :func:`effective_source_tau_mu`.
+
+    Numpy's version of this (row max, boolean masks for negative entries, ``exp``, masked division) allocates
+    several full ``(n_layers, n_grid)`` temporaries (the ``.copy()``, the ``nonzero`` index arrays, two boolean
+    masks) on every call; this does the same row-local derivation in one pass per layer with no intermediates,
+    which matters here since it's called once per NLTE layer per iteration on the same full-size arrays.
+
+    All arguments are plain arrays/floats in a consistent cgs-like unit system (chi in cm^2, eta in
+    erg*cm/(s*sr), density in 1/cm^3, dz in cm) - unit handling/conversion happens once in the
+    :func:`effective_source_tau_mu` wrapper, not per element here.
+
+    Returns
+    -------
+    effective_chi, effective_source_func, dtau : ndarray, shape (n_layers, n_grid)
+        Shielded (always non-negative) effective opacity, the correspondingly corrected source function, and the
+        per-layer optical depth increment computed from ``effective_chi``.
+    """
+    n_layers, n_grid = global_chi.shape
+    effective_chi = np.empty((n_layers, n_grid), dtype=np.float64)
+    effective_source_func = np.empty((n_layers, n_grid), dtype=np.float64)
+    dtau = np.empty((n_layers, n_grid), dtype=np.float64)
+
+    # Maser shielding factor: a negative (masing) chi is replaced by zeta * abs(chi) - a fixed fraction of that
+    # element's own magnitude, not the row max/min. This is the standard treatment used in published coupled
+    # SE+ALI maser codes (e.g. Nesterenok 2016, MNRAS 455, 3978, CH3OH masers). Unlike the row-relative
+    # min/max-based remaps tried earlier (which made stronger masing map to a *smaller* effective_chi, so it
+    # could collapse toward 0 and blow up anything dividing by it - e.g. psi_approx_eta/V-matrix terms in
+    # build_y_matrix), this keeps effective_chi directly proportional to abs(chi), so it can never collapse
+    # regardless of how extreme or how deep the accumulated masing is. It does not try to preserve the relative
+    # shape of the masing profile - saturation (the real physical mechanism bounding maser gain) is left to the
+    # statistical equilibrium equations, not to this shielding.
+    zeta = 0.1
+
+    for i in numba.prange(n_layers):
+        for j in range(n_grid):
+            chi_val = global_chi[i, j]
+            if chi_val < 0.0:
+                chi_val = zeta * abs(chi_val)
+            effective_chi[i, j] = chi_val
+
+            sf_val = global_source_func[i, j]
+            if sf_val < 0.0:
+                if chi_val == 0.0:
+                    sf_val = 0.0
+                else:
+                    sf_val = global_eta[i, j] / (c_cgs * chi_val) * eta_to_source_func_scale
+            effective_source_func[i, j] = sf_val
+
+            dtau[i, j] = chi_val * density[i] * dz[i]
+
+    return effective_chi, effective_source_func, dtau
+
+
 def effective_source_tau_mu(
         global_source_func_matrix: u.Quantity,
         global_chi_matrix: u.Quantity,
         global_eta_matrix: u.Quantity,
         density_profile: u.Quantity,
         dz_profile: u.Quantity,
-        mu_values: npt.NDArray[np.float64],
-        negative_absorption_factor: float = 0.1,
-) -> t.Tuple[u.Quantity, npt.NDArray[np.float64]]:
+) -> t.Tuple[u.Quantity, npt.NDArray[np.float64], u.Quantity]:
     """
     Compute an effective Source function and optical depth, tau, for use in calculation of Bezier interpolants. These
     are computed based on an effective opacity calculated using Eq. (39) from https://doi.org/10.48550/arXiv.2508.12873.
+
+    Negative (masing/population-inversion) entries in ``global_chi_matrix`` are shielded by mapping ``chi`` to
+    ``zeta * abs(chi)`` (``zeta = 0.1``), the standard treatment used in published coupled statistical-equilibrium
+    + ALI maser codes (e.g. Nesterenok 2016, MNRAS 455, 3978). This keeps the shielded value directly proportional
+    to the element's own magnitude - never collapsing toward zero regardless of how extreme the masing - unlike
+    row-relative min/max-based remaps tried earlier, which made stronger masing map to a *smaller* effective_chi
+    and could blow up anything dividing by it (e.g. :func:`NLTEProcessor.build_y_matrix`'s Lambda*-operator
+    terms). It does not attempt to preserve the shape of the negative-opacity distribution; saturation (the real
+    physical mechanism bounding maser gain) is left to the statistical equilibrium equations, not this shielding.
 
     Parameters
     ----------
@@ -530,59 +601,72 @@ def effective_source_tau_mu(
     global_eta_matrix
     density_profile
     dz_profile
-    mu_values
-    negative_absorption_factor : float
-        Factor used to calculate the positive upper bound on the effective opacity to use in cases where the opacity is
-        negative.
 
     Returns
     -------
+    effective_source_func_matrix : Quantity
+    tau : ndarray, shape (n_layers, n_grid)
+        Optical depth with no angle axis. This used to be broadcast over mu here (``tau_mu``,
+        ``(n_layers, n_angles, n_grid)``) before being returned, materialising an array ~50x larger than ``tau``
+        itself for no reason: :func:`bezier_coefficients`/:func:`update_layer_coefficients` (the only consumers)
+        only ever use ``tau_mu[i, j, k]`` as ``tau[i, k] / mu_values[j]`` at a point they're already visiting in a
+        loop, so the division now happens there instead of via a standalone broadcast. Callers must pass
+        ``mu_values`` to those functions directly.
+    effective_chi : Quantity, shape (n_layers, n_grid)
+        The shielded (always non-negative) effective opacity used to compute ``tau``. Callers should reuse this -
+        rather than re-deriving something from the raw ``global_chi_matrix`` - anywhere else in the iteration that
+        needs a numerically safe stand-in for opacity near masing (population-inversion, negative-opacity) regions,
+        e.g. :func:`NLTEProcessor.build_y_matrix`'s Lambda*-operator terms.
     """
-    # Set effective Chi.
-    chi_prime: u.Quantity = negative_absorption_factor * np.max(global_chi_matrix, axis=1)
+    chi_unit = u.cm ** 2
+    eta_unit = u.erg * u.cm / (u.s * u.sr)
 
-    effective_chi = global_chi_matrix.copy()
-    row_mask, col_mask = np.nonzero(global_chi_matrix < 0)
-    effective_chi[row_mask, col_mask] = chi_prime[row_mask] * np.exp(
-        -np.abs(global_chi_matrix[row_mask, col_mask].value)
-    )
-
-    effective_source_func_matrix = global_source_func_matrix.copy()
-    neg_mask = effective_source_func_matrix < 0
-    # Update negative source functions.
-    # Zero entries where effective_chi is 0 - avoid division by 0.
-    zero_chi_mask = neg_mask & (effective_chi == 0)
-    effective_source_func_matrix[zero_chi_mask] = 0 * global_source_func_matrix.unit
-    # Set entries with non-zero effective_chi.
-    pos_chi_mask = neg_mask & ~zero_chi_mask
-    effective_source_func_matrix[pos_chi_mask] = (
-            global_eta_matrix[pos_chi_mask] / (ac.c.cgs * effective_chi[pos_chi_mask])
+    c_cgs = ac.c.cgs.value
+    # Unit.to() (unlike Quantity.to()) already returns the bare conversion factor, not a Quantity.
+    eta_to_source_func_scale = (
+            eta_unit / (u.cm / u.s * chi_unit)
     ).to(global_source_func_matrix.unit, equivalencies=u.spectral())
 
-    # Compute optical depths using effective chi.
-    res = effective_chi * density_profile[:, None] * dz_profile[:, None]
-    dtau = res.decompose().value
+    effective_chi_val, effective_source_func_val, dtau = _effective_chi_source_dtau_core(
+        global_chi=global_chi_matrix.to_value(chi_unit),
+        global_source_func=global_source_func_matrix.value,
+        global_eta=global_eta_matrix.to_value(eta_unit),
+        density=density_profile.to_value(1 / u.cm ** 3),
+        dz=dz_profile.to_value(u.cm),
+        c_cgs=c_cgs,
+        eta_to_source_func_scale=eta_to_source_func_scale,
+    )
+
+    effective_chi = effective_chi_val << chi_unit
+    effective_source_func_matrix = effective_source_func_val << global_source_func_matrix.unit
+
     tau = dtau[::-1].cumsum(axis=0)[::-1]
-    tau_mu = tau[:, None, :] / mu_values[None, :, None]
-    return effective_source_func_matrix, tau_mu
+    return effective_source_func_matrix, tau, effective_chi
 
 
 @numba.njit(parallel=True, cache=True, error_model="numpy")
 def _compute_coefficients_core(
         delta_tau: npt.NDArray[np.float64],
+        mu_values: npt.NDArray[np.float64],
         coefficients: npt.NDArray[np.float64]
 ) -> None:
     """
     Compute alpha, beta, gamma coefficients and store exp(-delta_tau) in coefficients[:, 0].
     This modifies coefficients in-place.
+
+    ``delta_tau`` is ``(n_layers+1, n_wavelengths)`` - the per-mu division that used to be pre-broadcast into a
+    ``(n_layers+1, n_angles, n_wavelengths)`` array by the caller now happens here instead, one scalar divide per
+    element next to the exp/Horner-expansion work already done for that element - see
+    :func:`effective_source_tau_mu` for why avoiding that broadcast matters.
     """
     n_layers, _, n_angles, n_wavelengths = coefficients.shape
     delta_tau_limit = 1.4e-1
 
     for k in numba.prange(n_wavelengths):
         for i in range(n_layers):
+            dtau_2d = delta_tau[i, k]
             for j in range(n_angles):
-                dt = delta_tau[i, j, k]
+                dt = dtau_2d / mu_values[j]
 
                 if dt == 0.0:
                     coefficients[i, 0, j, k] = 1.0
@@ -612,15 +696,24 @@ def _compute_coefficients_core(
 
 @numba.njit(parallel=True, cache=True, error_model="numpy")
 def _compute_control_points_outward(
-        tau_mu_matrix: npt.NDArray[np.float64],
-        source_func_mu: npt.NDArray[np.float64],
+        tau_matrix: npt.NDArray[np.float64],
+        mu_values: npt.NDArray[np.float64],
+        source_function_matrix: npt.NDArray[np.float64],
         control_points: npt.NDArray[np.float64],
         coefficients: npt.NDArray[np.float64],
         start: int = 0,
         end: int | None = None,
 ) -> None:
-    """Compute outward control points (index 0)."""
-    n_layers, n_angles, n_wavelengths = tau_mu_matrix.shape
+    """
+    Compute outward control points (index 0).
+
+    ``tau_matrix``/``source_function_matrix`` are the un-broadcast ``(n_layers, n_wavelengths)`` arrays; every
+    former ``tau_mu_matrix[i, j, k]``/``source_func_mu[i, j, k]`` lookup becomes ``tau_matrix[i, k] / mu_values[j]``
+    /``source_function_matrix[i, k]`` here instead (control points are angle-independent for the source function -
+    see the removed broadcast this replaces), since both loops already visit every ``(i, j, k)`` anyway.
+    """
+    n_layers, n_wavelengths = tau_matrix.shape
+    n_angles = mu_values.shape[0]
     if end is None or end > n_layers - 1:
         end = n_layers - 1
 
@@ -630,24 +723,27 @@ def _compute_control_points_outward(
 
     for k in numba.prange(n_wavelengths):
         for j in range(n_angles):
+            inv_mu = 1.0 / mu_values[j]
             # Compute derivatives
             d_s_d_tau_out = np.zeros(n_layers, dtype=np.float64)
 
             for i in range(deriv_start, deriv_end):
-                tau_diff = tau_mu_matrix[i, j, k] - tau_mu_matrix[i + 1, j, k]
+                tau_diff = (tau_matrix[i, k] - tau_matrix[i + 1, k]) * inv_mu
                 if tau_diff != 0:
-                    d_diff = (source_func_mu[i, j, k] - source_func_mu[i + 1, j, k]) / tau_diff
+                    d_diff = (source_function_matrix[i, k] - source_function_matrix[i + 1, k]) / tau_diff
 
                     if i > 0:
-                        tau_diff_prev = tau_mu_matrix[i - 1, j, k] - tau_mu_matrix[i, j, k]
+                        tau_diff_prev = (tau_matrix[i - 1, k] - tau_matrix[i, k]) * inv_mu
                         if tau_diff_prev != 0:
-                            d_diff_prev = (source_func_mu[i - 1, j, k] - source_func_mu[i, j, k]) / tau_diff_prev
+                            d_diff_prev = (
+                                    (source_function_matrix[i - 1, k] - source_function_matrix[i, k]) / tau_diff_prev
+                            )
                         else:
                             d_diff_prev = 0
 
-                        zeta_denom = tau_mu_matrix[i - 1, j, k] - tau_mu_matrix[i + 1, j, k]
+                        zeta_denom = (tau_matrix[i - 1, k] - tau_matrix[i + 1, k]) * inv_mu
                         if zeta_denom != 0:
-                            zeta = (1 + (tau_mu_matrix[i - 1, j, k] - tau_mu_matrix[i, j, k]) / zeta_denom) / 3
+                            zeta = (1 + (tau_matrix[i - 1, k] - tau_matrix[i, k]) * inv_mu / zeta_denom) / 3
                         else:
                             zeta = 1.0 / 3.0
 
@@ -659,13 +755,13 @@ def _compute_control_points_outward(
 
             # Compute control points with clamping
             for i in range(max(start, 1), min(end + 1, n_layers)):
-                tau_diff = tau_mu_matrix[i - 1, j, k] - tau_mu_matrix[i, j, k]
+                tau_diff = (tau_matrix[i - 1, k] - tau_matrix[i, k]) * inv_mu
 
-                control_0 = source_func_mu[i, j, k] + 0.5 * tau_diff * d_s_d_tau_out[i]
-                control_1 = source_func_mu[i - 1, j, k] - 0.5 * tau_diff * d_s_d_tau_out[i - 1]
+                control_0 = source_function_matrix[i, k] + 0.5 * tau_diff * d_s_d_tau_out[i]
+                control_1 = source_function_matrix[i - 1, k] - 0.5 * tau_diff * d_s_d_tau_out[i - 1]
 
-                min_source = min(source_func_mu[i - 1, j, k], source_func_mu[i, j, k])
-                max_source = max(source_func_mu[i - 1, j, k], source_func_mu[i, j, k])
+                min_source = min(source_function_matrix[i - 1, k], source_function_matrix[i, k])
+                max_source = max(source_function_matrix[i - 1, k], source_function_matrix[i, k])
 
                 control_0 = max(min(control_0, max_source), min_source)
                 control_1 = max(min(control_1, max_source), min_source)
@@ -684,15 +780,18 @@ def _compute_control_points_outward(
 
 @numba.njit(parallel=True, cache=True, error_model="numpy")
 def _compute_control_points_inward(
-        tau_mu_matrix: npt.NDArray[np.float64],
-        source_func_mu: npt.NDArray[np.float64],
+        tau_matrix: npt.NDArray[np.float64],
+        mu_values: npt.NDArray[np.float64],
+        source_function_matrix: npt.NDArray[np.float64],
         control_points: npt.NDArray[np.float64],
         coefficients: npt.NDArray[np.float64],
         start: int = 0,
         end: int | None = None,
 ) -> None:
-    """Compute inward control points (index 1)."""
-    n_layers, n_angles, n_wavelengths = tau_mu_matrix.shape
+    """Compute inward control points (index 1). See :func:`_compute_control_points_outward` for the
+    tau_matrix/mu_values/source_function_matrix substitution this makes for the former broadcast arrays."""
+    n_layers, n_wavelengths = tau_matrix.shape
+    n_angles = mu_values.shape[0]
 
     if end is None or end > n_layers - 1:
         end = n_layers - 1
@@ -703,24 +802,28 @@ def _compute_control_points_inward(
 
     for k in numba.prange(n_wavelengths):
         for j in range(n_angles):
+            inv_mu = 1.0 / mu_values[j]
             # Compute derivatives
             d_s_d_tau_in = np.zeros(n_layers, dtype=np.float64)
 
             for i in range(deriv_start, deriv_end):
-                tau_diff = tau_mu_matrix[i + 1, j, k] - tau_mu_matrix[i, j, k]
+                tau_diff = (tau_matrix[i + 1, k] - tau_matrix[i, k]) * inv_mu
                 if tau_diff != 0:
-                    d_diff = (source_func_mu[i + 1, j, k] - source_func_mu[i, j, k]) / tau_diff
+                    d_diff = (source_function_matrix[i + 1, k] - source_function_matrix[i, k]) / tau_diff
 
                     if i < n_layers - 2:
-                        tau_diff_next = tau_mu_matrix[i + 2, j, k] - tau_mu_matrix[i + 1, j, k]
+                        tau_diff_next = (tau_matrix[i + 2, k] - tau_matrix[i + 1, k]) * inv_mu
                         if tau_diff_next != 0:
-                            d_diff_next = (source_func_mu[i + 2, j, k] - source_func_mu[i + 1, j, k]) / tau_diff_next
+                            d_diff_next = (
+                                    (source_function_matrix[i + 2, k] - source_function_matrix[i + 1, k])
+                                    / tau_diff_next
+                            )
                         else:
                             d_diff_next = 0
 
-                        zeta_denom = tau_mu_matrix[i + 2, j, k] - tau_mu_matrix[i, j, k]
+                        zeta_denom = (tau_matrix[i + 2, k] - tau_matrix[i, k]) * inv_mu
                         if zeta_denom != 0:
-                            zeta = (1 + (tau_mu_matrix[i + 2, j, k] - tau_mu_matrix[i + 1, j, k]) / zeta_denom) / 3
+                            zeta = (1 + (tau_matrix[i + 2, k] - tau_matrix[i + 1, k]) * inv_mu / zeta_denom) / 3
                         else:
                             zeta = 1.0 / 3.0
 
@@ -732,13 +835,13 @@ def _compute_control_points_inward(
 
             # Compute control points with clamping
             for i in range(max(start, 0), min(end + 1, n_layers - 1)):
-                tau_diff = tau_mu_matrix[i + 1, j, k] - tau_mu_matrix[i, j, k]
+                tau_diff = (tau_matrix[i + 1, k] - tau_matrix[i, k]) * inv_mu
 
-                control_0 = source_func_mu[i, j, k] + 0.5 * tau_diff * d_s_d_tau_in[i]
-                control_1 = source_func_mu[i + 1, j, k] - 0.5 * tau_diff * d_s_d_tau_in[i + 1]
+                control_0 = source_function_matrix[i, k] + 0.5 * tau_diff * d_s_d_tau_in[i]
+                control_1 = source_function_matrix[i + 1, k] - 0.5 * tau_diff * d_s_d_tau_in[i + 1]
 
-                min_source = min(source_func_mu[i, j, k], source_func_mu[i + 1, j, k])
-                max_source = max(source_func_mu[i, j, k], source_func_mu[i + 1, j, k])
+                min_source = min(source_function_matrix[i, k], source_function_matrix[i + 1, k])
+                max_source = max(source_function_matrix[i, k], source_function_matrix[i + 1, k])
 
                 control_0 = max(min(control_0, max_source), min_source)
                 control_1 = max(min(control_1, max_source), min_source)
@@ -757,7 +860,8 @@ def _compute_control_points_inward(
 
 # @numba.njit(parallel=True, cache=True, error_model="numpy")
 def bezier_coefficients(
-        tau_mu_matrix: npt.NDArray[np.float64],
+        tau_matrix: npt.NDArray[np.float64],
+        mu_values: npt.NDArray[np.float64],
         source_function_matrix: u.Quantity,
 ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
     """
@@ -765,10 +869,24 @@ def bezier_coefficients(
 
     Parameters
     ----------
-    tau_mu_matrix : ndarray
-        Optical depth matrix [n_layers, n_angles, n_wavelengths].
+    tau_matrix : ndarray
+        Optical depth matrix [n_layers, n_wavelengths] (no angle axis - see below).
+    mu_values : ndarray
+        Cosines of the angle quadrature points [n_angles].
     source_function_matrix : ndarray
         Source function [n_layers, n_wavelengths].
+
+    Notes
+    -----
+    This used to take a pre-broadcast ``tau_mu_matrix`` ``[n_layers, n_angles, n_wavelengths]`` (``tau_matrix``
+    divided through by every ``mu`` up front) and a similarly pre-broadcast source function. Both broadcasts
+    materialised a full ``(n_layers, n_angles, n_wavelengths)`` array - for a realistic grid, ~14x the size of
+    everything else this function computes - for no reason: every place that used them only ever read
+    ``tau_mu_matrix[i, j, k]`` as ``tau_matrix[i, k] / mu_values[j]``, and the source function isn't angle-dependent
+    at all. Both substitutions now happen inline inside ``_compute_coefficients_core``/
+    ``_compute_control_points_outward``/``_inward``, which already loop over every ``(i, j, k)`` - one extra
+    multiply/lookup there costs nothing next to the broadcast it replaces. See :func:`effective_source_tau_mu`,
+    which now returns ``tau`` instead of ``tau_mu`` for the same reason.
 
     Returns
     -------
@@ -779,50 +897,36 @@ def bezier_coefficients(
         control_points : ndarray
             [n_layers, 2, n_angles, n_wavelengths]
     """
-    n_layers, n_angles, n_wavelengths = tau_mu_matrix.shape
+    n_layers, n_wavelengths = tau_matrix.shape
+    n_angles = mu_values.shape[0]
 
-    tau_mu_matrix = np.ascontiguousarray(tau_mu_matrix)
+    tau_matrix = np.ascontiguousarray(tau_matrix)
+    source_func_val = np.ascontiguousarray(source_function_matrix.value)
 
     # Initialize arrays
     coefficients = np.zeros((n_layers + 1, 4, n_angles, n_wavelengths), dtype=np.float64)
     control_points = np.zeros((n_layers, 2, n_angles, n_wavelengths), dtype=np.float64)
 
-    # Compute delta_tau (difference between layers)
-    # coefficients[1:, 0, :, :] = tau_mu_matrix
-    # coefficients[:-1, 0, :, :] -= tau_mu_matrix
-    # # Store delta_tau temporarily for coefficient computation; contiguous copy is faster.
-    # delta_tau = np.ascontiguousarray(coefficients[:, 0, :, :])
-
-    # Delta tau was previously stored in coefficients but _compute_coefficients_core no longer accesses these and we
-    # do not need to keep them for output.
-    delta_tau = np.zeros((n_layers + 1, n_angles, n_wavelengths), dtype=np.float64)
-    delta_tau[1:, :, :] = tau_mu_matrix
-    delta_tau[:-1, :, :] -= tau_mu_matrix
+    # Compute delta_tau (difference between layers) - still per-layer only, mu division deferred into the kernel.
+    delta_tau = np.zeros((n_layers + 1, n_wavelengths), dtype=np.float64)
+    delta_tau[1:, :] = tau_matrix
+    delta_tau[:-1, :] -= tau_matrix
 
     # Compute alpha, beta, gamma and overwrite coefficients[:, 0] with exp(-delta_tau)
-    _compute_coefficients_core(delta_tau, coefficients)
-
-    # Expand source function to all angles
-    # Division through by mu was removed; following the maths through the control points are angle independent.
-    # It also braks the clamping checks which ensure monotonicity.
-    # source_func_mu = np.empty((n_layers, n_angles, n_wavelengths))
-    # for i in range(n_layers):
-    #     for j in range(n_angles):
-    #         source_func_mu[i, j, :] = source_function_matrix[i, :]
-    source_func_mu = np.ascontiguousarray(
-        np.broadcast_to(source_function_matrix.value[:, None, :], (n_layers, n_angles, n_wavelengths))
-    )
+    _compute_coefficients_core(delta_tau, mu_values, coefficients)
 
     # Compute control points
     _compute_control_points_outward(
-        tau_mu_matrix=tau_mu_matrix,
-        source_func_mu=source_func_mu,
+        tau_matrix=tau_matrix,
+        mu_values=mu_values,
+        source_function_matrix=source_func_val,
         control_points=control_points,
         coefficients=coefficients
     )
     _compute_control_points_inward(
-        tau_mu_matrix=tau_mu_matrix,
-        source_func_mu=source_func_mu,
+        tau_matrix=tau_matrix,
+        mu_values=mu_values,
+        source_function_matrix=source_func_val,
         control_points=control_points,
         coefficients=coefficients
     )
@@ -833,12 +937,22 @@ def bezier_coefficients(
 @numba.njit(parallel=True, cache=True, error_model="numpy")
 def update_layer_coefficients(
         layer_idx: int,
-        tau_mu_matrix: npt.NDArray[np.float64],
+        tau_matrix: npt.NDArray[np.float64],
+        mu_values: npt.NDArray[np.float64],
         source_function_matrix: npt.NDArray[np.float64],
         coefficients: npt.NDArray[np.float64],
         control_points: npt.NDArray[np.float64]
 ) -> None:
-    n_layers, n_angles, n_wavelengths = tau_mu_matrix.shape
+    """
+    Refresh the Bezier coefficients/control points for the one or two layer boundaries touched by ``layer_idx``.
+
+    ``tau_matrix``/``source_function_matrix`` are ``(n_layers, n_wavelengths)`` - see
+    :func:`_compute_control_points_outward` for why the former ``tau_mu_matrix``/broadcast-``source_func_mu``
+    arrays are no longer materialised: this also drops the ``source_func_mu`` per-call allocation+copy that used to
+    happen here.
+    """
+    n_layers, n_wavelengths = tau_matrix.shape
+    n_angles = mu_values.shape[0]
     delta_tau_limit = 1.4e-1
 
     update_idxs = []
@@ -849,8 +963,9 @@ def update_layer_coefficients(
 
     for k in numba.prange(n_wavelengths):
         for j in range(n_angles):
+            inv_mu = 1.0 / mu_values[j]
             for i in update_idxs:
-                dt = tau_mu_matrix[i - 1, j, k] - tau_mu_matrix[i, j, k]
+                dt = (tau_matrix[i - 1, k] - tau_matrix[i, k]) * inv_mu
 
                 if dt == 0.0:
                     coefficients[i, 0, j, k] = 1.0
@@ -876,11 +991,6 @@ def update_layer_coefficients(
                     coefficients[i, 2, j, k] = (2 - (2 + 2 * dt + dt_sq) * exp_neg_tau) / dt_sq
                     coefficients[i, 3, j, k] = (2 * dt - 4 + (2 * dt + 4) * exp_neg_tau) / dt_sq
 
-    source_func_mu = np.empty((n_layers, n_angles, n_wavelengths), dtype=np.float64)
-    for i in range(n_layers):
-        for j in range(n_angles):
-            source_func_mu[i, j, :] = source_function_matrix[i, :]
-
     # Recompute control_points[i, 0] and control_points[i, 1] for i in range [layer_idx-2 ... layer_idx+2]
     min_update_idx = min(update_idxs)
     max_update_idx = max(update_idxs)
@@ -889,14 +999,110 @@ def update_layer_coefficients(
     i_high = min(max_update_idx + 1, n_layers - 1)
 
     _compute_control_points_outward(
-        tau_mu_matrix=tau_mu_matrix, source_func_mu=source_func_mu, control_points=control_points,
-        coefficients=coefficients, start=i_low, end=i_high,
+        tau_matrix=tau_matrix, mu_values=mu_values, source_function_matrix=source_function_matrix,
+        control_points=control_points, coefficients=coefficients, start=i_low, end=i_high,
     )
     _compute_control_points_inward(
-        tau_mu_matrix=tau_mu_matrix, source_func_mu=source_func_mu, control_points=control_points,
-        coefficients=coefficients, start=i_low, end=i_high,
+        tau_matrix=tau_matrix, mu_values=mu_values, source_function_matrix=source_function_matrix,
+        control_points=control_points, coefficients=coefficients, start=i_low, end=i_high,
     )
     # Done.
+
+
+@numba.njit(parallel=True, cache=True, error_model="numpy")
+def update_inward_layer(
+        layer_idx: int,
+        i_in_matrix: npt.NDArray[np.float64],
+        lambda_in_matrix: npt.NDArray[np.float64],
+        bezier_coefs: npt.NDArray[np.float64],
+        control_points: npt.NDArray[np.float64],
+        source_function_matrix: npt.NDArray[np.float64],
+        alpha_plus_gamma: npt.NDArray[np.float64],
+        one_plus_exp_neg_delta_tau: npt.NDArray[np.float64],
+        do_tridiag_lambda: bool,
+) -> None:
+    """
+    Update ``i_in_matrix[layer_idx]``/``lambda_in_matrix[layer_idx]`` in place during a Gauss-Seidel inward pass.
+
+    Replaces the numpy formula::
+
+        i_in_matrix[layer_idx] = (
+            i_in_matrix[layer_idx + 1] * bezier_coefs[layer_idx + 1, 0]
+            + bezier_coefs[layer_idx + 1, 1] * source_function_matrix[layer_idx, None, :]
+            + bezier_coefs[layer_idx + 1, 2] * source_function_matrix[layer_idx + 1, None, :]
+            + bezier_coefs[layer_idx + 1, 3] * control_points[layer_idx, 1]
+        )
+
+    which broadcasts ``source_function_matrix``'s missing angle axis via ``[:, None, :]`` on every call (a fresh
+    ``(n_angles, n_wavelengths)`` temporary each time); here that's just two scalar reads per ``(angle,
+    wavelength)`` element, done in the same pass that already visits every element.
+
+    ``do_tridiag_lambda`` is the caller's ``self._do_tridiag and layer_idx > 0`` - the two branches of the lambda
+    update need different formulas, and which one applies depends on the call site.
+    """
+    n_angles, n_grid = i_in_matrix.shape[1], i_in_matrix.shape[2]
+
+    for k in numba.prange(n_grid):
+        sf_here = source_function_matrix[layer_idx, k]
+        sf_next = source_function_matrix[layer_idx + 1, k]
+
+        for j in range(n_angles):
+            i_in_matrix[layer_idx, j, k] = (
+                    i_in_matrix[layer_idx + 1, j, k] * bezier_coefs[layer_idx + 1, 0, j, k]
+                    + bezier_coefs[layer_idx + 1, 1, j, k] * sf_here
+                    + bezier_coefs[layer_idx + 1, 2, j, k] * sf_next
+                    + bezier_coefs[layer_idx + 1, 3, j, k] * control_points[layer_idx, 1, j, k]
+            )
+
+            if do_tridiag_lambda:
+                lambda_in_matrix[layer_idx, j, k] = (
+                        alpha_plus_gamma[layer_idx + 1, j, k] * one_plus_exp_neg_delta_tau[layer_idx, j, k]
+                        + bezier_coefs[layer_idx, 2, j, k]
+                )
+            else:
+                lambda_in_matrix[layer_idx, j, k] = alpha_plus_gamma[layer_idx + 1, j, k]
+
+
+@numba.njit(parallel=True, cache=True, error_model="numpy")
+def update_outward_layer(
+        layer_idx: int,
+        i_out_matrix: npt.NDArray[np.float64],
+        lambda_out_matrix: npt.NDArray[np.float64],
+        bezier_coefs: npt.NDArray[np.float64],
+        control_points: npt.NDArray[np.float64],
+        source_function_matrix: npt.NDArray[np.float64],
+        alpha_plus_gamma: npt.NDArray[np.float64],
+        one_plus_exp_neg_delta_tau: npt.NDArray[np.float64],
+        do_tridiag_lambda: bool,
+) -> None:
+    """
+    Update ``i_out_matrix[layer_idx]``/``lambda_out_matrix[layer_idx]`` in place during a Gauss-Seidel outward pass.
+
+    See :func:`update_inward_layer` for the broadcast this replaces; this is the mirror-image formula for the
+    outward direction. Assumes ``layer_idx > 0`` - the ``layer_idx == 0`` boundary condition (blackbody, no
+    ``lambda_out_matrix`` update) is the caller's responsibility, same as before.
+    """
+    n_angles, n_grid = i_out_matrix.shape[1], i_out_matrix.shape[2]
+
+    for k in numba.prange(n_grid):
+        sf_here = source_function_matrix[layer_idx, k]
+        sf_prev = source_function_matrix[layer_idx - 1, k]
+
+        for j in range(n_angles):
+            i_out_matrix[layer_idx, j, k] = (
+                    i_out_matrix[layer_idx - 1, j, k] * bezier_coefs[layer_idx, 0, j, k]
+                    + bezier_coefs[layer_idx, 1, j, k] * sf_here
+                    + bezier_coefs[layer_idx, 2, j, k] * sf_prev
+                    + bezier_coefs[layer_idx, 3, j, k] * control_points[layer_idx, 0, j, k]
+            )
+
+            if do_tridiag_lambda:
+                lambda_out_matrix[layer_idx, j, k] = (
+                        alpha_plus_gamma[layer_idx, j, k] * one_plus_exp_neg_delta_tau[layer_idx + 1, j, k]
+                        + bezier_coefs[layer_idx + 1, 2, j, k]
+                )
+            else:
+                lambda_out_matrix[layer_idx, j, k] = alpha_plus_gamma[layer_idx, j, k]
 
 
 ############# END NEW
@@ -1641,6 +1847,10 @@ class NLTEProcessor:
         self.debug: bool = debug
         self.debug_pop_matrix: npt.NDArray[np.float64] | None = debug_pop_matrix
         self.save_rates_profiles = save_rates_profiles
+        self.profile_pickle = profile_pickle
+        self.rates_pickle = rates_pickle
+        self.cont_profile_pickle = cont_profile_pickle
+        self.cont_rates_pickle = cont_rates_pickle
         self._agg_lookup_cache = None
         self._nlte_pop_frac = None
         self._a_ox_vals = None
@@ -1798,6 +2008,35 @@ class NLTEProcessor:
                 return self.pop_matrix[-1, layer_idx]
         else:
             raise RuntimeError(f"No population matrix available for species {self.species}.")
+
+    def set_pop_matrix_to_debug(self) -> None:
+        if self.debug_pop_matrix is None:
+            raise RuntimeError(f"Attempting to set debug pop matrix for {self.species} but argument not set.")
+        if len(self.debug_pop_matrix.shape) == 2:
+            self._pop_matrix = self.debug_pop_matrix[None, :, :]
+        elif len(self.debug_pop_matrix.shape) == 3:
+            self._pop_matrix = self.debug_pop_matrix
+        else:
+            raise RuntimeError(f"Invalid debug pop matrix dimensions {self.debug_pop_matrix.shape}.")
+
+        # Also need to update the states data for final xsec calcualtions.
+        id_agg_np = self.states["id_agg"].to_numpy()
+
+        for layer_idx in range(self.n_layers):
+            n_agg_lte_col = f"n_agg_L{layer_idx}"
+            n_lte_col = f"n_L{layer_idx}"
+            n_agg_nlte_col = f"n_agg_nlte_L{layer_idx}"
+            n_nlte_col = f"n_nlte_L{layer_idx}"
+
+            self.states = self.states.with_columns(
+                pl.Series(n_agg_nlte_col, self.pop_matrix[-1, layer_idx, id_agg_np])
+            )
+            self.states = self.states.with_columns(
+                pl.when(pl.col(n_agg_lte_col) == 0)
+                .then(0)
+                .otherwise(pl.col(n_lte_col) * pl.col(n_agg_nlte_col) / pl.col(n_agg_lte_col))
+                .alias(n_nlte_col)
+            )
 
     def _build_agg_state_lookup(self) -> None:
         """
@@ -1983,6 +2222,7 @@ class NLTEProcessor:
             assert len(self.profile_store.abs_profiles) == n_nlte_layers
             assert len(self.profile_store.ste_profiles) == n_nlte_layers
             assert len(self.profile_store.spe_profiles) == n_nlte_layers
+            log.info(f"ProfileStore and rates grid loaded from disk for {self.species}.")
             # Any additional debugging metrics here?
             return
 
@@ -2016,11 +2256,11 @@ class NLTEProcessor:
         )
 
         # Grid parameters and buffers.
-        wn_min = wn_grid[0]
-        wn_max = wn_grid[-1]
         n_grid = wn_grid.shape[0]
         # Bin edges for finding trans bins.
         wn_arr = wn_grid.value
+        wn_min = wn_arr[0]
+        wn_max = wn_arr[-1]
         bin_edges = np.empty(n_grid + 1, dtype=np.float64)
         bin_edges[0] = wn_arr[0] - (wn_arr[1] - wn_arr[0]) * 0.5
         for j in range(1, n_grid):
@@ -2201,7 +2441,7 @@ class NLTEProcessor:
                 pickle.dump(self.profile_store, band_pickle, protocol=pickle.HIGHEST_PROTOCOL)
             rates_file = f"{self.species}_wn{int(wn_min)}-{int(wn_max)}_G{n_grid}_B{n_bands_used}_L{n_nlte_layers}.ratesgrid.pickle"
             with open((output_dir / rates_file).resolve(), "wb") as rates_pickle:
-                pickle.dump(self.profile_store, rates_pickle, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(self.rates_grid, rates_pickle, protocol=pickle.HIGHEST_PROTOCOL)
 
     def compute_continuum_rates_profiles(
             self,
@@ -2237,7 +2477,7 @@ class NLTEProcessor:
             assert len(self._cont_profile_store.abs_profiles) == n_nlte_layers
             return
 
-        log.log(_LOG_VERBOSE_2, f"[I0] {self.species} loading continuum absorption rates and profiles.")
+        log.log(_LOG_VERBOSE_2, f"{self.species} loading continuum absorption rates and profiles.")
 
         read_col_map = {num: "v" if num == self.cont_broad_col_num else name for num, name in
                         zip(self.agg_col_nums, self.agg_col_names)}
@@ -2632,12 +2872,13 @@ class NLTEProcessor:
         if self.cont_states_file is not None and self.cont_trans_files is not None:
             self.compute_continuum_rates_profiles(temperature_profile=temperature_profile, wn_grid=wn_grid)
 
-        self.mol_chi_matrix = initial_chi_matrix
+        vmr_mask = chem_profile[self.species] != 0
+        self.mol_chi_matrix = np.zeros_like(initial_chi_matrix)
+        self.mol_chi_matrix[vmr_mask] = initial_chi_matrix[vmr_mask] / chem_profile[self.species][vmr_mask, None]
         lte_source_func_matrix = blackbody(
             spectral_grid=wn_grid, temperature=temperature_profile
         )
         self.mol_eta_matrix = lte_source_func_matrix * self.mol_chi_matrix * ac.c
-        # TODO: Implement debug_pop_matrix here!
         self._build_a_ox_vals_cache()
         self._build_col_chem_cache(
             chem_profile=chem_profile,
@@ -2674,13 +2915,10 @@ class NLTEProcessor:
             b_if_approx += self._cont_rates.select(
                 pl.col("B_if").filter(pl.col("id_agg_i") <= self.id_agg_cutoff).sum()
             ).item() * einstein_b_unit
-        # mol_chi_norm = simpson_normalise_quantity_2d(y_data=self.mol_chi_matrix, x_data=wn_grid)
         mol_chi_norm = loglinear_normalise_quantity_2d_nonnegative(y_data=self.mol_chi_matrix, dx=wn_dx)
         v_fi_approx = mol_chi_norm * b_fi_approx * i_mean
-        # v_fi_rate = simpson_quantity_2d(y_data=v_fi_approx, x_data=wn_grid)
         v_fi_rate = loglinear_integral_quantity_2d_nonnegative(y_data=v_fi_approx, dx=wn_dx)
         v_if_approx = mol_chi_norm * b_if_approx * i_mean
-        # v_if_rate = simpson_quantity_2d(y_data=v_if_approx, x_data=wn_grid)
         v_if_rate = loglinear_integral_quantity_2d_nonnegative(y_data=v_if_approx, dx=wn_dx)
 
         # energy_dif_approx = np.mean(np.diff(
@@ -2699,27 +2937,35 @@ class NLTEProcessor:
             agg_lookup_cache=self._agg_lookup_cache,
             id_agg_cutoff=self.id_agg_cutoff,
         )
-        # log.info(f"T_ex DEBUG: C_if = {c_if_approx}, C_fi = {c_fi_approx}, V_if = {v_if_rate}, V_fi = {v_fi_rate},"
-        #          f" A_fi = {a_fi_approx}.")
         energy_dif_wmean_global = (mol_chi_norm @ wn_grid) / mol_chi_norm.sum(axis=1)
         n_ratio_old = (c_if_approx + v_if_rate) / (c_fi_approx + a_fi_approx + v_fi_rate)
         t_ex_profile_old = (ac_h_c_on_kB * energy_dif_wmean_global / np.log(1 / n_ratio_old)).to(u.K)
         log.log(
-            _LOG_VERBOSE_3,
+            _LOG_VERBOSE_2,
             f"{self.species} T_ex profile global fit = {np.array2string(t_ex_profile_old, formatter=_LOG_ARRAY_FMT)}"
         )
+
         # Get pairs of valid band keys: choosing adjacent IDs do not always exist, i.e.: in species with distinct
         # isomers whose states are close in energy.
         agg_energies = self.agg_states.sort("id_agg")["energy_agg"].to_numpy()
-        max_id = self.id_agg_cutoff + 1
-        num_pairs = max_id if max_id <= 10 else max(11, (max_id + 1) // 2)
+        agg_energies = np.concatenate((agg_energies, [wn_grid[-1].value]), axis=0)
+        # TODO: Better version of above, store cutoff state in agg_states? Do we need better?
+        # max_id = self.id_agg_cutoff + 1
+        # max_bands = max_id * max_id
+        # num_pairs = max_bands if max_bands <= 10 else max(11, (max_bands + 1) // 2)
         id_pairs = self.profile_store.get_sorted_band_keys(
-            num_max=num_pairs, id_cutoff=self.id_agg_cutoff, agg_energies=agg_energies,
+            agg_energies=agg_energies, id_cutoff=self.id_agg_cutoff,  # num_max=num_pairs,
         )
-        log.log(_LOG_VERBOSE_3, f"{self.species} num pairs = {num_pairs}, {len(id_pairs)} returned.")
+        # log.log(_LOG_VERBOSE_3, f"{self.species} num pairs = {num_pairs}, {len(id_pairs)} returned.")
         t_ex_profiles = np.zeros((len(id_pairs), n_layers), dtype=np.float64) << u.K
+        band_weights = np.zeros(len(id_pairs), dtype=np.float64)
         log.log(_LOG_VERBOSE_3, f"{self.species} ID pairs for T_ex = {id_pairs}")
+
         for pair_idx, (id_agg_f, id_agg_i) in enumerate(id_pairs):
+            # if id_agg_f > self.id_agg_cutoff or id_agg_i > self.id_agg_cutoff:
+            #     # TODO: How to implement above/below ratio calculation?
+            #     ...
+
             id_filter = (pl.col("id_agg_f") == id_agg_f) & (pl.col("id_agg_i") == id_agg_i)
             a_fi = self.rates_grid.select(
                 pl.col("A_fi").filter(id_filter).sum()
@@ -2746,20 +2992,6 @@ class NLTEProcessor:
                 ste_profile: u.Quantity = ste_profile << u.cm ** 2
                 abs_end_idx = abs_start_idx + len(abs_profile)
                 ste_end_idx = ste_start_idx + len(ste_profile)
-                # abs_profile_norm = simpson_normalise_quantity_1d(
-                #     y_data=abs_profile, x_data=wn_grid[abs_start_idx:abs_end_idx]
-                # )
-                # ste_profile_norm = simpson_normalise_quantity_1d(
-                #     y_data=ste_profile, x_data=wn_grid[ste_start_idx:ste_end_idx]
-                # )
-                # v_fi[layer_idx] = simpson_quantity(
-                #     y_data=ste_profile_norm * b_fi * i_mean[layer_idx, ste_start_idx:ste_end_idx],
-                #     x_data=wn_grid[ste_start_idx:ste_end_idx]
-                # )
-                # v_if[layer_idx] = simpson_quantity(
-                #     y_data=abs_profile_norm * b_if * i_mean[layer_idx, abs_start_idx:abs_end_idx],
-                #     x_data=wn_grid[abs_start_idx:abs_end_idx]
-                # )
                 abs_profile_norm = loglinear_normalise_quantity_1d_nonnegative(
                     y_data=abs_profile, dx=wn_dx[abs_start_idx:abs_end_idx - 1]
                 )
@@ -2774,32 +3006,47 @@ class NLTEProcessor:
                     y_data=abs_profile_norm * i_mean[layer_idx, abs_start_idx:abs_end_idx],
                     dx=wn_dx[abs_start_idx:abs_end_idx - 1]
                 ) * b_if
-                # log.info(f"[L{layer_idx}] {self.species} V_fi = {v_fi[layer_idx]:{_LOG_FLOAT_FMT}}"
-                #          f" V_if = {v_if[layer_idx]:{_LOG_FLOAT_FMT}}.")
                 energy_dif_wmean[layer_idx] = np.average(
                     wn_grid[abs_start_idx:abs_end_idx].value,
                     weights=abs_profile_norm.value,
                 ) * wn_grid.unit
-            c_fi = self._col_chem_c_matrix[:, id_agg_i, id_agg_f] << 1 / u.s
-            c_if = self._col_chem_c_matrix[:, id_agg_f, id_agg_i] << 1 / u.s
+
+            if id_agg_f > self.id_agg_cutoff or id_agg_i > self.id_agg_cutoff:
+                c_fi = c_fi_approx
+                c_if = c_if_approx
+            else:
+                c_fi = self._col_chem_c_matrix[:, id_agg_i, id_agg_f] << 1 / u.s
+                c_if = self._col_chem_c_matrix[:, id_agg_f, id_agg_i] << 1 / u.s
+
             n_ratio = (c_if + v_if) / (c_fi + a_fi + v_fi)
-            # energy_agg_f = self.agg_states.filter(pl.col("id_agg") == id_agg_f).select(pl.col("energy_agg")).item()
-            # energy_agg_i = self.agg_states.filter(pl.col("id_agg") == id_agg_i).select(pl.col("energy_agg")).item()
-            # energy_dif = (energy_agg_f - energy_agg_i) / u.cm
-            # log.info(f"DEBUG: energy_dif = {energy_dif}, WMean = {energy_dif_wmean}.")
-            t_ex_profile = (ac_h_c_on_kB * energy_dif_wmean / np.log(1 / n_ratio)).to(u.K)
-            if np.any(t_ex_profile < 0):
+
+            t_ex_profile_band = (ac_h_c_on_kB * energy_dif_wmean / np.log(1 / n_ratio)).to(u.K)
+            if np.any(t_ex_profile_band < 0):
                 log.warning(f"{self.species} T_ex for ({id_agg_f}-{id_agg_i}) band contains negatives!")
-            t_ex_profile = np.where(np.isnan(t_ex_profile), temperature_profile, t_ex_profile)
-            t_ex_profile = np.clip(abs(t_ex_profile), a_min=0.0 * u.K, a_max=temperature_profile * 3.0)  # Failsafe
+            t_ex_profile_band = np.where(np.isnan(t_ex_profile_band), temperature_profile, t_ex_profile_band)
+            # Failsafe for negative temepratures (inversions).
+            t_ex_profile_band = np.clip(abs(t_ex_profile_band), a_min=0.0 * u.K, a_max=temperature_profile * 3.0)
             log.log(
                 _LOG_VERBOSE_2,
-                f"{id_agg_f}-{id_agg_i} T_ex = {np.array2string(t_ex_profile, formatter=_LOG_ARRAY_FMT)}"
+                f"{id_agg_f}-{id_agg_i} T_ex = {np.array2string(t_ex_profile_band, formatter=_LOG_ARRAY_FMT)}"
             )
-            t_ex_profiles[pair_idx] = t_ex_profile
+
+            t_ex_profiles[pair_idx] = t_ex_profile_band
+            band_weights[pair_idx] = a_fi.value
         # t_ex_profiles = np.stack(t_ex_profiles)
-        t_ex_profile = t_ex_profiles.mean(axis=0)
-        log.log(_LOG_VERBOSE_1, f"{self.species} T_ex = {t_ex_profile}")
+        # t_ex_profile = t_ex_profiles.mean(axis=0)
+        t_ex_profile = np.average(t_ex_profiles, axis=0, weights=band_weights)
+        log.log(_LOG_VERBOSE_1, f"{self.species} T_ex = {np.array2string(t_ex_profile, formatter=_LOG_ARRAY_FMT)}")
+
+        # TEST:
+        valid_map = np.array([
+            l >= self.n_lte_layers and chem_profile[self.species][l] > _VMR_THRESHOLD for l in range(self.n_layers)
+        ])
+        t_ex_profile = np.where(valid_map, t_ex_profile, temperature_profile)
+        log.log(
+            _LOG_VERBOSE_1,
+            f"{self.species} T_ex (VMR adjusted) = {np.array2string(t_ex_profile, formatter=_LOG_ARRAY_FMT)}"
+        )
 
         g_np = self.states["g"].to_numpy()
         energy_np = self.states["energy"].to_numpy() << 1 / u.cm
@@ -2807,84 +3054,138 @@ class NLTEProcessor:
         hcE_on_kB = ac_h_c_on_kB * energy_np
 
         cutoff_mask = id_agg_np <= self.id_agg_cutoff
-
-        nlte_layer_slice = slice(self.n_lte_layers, None)
-        t_ex_vals = t_ex_profile[nlte_layer_slice]
-        t_k_vals = temperature_profile[nlte_layer_slice]
         n_nlte_layers = self.n_layers - self.n_lte_layers
-        nlte_layers = range(self.n_lte_layers, self.n_layers)
 
-        q_lte = g_np[None, :] * np.exp(-hcE_on_kB[None, :] / t_k_vals[:, None])
+        # NEW
+        q_lte = g_np[None, :] * np.exp(-hcE_on_kB[None, :] / temperature_profile[:, None])  # (n_layers, n_states)
         n_lte = q_lte / q_lte.sum(axis=1, keepdims=True)
-        n_agg_lte = np.zeros((n_nlte_layers, self.n_agg_states))
+
+        n_agg_lte = np.zeros((self.n_layers, self.n_agg_states), dtype=np.float64)
         np.add.at(n_agg_lte.T, id_agg_np, n_lte.T)
 
-        t_eff = np.where(cutoff_mask, t_ex_vals[:, None], t_k_vals[:, None])
-        q_eff = g_np[None, :] * np.exp(-hcE_on_kB[None, :] / t_eff)
-        n_eff = q_eff / q_eff.sum(axis=1, keepdims=True)
-        # This gives the aggregated populations using T_ex where needed, T_kin otherwise.
-        n_agg_eff = np.zeros((n_nlte_layers, self.n_agg_states))
-        # Witchcraft (adds each n_all to corresponding id_agg indices in n_agg_al, in place).
-        np.add.at(n_agg_eff.T, id_agg_np, n_eff.T)
-        # Equivalent to:
-        # n_agg_all = np.stack([
-        #     np.bincount(id_agg_np, weights=row, minlength=self.n_agg_states)
-        #     for row in n_all
-        # ])
-        # Why the fuck is it done like this?
-        # n_lte = self.states.select(
-        #     [f"n_L{layer_idx}" for layer_idx in nlte_layers]
-        # ).to_numpy().T
-        # n_agg_lte = np.stack([
-        #     (
-        #         self.states[f"n_agg_L{layer_idx}"].to_numpy()[:self.n_agg_states]
-        #         if f"n_agg_L{layer_idx}" in self.states.columns
-        #         else self.pop_matrix[0, layer_idx]
-        #     )[id_agg_np]
-        #     for layer_idx in nlte_layers
-        # ])
-        # n_agg_nlte = n_agg_all[:, id_agg_np]  # n_agg for every state at every layer.
-        # Map agg states back on to each state.
-        n_agg_eff_map = n_agg_eff[:, id_agg_np]
-        n_agg_lte_map = n_agg_lte[:, id_agg_np]
+        self._nlte_pop_frac = n_agg_lte[:, :self.id_agg_cutoff + 1].sum(axis=1)
 
-        scale_factor = np.divide(
-            n_agg_eff_map,
-            n_agg_lte_map,
-            out=np.zeros_like(n_agg_eff_map),
-            where=n_agg_lte_map != 0
+        q_nlte = np.zeros_like(q_lte)
+        q_nlte[:, cutoff_mask] = (
+                g_np[cutoff_mask][None, :] * np.exp(-hcE_on_kB[cutoff_mask][None, :] / t_ex_profile[:, None])
         )
-        # n_scaled = n_lte.copy()
-        # n_scaled[:, cutoff_mask] *= scale_factor[:, cutoff_mask]
-        n_scaled = n_lte * scale_factor
-        # The LTE pops have been rescaled here, though the relative strengths in these bands remains the same.
-        n_scaled /= n_scaled.sum(axis=1, keepdims=True)
+        # q_nlte = g_np[None, :] * np.exp(-hcE_on_kB[None, :] / t_ex_profile[:, None])
+        n_nlte = q_nlte / q_nlte.sum(axis=1, keepdims=True)
+        n_agg_nlte = np.zeros((self.n_layers, self.n_agg_states), dtype=np.float64)
+        np.add.at(n_agg_nlte.T, id_agg_np, n_nlte.T)
 
-        n_agg_final = np.zeros((n_nlte_layers, self.n_agg_states))
-        np.add.at(n_agg_final.T, id_agg_np, n_scaled.T)
+        # By using the cutoff_mask, states above the cutoff are already zero, and we're already normalised to 1 within
+        # the nLTE manifold.
+        # n_agg_nlte[:, self.id_agg_cutoff + 1:] = 0
+        n_agg_nlte *= self._nlte_pop_frac[:, None]  # / n_agg_nlte.sum(axis=1, keepdims=True)
 
-        # TODO: This is broken when there are null states in the grouping!
-        # self._nlte_pop_frac[nlte_layer_slice] = n_scaled[:, cutoff_mask].sum(axis=1)
-        self._nlte_pop_frac[nlte_layer_slice] = n_agg_final[:, :self.id_agg_cutoff + 1].sum(axis=1)
+        n_agg_final = n_agg_lte.copy()
+        n_agg_final[:, :self.id_agg_cutoff + 1] = n_agg_nlte[:, :self.id_agg_cutoff + 1]
+
+        n_final = n_lte.copy()
+        # n_agg_scale = n_agg_final / n_agg_lte
+        n_agg_scale = np.ones_like(n_agg_final)
+        # Protects against cases where n_agg_lte is 0.
+        np.divide(n_agg_final, n_agg_lte, out=n_agg_scale, where=n_agg_lte > 0)
+        n_final *= n_agg_scale[:, id_agg_np]
+
         log.log(_LOG_VERBOSE_2, f"{self.species} NLTE pop frac = {self._nlte_pop_frac}.")
-
-        t_ex_pop_grid = np.zeros((1, self.pop_matrix.shape[1], self.pop_matrix.shape[2]))
-        t_ex_pop_grid[0, :self.n_lte_layers] = self.pop_matrix[0, :self.n_lte_layers]
-        t_ex_pop_grid[0, nlte_layer_slice] = n_agg_final
-        log.log(_LOG_VERBOSE_2, f"{self.species} new pop grid sums = {t_ex_pop_grid[0].sum(axis=1)}")
+        log.log(_LOG_VERBOSE_2, f"{self.species} new pop grid sums = {n_agg_final.sum(axis=1)}")
 
         nlte_col_exprs = []
-        for idx, layer_idx in enumerate(nlte_layers):
+        for layer_idx in range(self.n_layers):
             nlte_col_exprs.extend([
-                # pl.Series(f"n_nlte_L{layer_idx}", n_scaled[idx]),
-                # pl.Series(f"n_agg_nlte_L{layer_idx}", n_agg_final[idx, id_agg_np]),
-                # TODO: TEST THIS! Set as new LTE.
-                pl.Series(f"n_L{layer_idx}", n_scaled[idx]),
-                pl.Series(f"n_agg_L{layer_idx}", n_agg_final[idx, id_agg_np]),
+                # TODO: Why exactly do we store this on LTE? There's something downstream that needs top pull these from
+                #  the LTE columns specifically but I'm not sure what.
+                #  I think it was in update_pops where they pops in self.states were rescaled based on the n_agg_LX
+                #  columns, but now that all the ratios are fixed as LTE I think we can write these to n_nlte_Lx.
+                # pl.Series(f"n_L{layer_idx}", n_final[layer_idx]),
+                # pl.Series(f"n_agg_L{layer_idx}", n_agg_final[layer_idx, id_agg_np]),
+                pl.Series(f"n_nlte_L{layer_idx}", n_final[layer_idx]),
+                pl.Series(f"n_agg_nlte_L{layer_idx}", n_agg_final[layer_idx, id_agg_np]),
             ])
-
         self.states = self.states.with_columns(nlte_col_exprs)
-        self.pop_matrix = np.vstack((self.pop_matrix, t_ex_pop_grid))
+
+        # n_agg_final[None, :] has shape (1, n_layers, n_agg_states) as required.
+        self.pop_matrix = np.vstack((self.pop_matrix, n_agg_final[None, :]))
+
+        #####
+        # nlte_layer_slice = slice(self.n_lte_layers, None)
+        # t_ex_vals = t_ex_profile[nlte_layer_slice]
+        # t_k_vals = temperature_profile[nlte_layer_slice]
+        # nlte_layers = range(self.n_lte_layers, self.n_layers)
+        #
+        # q_lte = g_np[None, :] * np.exp(-hcE_on_kB[None, :] / t_k_vals[:, None])
+        # n_lte = q_lte / q_lte.sum(axis=1, keepdims=True)
+        # n_agg_lte = np.zeros((n_nlte_layers, self.n_agg_states))
+        # np.add.at(n_agg_lte.T, id_agg_np, n_lte.T)
+        #
+        # t_eff = np.where(cutoff_mask, t_ex_vals[:, None], t_k_vals[:, None])
+        # q_eff = g_np[None, :] * np.exp(-hcE_on_kB[None, :] / t_eff)
+        # n_eff = q_eff / q_eff.sum(axis=1, keepdims=True)
+        # # This gives the aggregated populations using T_ex where needed, T_kin otherwise.
+        # n_agg_eff = np.zeros((n_nlte_layers, self.n_agg_states))
+        # # Witchcraft (adds each n_all to corresponding id_agg indices in n_agg_al, in place).
+        # np.add.at(n_agg_eff.T, id_agg_np, n_eff.T)
+        # # Equivalent to:
+        # # n_agg_all = np.stack([
+        # #     np.bincount(id_agg_np, weights=row, minlength=self.n_agg_states)
+        # #     for row in n_all
+        # # ])
+        # # Why the fuck is it done like this?
+        # # n_lte = self.states.select(
+        # #     [f"n_L{layer_idx}" for layer_idx in nlte_layers]
+        # # ).to_numpy().T
+        # # n_agg_lte = np.stack([
+        # #     (
+        # #         self.states[f"n_agg_L{layer_idx}"].to_numpy()[:self.n_agg_states]
+        # #         if f"n_agg_L{layer_idx}" in self.states.columns
+        # #         else self.pop_matrix[0, layer_idx]
+        # #     )[id_agg_np]
+        # #     for layer_idx in nlte_layers
+        # # ])
+        # # n_agg_nlte = n_agg_all[:, id_agg_np]  # n_agg for every state at every layer.
+        # # Map agg states back on to each state.
+        # n_agg_eff_map = n_agg_eff[:, id_agg_np]
+        # n_agg_lte_map = n_agg_lte[:, id_agg_np]
+        #
+        # scale_factor = np.divide(
+        #     n_agg_eff_map,
+        #     n_agg_lte_map,
+        #     out=np.zeros_like(n_agg_eff_map),
+        #     where=n_agg_lte_map != 0
+        # )
+        # # n_scaled = n_lte.copy()
+        # # n_scaled[:, cutoff_mask] *= scale_factor[:, cutoff_mask]
+        # n_scaled = n_lte * scale_factor
+        # # The LTE pops have been rescaled here, though the relative strengths in these bands remains the same.
+        # n_scaled /= n_scaled.sum(axis=1, keepdims=True)
+        #
+        # n_agg_final = np.zeros((n_nlte_layers, self.n_agg_states))
+        # np.add.at(n_agg_final.T, id_agg_np, n_scaled.T)
+        #
+        # # TODO: This is broken when there are null states in the grouping! What did this mean?
+        # # self._nlte_pop_frac[nlte_layer_slice] = n_scaled[:, cutoff_mask].sum(axis=1)
+        # self._nlte_pop_frac[nlte_layer_slice] = n_agg_final[:, :self.id_agg_cutoff + 1].sum(axis=1)
+        # log.log(_LOG_VERBOSE_2, f"{self.species} NLTE pop frac = {self._nlte_pop_frac}.")
+        #
+        # t_ex_pop_grid = np.zeros((1, self.pop_matrix.shape[1], self.pop_matrix.shape[2]))
+        # t_ex_pop_grid[0, :self.n_lte_layers] = self.pop_matrix[0, :self.n_lte_layers]
+        # t_ex_pop_grid[0, nlte_layer_slice] = n_agg_final
+        # log.log(_LOG_VERBOSE_2, f"{self.species} new pop grid sums = {t_ex_pop_grid[0].sum(axis=1)}")
+        #
+        # nlte_col_exprs = []
+        # for idx, layer_idx in enumerate(nlte_layers):
+        #     nlte_col_exprs.extend([
+        #         # pl.Series(f"n_nlte_L{layer_idx}", n_scaled[idx]),
+        #         # pl.Series(f"n_agg_nlte_L{layer_idx}", n_agg_final[idx, id_agg_np]),
+        #         # TODO: TEST THIS! Set as new LTE.
+        #         pl.Series(f"n_L{layer_idx}", n_scaled[idx]),
+        #         pl.Series(f"n_agg_L{layer_idx}", n_agg_final[idx, id_agg_np]),
+        #     ])
+        #
+        # self.states = self.states.with_columns(nlte_col_exprs)
+        # self.pop_matrix = np.vstack((self.pop_matrix, t_ex_pop_grid))
         # return t_ex_profile
 
     def precompute_all_cross_terms(
@@ -2927,27 +3228,50 @@ class NLTEProcessor:
             i_layer_grid: u.Quantity,
             lambda_layer_grid: npt.NDArray[np.float64],
             chem_profile: ChemicalProfile,
-            global_chi_matrix: u.Quantity,  # u.cm**2
-            global_source_func_matrix: u.Quantity,
+            effective_chi_matrix: u.Quantity,  # u.cm**2 - shielded (always non-negative), see effective_source_tau_mu.
             wn_grid: u.Quantity,
             wn_dx: u.Quantity,
             full_prec: bool,
     ) -> None:
         """
         Build statistical equilibrium matrix.
+
+        ``effective_chi_matrix`` must be the shielded effective opacity returned by the most recent call to
+        :func:`effective_source_tau_mu` for the current global chi/eta state (i.e. reflecting this layer's own
+        opacity as of just before it is solved this iteration), not the raw ``XSecCollection._global_chi_matrix``:
+        dividing by the raw matrix here would reintroduce the masing (negative/near-zero opacity) blow-ups that
+        ``effective_source_tau_mu`` already shields the radiative-transfer solve against - see the caller in
+        ``XSecCollection.compute_opacities_profile``.
         """
         num_grid = wn_grid.shape[0]
 
         species_eta: u.Quantity = chem_profile[self.species][layer_idx] * self.mol_eta_matrix[layer_idx] / ac.c
-        # species_eta = self.mol_eta_matrix[layer_idx] / ac.c
-        global_chi: u.Quantity = global_chi_matrix[layer_idx]  # / density_profile[layer_idx]
+        global_chi: u.Quantity = effective_chi_matrix[layer_idx]  # / density_profile[layer_idx]
         chi_mask = global_chi != 0
-        psi_approx_eta = np.zeros(num_grid) << global_source_func_matrix.unit
+        psi_approx_eta = np.zeros(num_grid) << i_layer_grid.unit
         psi_approx_eta[chi_mask] = (
                 lambda_layer_grid[chi_mask] * species_eta[chi_mask] / global_chi[chi_mask]
         )
-        psi_approx_eta = np.clip(abs(psi_approx_eta), 0, i_layer_grid)
+        # Do NOT take abs()/clamp psi_approx_eta before subtracting: lambda_layer_grid can legitimately go negative
+        # in masing regions, and i_layer_grid is built from the same underlying (bezier/tau) machinery, so at a
+        # given masing-affected grid point both tend to go negative together. Keeping psi_approx_eta's natural sign
+        # lets (i_layer_grid - psi_approx_eta) cancel correctly in that case (negative - negative); discarding the
+        # sign first would instead make the subtraction strictly more negative (negative - positive). psi_approx_eta
+        # is not used anywhere after this, so there's no need for it to be positive in its own right.
         i_prec: u.Quantity = (i_layer_grid - psi_approx_eta) * 4 * np.pi * u.sr
+        i_prec_negative_count = np.count_nonzero(i_prec.value < 0)
+        # Saturate, don't rescale: unlike effective_chi's masing shielding (where the magnitude of a negative value
+        # is physically meaningful - population inversion strength - and remapping to a smaller positive analog
+        # preserves that shape), a negative i_prec here just means this species' own local-emission estimate
+        # (psi_approx_eta) overshot the total available intensity even after the sign-preserving cancellation above -
+        # there's no meaningful shape to preserve by magnitude, so we saturate to 0 outright rather than rescaling.
+        i_prec = np.clip(i_prec, 0, None)
+        if i_prec_negative_count:
+            log.log(
+                _LOG_VERBOSE_1,
+                f"[L{layer_idx}] {self.species}: {i_prec_negative_count}/{num_grid} I_prec entries were negative "
+                f"before clamping."
+            )
 
         n_dim = self.id_agg_cutoff + 1
         self.y_matrix = np.zeros((n_dim, n_dim), dtype=np.float64) << (1 / u.s)
@@ -2962,6 +3286,7 @@ class NLTEProcessor:
             )
             psi_approx_cross = np.zeros((n_dim, num_grid), dtype=np.float64) << a_ox_cross_cache.unit / global_chi.unit
             shielded_lambda = np.clip(lambda_layer_grid, 0, 1)
+            # Lambda can legitimately be negative when masing, but it introduces exponential instabilities.
 
             psi_approx_cross[:, chi_mask] = (
                     shielded_lambda[chi_mask] * a_ox_cross_cache[:, chi_mask] / global_chi[chi_mask]
@@ -2971,13 +3296,16 @@ class NLTEProcessor:
             for trans_row in self.rates_grid.iter_rows(named=False):
                 # 0 = id_agg_f, 1 = id_agg_i, 2 = A_fi, 3 = B_fi, 4 = B_if.
                 if trans_row[0] > self.id_agg_cutoff or trans_row[1] > self.id_agg_cutoff:
-                    # Short-circuit for bands involving states above cutoff; these pops are fixed and including them on RHS
-                    # biases towards fixed distribution above cutoff.
+                    # Short-circuit for bands involving states above cutoff; these pops are fixed and including them on
+                    # RHS biases towards fixed distribution above cutoff.
                     continue
                 a_fi = trans_row[2] * einstein_a_unit
                 b_fi = trans_row[3] * einstein_b_unit
                 b_if = trans_row[4] * einstein_b_unit
-                log.debug(f"[L{layer_idx}] Trans: {trans_row}.")
+                log.log(
+                    _LOG_VERBOSE_2,
+                    f"[L{layer_idx}] Trans: {trans_row[0:2]}: {[f'{val:6.3E}' for val in trans_row[2:]]}."
+                )
 
                 # These are pop-normalised within the band, but redundant due to normalisation.
                 abs_profile, abs_start_idx = self.profile_store.get_profile(
@@ -3053,34 +3381,28 @@ class NLTEProcessor:
                     )
                     u_fi *= 1 - self_prec
                 # End cross.
-                # DEBUG:
-                # integrand = ste_profile_norm * i_prec[ste_start_idx: ste_end_idx]
-                # plt.plot(wn_grid[ste_start_idx: ste_end_idx], integrand)
-                # plt.xlim(left=wn_grid[ste_start_idx].value, right=wn_grid[ste_end_idx-1].value)
-                # plt.title(f"V_{trans_row[0], trans_row[1]}_prec")
-                # plt.xlabel(r"Wavenumbers (cm$^{-1}$)")
-                # plt.ylabel(f"Integrand ({integrand.unit:latex})")
-                # if np.all(integrand >= 0):
-                #     plt.yscale("log")
-                # plt.show()
-                # plt.close()
-                # log.info(f"DEBUG: ste/abs start/end idxs = {ste_start_idx, ste_end_idx, abs_start_idx, abs_end_idx}.")
-                ##############################
-
-                log.debug(f"[L{layer_idx}] U_{trans_row[0], trans_row[1]} = {u_fi}")
+                log.log(
+                    _LOG_VERBOSE_2, f"[L{layer_idx}] U_{trans_row[0], trans_row[1]} = {u_fi:{_LOG_FLOAT_FMT}}"
+                )
                 v_fi_prec = loglinear_integral_quantity_1d(
                     y_data=ste_profile_norm * i_prec[ste_start_idx: ste_end_idx],
                     dx=wn_dx[ste_start_idx: ste_end_idx - 1]
                 ) * b_fi
                 v_fi_prec = v_fi_prec.decompose()
-                log.debug(f"[L{layer_idx}] V_{trans_row[0], trans_row[1]}_prec = {v_fi_prec:{_LOG_FLOAT_FMT}}")
+                log.log(
+                    _LOG_VERBOSE_2,
+                    f"[L{layer_idx}] V_{trans_row[0], trans_row[1]}_prec = {v_fi_prec:{_LOG_FLOAT_FMT}}"
+                )
 
                 v_if_prec = loglinear_integral_quantity_1d(
                     y_data=abs_profile_norm * i_prec[abs_start_idx: abs_end_idx],
                     dx=wn_dx[abs_start_idx: abs_end_idx - 1]
                 ) * b_if
                 v_if_prec = v_if_prec.decompose()
-                log.debug(f"[L{layer_idx}] V_{trans_row[1], trans_row[0]}_prec = {v_if_prec:{_LOG_FLOAT_FMT}}")
+                log.log(
+                    _LOG_VERBOSE_2,
+                    f"[L{layer_idx}] V_{trans_row[1], trans_row[0]}_prec = {v_if_prec:{_LOG_FLOAT_FMT}}"
+                )
 
                 self.y_matrix[trans_row[0], trans_row[1]] += v_if_prec
                 self.y_matrix[trans_row[1], trans_row[0]] += u_fi + v_fi_prec
@@ -3095,8 +3417,8 @@ class NLTEProcessor:
                 # ))
                 for cont_trans_row in self._cont_rates.iter_rows(named=False):
                     if cont_trans_row[0] > self.id_agg_cutoff:
-                        # Short-circuit for bands involving states above cutoff; these pops are fixed and including them on
-                        # RHS biases towards fixed distribution above cutoff.
+                        # Short-circuit for bands involving states above cutoff; these pops are fixed and including them
+                        # on RHS biases towards fixed distribution above cutoff.
                         continue
 
                     a_ci = cont_trans_row[1] * einstein_a_unit
@@ -3139,7 +3461,10 @@ class NLTEProcessor:
                         dx=wn_dx[cont_abs_start_idx: cont_abs_end_idx - 1]
                     ) * b_ic
                     v_ic_prec = v_ic_prec.decompose()
-                    log.debug(f"[L{layer_idx}] V_{cont_trans_row[0]}c_prec = {v_ic_prec:{_LOG_FLOAT_FMT}}")
+                    log.log(
+                        _LOG_VERBOSE_2,
+                        f"[L{layer_idx}] V_{cont_trans_row[0]}c_prec = {v_ic_prec:{_LOG_FLOAT_FMT}}"
+                    )
 
                     limiting_species_num_dens = min(
                         (
@@ -3294,14 +3619,14 @@ class NLTEProcessor:
             n_iter: int,
     ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
         self.y_reduced_idx_map = np.where(np.abs(self.y_matrix).sum(axis=1) != 0)[0]
-        y_matrix_reduced = self.y_matrix[np.ix_(self.y_reduced_idx_map, self.y_reduced_idx_map)]
+        y_matrix_reduced = self.y_matrix[np.ix_(self.y_reduced_idx_map, self.y_reduced_idx_map)].value
         log.log(
-            _LOG_VERBOSE_2,
+            _LOG_VERBOSE_3,
             (
                 f"[L{layer_idx}] {self.species} Y matrix (before row-normalisation) =\n"
-                f"{np.array2string(y_matrix_reduced.value, formatter=_LOG_ARRAY_FMT)}\n"
+                f"{np.array2string(y_matrix_reduced, formatter=_LOG_ARRAY_FMT)}\n"
                 f"[L{layer_idx}] {self.species} Y matrix cond. (before row-normalisation) ="
-                f" {np.linalg.cond(y_matrix_reduced.value):{_LOG_FLOAT_FMT}}"
+                f" {np.linalg.cond(y_matrix_reduced):{_LOG_FLOAT_FMT}}"
             )
         )
         norm_factors = abs(y_matrix_reduced).sum(axis=1)[:, None]
@@ -3317,7 +3642,7 @@ class NLTEProcessor:
             )
 
         y_rect = np.vstack([y_matrix_reduced.copy(), np.ones(y_matrix_reduced.shape[1])])
-        rhs_rect = self.rhs_matrix[self.y_reduced_idx_map] / norm_factors[:, 0]
+        rhs_rect = self.rhs_matrix[self.y_reduced_idx_map].value / norm_factors[:, 0]
         rhs_rect = np.append(rhs_rect, 1)
 
         log.log(_LOG_VERBOSE_2, f"{self.species} Y matrix =\n{np.array2string(y_rect, precision=3)}")
@@ -3396,9 +3721,11 @@ class NLTEProcessor:
         )
         # TODO: In the case where T_ex has been approximated, the LTE pops above the cutoff have been rescaled!
         #  Use those somehow - if the degree of NLTE decreases from the first T_ex run then states above cutoff are
-        #  froxen into a more NLTE distribution.
+        #  frozen into a more NLTE distribution.
         #  In non-T_ex runs, n_nlte_col doesn't exist the first iteration to pull from - rebalance in
         #  the n_lte_col directly?
+        #  Update: Frozen above cutoff is fixed to LTE and above/below ratio is fixed to LTE, so no change. We will
+        #  always be scaling based on LTE so we can store T_ex in nLTE more appropriately.
         self.states = self.states.with_columns(
             pl.when(pl.col(n_agg_lte_col) == 0)
             .then(0)
@@ -3412,7 +3739,12 @@ class NLTEProcessor:
         log.log(
             _LOG_VERBOSE_2,
             (
-                f"[L{layer_idx}] {self.species} NLTE States = \n{self.states.select(log_col_names)}\n"
+                f"[L{layer_idx}] {self.species} NLTE States = \n{self.states.select(log_col_names)}"
+            )
+        )
+        log.log(
+            _LOG_VERBOSE_3,
+            (
                 f"[L{layer_idx}] Sum of LTE populations = {self.states[n_lte_col].sum()}.\n"
                 f"[L{layer_idx}] Sum of non-LTE populations = {self.states[n_nlte_col].sum()}."
             )
@@ -3430,7 +3762,7 @@ class NLTEProcessor:
             layer_pop_grid: npt.NDArray[np.float64] = None,
     ) -> None:
         if layer_pop_grid is None:
-            # Use for T_ex approximation when all new popualtions stored internally.
+            # Use for T_ex approximation when all new populations stored internally.
             layer_pop_grid = self.pop_matrix[-1, layer_idx]
 
         start_time = time.perf_counter()
@@ -3441,7 +3773,7 @@ class NLTEProcessor:
 
         if np.any(abs_xsec < 0):
             log.warning(
-                f"[L{layer_idx}] {self.species} Negative contribution in absorption (stimulated emission dominates)"
+                f"[L{layer_idx}] {self.species} Negative contribution in absorption."
             )
 
         if self._cont_states is not None and self.cont_trans_files is not None:
@@ -3528,7 +3860,7 @@ class NLTEProcessor:
                 n_lte_layers=self.n_lte_layers,
                 n_nlte_layers=n_nlte_layers,
                 temperature_profile=temperature_profile,
-                wn_grid=wn_grid.value,
+                wn_grid=wn_grid,
                 species_mass=self.species_mass,
                 reduced_mass=self.reduced_mass,
                 cont_box_length=self.cont_box_length,

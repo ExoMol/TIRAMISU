@@ -6,17 +6,25 @@ import numba
 
 from logging.handlers import QueueHandler, QueueListener
 
+# Workflow configurations.
 _DEFAULT_NUM_THREADS = 20
 _DEFAULT_CHUNK_SIZE = 10_000_000
 _PARQUET_BATCH_SIZE = 200_000_000
 _DASK_BLOCK_SIZE = "512MB"
 _N_GH_QUAD_POINTS = 30
 _INTENSITY_CUTOFF = 1e-100
+_VMR_THRESHOLD = 1e-20
+
+# Logging configurations
 _LOG_FLOAT_FMT = "6.3E"
 _LOG_ARRAY_FMT = {'float': lambda x: format(x, _LOG_FLOAT_FMT)}
 _LOG_VERBOSE_1 = logging.INFO - 1
 _LOG_VERBOSE_2 = logging.INFO - 2
 _LOG_VERBOSE_3 = logging.INFO - 3
+
+logging.addLevelName(_LOG_VERBOSE_1, "VERB1")
+logging.addLevelName(_LOG_VERBOSE_2, "VERB2")
+logging.addLevelName(_LOG_VERBOSE_3, "VERB3")
 
 os.environ["RUST_BACKTRACE"] = "1"
 
@@ -32,10 +40,13 @@ ctx = mp.get_context("spawn")
 log_queue = ctx.Queue()
 
 
-def setup_logging_main(logfile: str = "nlte.log", level: int = logging.INFO):
+def setup_logging_main(logfile: str = "nlte.log", level: int = logging.INFO, verbose: int | None = None):
     root = logging.getLogger()
     root.handlers.clear()
-    root.setLevel(level)
+    if verbose is not None:
+        root.setLevel(logging.INFO - verbose)
+    else:
+        root.setLevel(level)
 
     # Queue handler (thread/process safe).
     # queue_handler = QueueHandler(log_queue)

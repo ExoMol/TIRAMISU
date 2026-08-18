@@ -977,7 +977,8 @@ class ProfileStore:
         return loglinear_normalise_2d_nonnegative(y_data=all_profiles, dx=wn_dx) << 1 / wn_grid.unit
 
     def get_sorted_band_keys(
-            self, num_max: int, id_cutoff: int, agg_energies: npt.NDArray[np.float64], profile_type: str = "abs",
+            self, agg_energies: npt.NDArray[np.float64], profile_type: str = "abs",  id_cutoff: int = 0,
+            num_max: int = -1
     ) -> t.List[t.Tuple[int, int]]:
         """
         Returns band keys (id_agg_f, id_agg_i) from the CompactProfile for the given layer, sorted by energy gap
@@ -985,12 +986,60 @@ class ProfileStore:
 
         Parameters
         ----------
-        num_max : int
-            Maximum number of keys to return.
-        id_cutoff : int
-            ID above which states are fixed, so key pairs containing IDs above this should be excluded.
         agg_energies : ndarray
             Array containing the energies for each aggregate state ordered on id_agg (ascending).
+        profile_type : str
+            One of "abs", "ste", "spe" - selects which CompactProfile to inspect.
+        id_cutoff : int
+            ID above which states are fixed, so key pairs containing IDs above this should be excluded. If not provided,
+            returned keys include band keys involving the cutoff state.
+        num_max : int
+            Maximum number of keys to return. If not set to a psoitive value, return all band keys.
+
+        Returns
+        -------
+        List of (id_agg_f, id_agg_i) tuples in the above order.
+        """
+        match profile_type:
+            case "abs":
+                profiles = self.abs_profiles
+            case "ste":
+                profiles = self.ste_profiles
+            case "spe":
+                profiles = self.spe_profiles
+            case _:
+                raise ValueError(f"Unknown profile_type '{profile_type}': expected 'abs', 'ste' or 'spe'.")
+
+        key_sets = [set(compact.key_lookup.keys()) for compact in profiles]
+        common_keys = key_sets[0].intersection(*key_sets[1:])
+        if id_cutoff > 0:
+            common_keys = [k for k in common_keys if id_cutoff >= k[0] > k[1] >= 0]
+        else:
+            common_keys = [k for k in common_keys if k[0] > k[1] >= 0]
+
+        def sort_key(k):
+            id_f, id_i = k
+            e_i = agg_energies[id_i]  # lower state energy
+            e_f = agg_energies[id_f]  # upper state energy
+            nu = e_f - e_i  # band centre frequency
+            return e_i, nu
+
+        common_keys.sort(key=sort_key)
+        if num_max > 0:
+            return common_keys[:num_max]
+        else:
+            return common_keys
+
+
+    def get_cutoff_band_keys(
+            self, id_cutoff: int, profile_type: str = "abs",
+    ) -> t.List[t.Tuple[int, int]]:
+        """
+
+        Parameters
+        ----------
+        id_cutoff : int
+            ID above which states are fixed, so key pairs containing IDs above this should be excluded.
         profile_type : str
             One of "abs", "ste", "spe" - selects which CompactProfile to inspect.
 
@@ -1010,18 +1059,9 @@ class ProfileStore:
 
         key_sets = [set(compact.key_lookup.keys()) for compact in profiles]
         common_keys = key_sets[0].intersection(*key_sets[1:])
-        common_keys = [k for k in common_keys if id_cutoff >= k[0] > k[1] >= 0]
+        common_keys = [k for k in common_keys if k[0] == id_cutoff or k[1] == id_cutoff]
 
-        def sort_key(k):
-            id_f, id_i = k
-            e_i = agg_energies[id_i]  # lower state energy
-            e_f = agg_energies[id_f]  # upper state energy
-            nu = e_f - e_i  # band centre frequency
-            return e_i, nu
-
-        common_keys.sort(key=sort_key)
-
-        return common_keys[:num_max]
+        return common_keys
 
 
 class ContinuumProfileStore:
@@ -1177,7 +1217,15 @@ def abs_emi_xsec(
         dtype=np.float64,
     )
     for l in range(n_nlte_layers):
-        n_lookup[state_ids, l] = states[f"n_nlte_L{n_lte_layers + l}"].to_numpy()
+        nlte_col = f"n_nlte_L{n_lte_layers + l}"
+        lte_col = f"n_L{n_lte_layers + l}"
+        # We need to check for the existence of the nLTE column here because n_nlte_Lx doesn't exist in layers that are
+        # marked as skipped due to negligible VMR; these layers are unchanged so we use the LTE values.
+        if nlte_col in states.columns:
+            n_lookup[state_ids, l] = states[nlte_col].to_numpy()
+        else:
+            n_lookup[state_ids, l] = states[lte_col].to_numpy()
+
     n_lookup = np.ascontiguousarray(n_lookup)
 
     g_lookup = np.zeros(max_state_id + 1, dtype=np.float64)
@@ -1212,7 +1260,7 @@ def abs_emi_xsec(
                 states_f=states_f,
                 wn_min=wn_min,
                 wn_max=wn_max,
-                parquet_batch_size=_PARQUET_BATCH_SIZE // 10,
+                parquet_batch_size=_PARQUET_BATCH_SIZE // 3,
                 dask_dtypes=dask_dtypes,
                 do_super_lines=do_super_lines,
         ):
@@ -1308,7 +1356,8 @@ def continuum_xsec(
     temperature_slice = temperature_profile[n_lte_layers:].value  # (n_nlte_layers,)
 
     n_cols = [f"n_nlte_L{n_lte_layers + nlte_idx}" for nlte_idx in range(n_nlte_layers)]
-    select_cols = ["id", "g", "v"] + n_cols
+    # select_cols = ["id", "g", "v"] + n_cols
+    select_cols = ["id"] + n_cols  # g and v are stored on cont_states.
     cont_states = cont_states.join(states.select(select_cols), on="id", how="left")
 
     invariant_cols = ["id", "energy", "id_agg"]
@@ -1343,18 +1392,26 @@ def continuum_xsec(
         dtype=np.float64,
     )
     for l in range(n_nlte_layers):
-        n_lookup[state_ids, l] = cont_states[f"n_nlte_L{n_lte_layers + l}"].to_numpy()
+        nlte_col = f"n_nlte_L{n_lte_layers + l}"
+        lte_col = f"n_L{n_lte_layers + l}"
+        # We need to check for the existence of the nLTE column here because n_nlte_Lx doesn't exist in layers that are
+        # marked as skipped due to negligible VMR; these layers are unchanged so we use the LTE values.
+        if nlte_col in states.columns:
+            n_lookup[state_ids, l] = cont_states[nlte_col].to_numpy()
+        else:
+            n_lookup[state_ids, l] = cont_states[lte_col].to_numpy()
     n_lookup = np.ascontiguousarray(n_lookup)
 
     g_lookup = np.zeros(max_state_id + 1, dtype=np.float64)
     g_lookup[state_ids] = cont_states["g"].to_numpy()
     g_lookup = np.ascontiguousarray(g_lookup)
+    zero_g_map = g_lookup == 0
     inv_g_lookup = np.zeros_like(g_lookup)
-    inv_g_lookup[1:] = 1.0 / g_lookup[1:]
+    inv_g_lookup[~zero_g_map] = 1.0 / g_lookup[~zero_g_map]
     inv_g_lookup = np.ascontiguousarray(inv_g_lookup)
 
     v_lookup = np.zeros(max_state_id + 1, dtype=np.float64)
-    v_lookup[state_ids] = cont_states["tau"].to_numpy()
+    v_lookup[state_ids] = cont_states["v"].to_numpy()
     v_lookup = np.ascontiguousarray(v_lookup)
 
     # Super-lines accumulator.
@@ -1372,7 +1429,7 @@ def continuum_xsec(
                 states_f=states_f,
                 wn_min=wn_min,
                 wn_max=wn_max,
-                parquet_batch_size=_PARQUET_BATCH_SIZE // 10,
+                parquet_batch_size=_PARQUET_BATCH_SIZE // 3,
                 dask_dtypes=dask_dtypes,
                 do_super_lines=do_super_lines,
         ):

@@ -20,8 +20,8 @@ const_h_c_on_kB = ac_h_c_on_kB.value
 @dataclass
 class RateTransition:
     """Single collisional rate transition."""
-    upper_key: int | t.Tuple[str, int] | t.Tuple[int, int, int, str]
-    lower_key: int | t.Tuple[str, int] | t.Tuple[int, int, int, str]
+    upper_key: int | t.Tuple[str, int] | t.Tuple[int, int, int, str] | t.Tuple[int, int, int]
+    lower_key: int | t.Tuple[str, int] | t.Tuple[int, int, int, str] | t.Tuple[int, int, int]
     rate: float  # cm^3/s
     mol_depend: str  # Collision partner species
 
@@ -67,6 +67,18 @@ class CollisionalRatesDatabase:
             collision_partners={"H2"}
         ),
     }
+
+    # Whether H2O collisional rates/state keys distinguish ortho/para at all. H2O+H2 is the only collision
+    # partner with isomer-resolved rate data (Faure & Josselin 2008); every other partner (H2O, He, H) below is
+    # only ever measured/estimated as a single isomer-unresolved rate, applied identically to both ortho and
+    # para as a stand-in. When False, state keys drop the isomer label entirely (``(v1, v2, v3)`` instead of
+    # ``(v1, v2, v3, 'o'/'p')``), matching an H2O NLTEProcessor configured with an isomer-unresolved
+    # ``agg_col_nums`` (3 columns instead of 4): the H2O+H2 rates are combined down via nuclear-spin
+    # statistical-weight averaging (see _get_h2o_rates) and every other partner's rate is emitted once instead
+    # of duplicated per isomer. This must match whatever aggregation scheme the H2O NLTEProcessor is built
+    # with - the lookup in NLTEProcessor._build_agg_state_lookup keys purely on the aggregation columns, so a
+    # mismatched isomer-vs-no-isomer key shape here will silently fail to match any state.
+    H2O_RESOLVE_ORTHO_PARA: bool = True
 
     @classmethod
     def has_rates(cls, species: str) -> bool:
@@ -883,12 +895,23 @@ class CollisionalRatesDatabase:
     @staticmethod
     def _get_h2o_rates(layer_temp: float) -> t.List[RateTransition]:
         """
-        H2O + H2 vibrational collisional rate coefficients.
+        H2O collisional rate coefficients (H2, H2O, He, H collision partners).
 
-        Data source: aggregated rates from quantum scattering calculations, summed over all rotational sub-states
-        (J, Ka, Kc) for ortho- and para-H2O separately.  Reference temperatures: 200–5000 K.
+        H2O+H2 data source: aggregated rates from quantum scattering calculations, summed over all rotational
+        sub-states (J, Ka, Kc) for ortho- and para-H2O separately (Faure & Josselin 2008). Reference
+        temperatures: 200-5000 K. This is the only partner with isomer-resolved data; every other partner below
+        has just one isomer-unresolved rate per transition.
 
-        State keys follow the convention ``(v1, v2, v3, isomer)`` where isomer is ``"o"`` (ortho) or ``"p"`` (para), and
+        State keys depend on ``CollisionalRatesDatabase.H2O_RESOLVE_ORTHO_PARA``:
+
+        - ``True`` (default): keys are ``(v1, v2, v3, isomer)`` with ``isomer`` ``"o"``/``"p"``. H2O+H2 uses its
+          real isomer-resolved rates; every other partner's single rate is duplicated identically onto both
+          isomer labels.
+        - ``False``: keys are ``(v1, v2, v3)`` with no isomer distinction at all - matching an H2O NLTEProcessor
+          built with a 3-column (v1, v2, v3) ``agg_col_nums`` instead of 4. H2O+H2's ortho/para rates are
+          combined via nuclear-spin statistical-weight averaging (3:1) into one rate per transition; every other
+          partner's rate is emitted once instead of duplicated.
+
         (v1, v2, v3) are the symmetric-stretch, bend, and asymmetric-stretch vibrational quantum numbers.
 
         Rates are interpolated log-linearly via ``_interp_rate``.
@@ -1078,22 +1101,44 @@ class CollisionalRatesDatabase:
                  1.3123240000000009e-13, 1.9334020000000025e-13, 3.573410000000009e-13]),
         }
 
-        rates = []
-        h2o_h2_isomer_datasets: t.List[t.Tuple[str, t.Dict]] = [
-            ("o", h2o_h2_ortho_rates),
-            ("p", h2o_h2_para_rates),
-        ]
+        resolve_isomer = CollisionalRatesDatabase.H2O_RESOLVE_ORTHO_PARA
 
-        for isomer_label, rate_dict in h2o_h2_isomer_datasets:
-            for (v1u, v2u, v3u, v1l, v2l, v3l), rate_array in rate_dict.items():
+        def _make_keys(v1u, v2u, v3u, v1l, v2l, v3l, isomer_label):
+            if resolve_isomer:
+                return (v1u, v2u, v3u, isomer_label), (v1l, v2l, v3l, isomer_label)
+            return (v1u, v2u, v3u), (v1l, v2l, v3l)
+
+        rates = []
+        if resolve_isomer:
+            h2o_h2_isomer_datasets: t.List[t.Tuple[str, t.Dict]] = [
+                ("o", h2o_h2_ortho_rates),
+                ("p", h2o_h2_para_rates),
+            ]
+            for isomer_label, rate_dict in h2o_h2_isomer_datasets:
+                for (v1u, v2u, v3u, v1l, v2l, v3l), rate_array in rate_dict.items():
+                    interpolated_rate = CollisionalRatesDatabase._interp_rate(
+                        layer_temp, h2o_h2_t_list, rate_array
+                    )
+                    upper_key, lower_key = _make_keys(v1u, v2u, v3u, v1l, v2l, v3l, isomer_label)
+                    rates.append(RateTransition(
+                        upper_key=upper_key, lower_key=lower_key, rate=interpolated_rate, mol_depend="H2",
+                    ))
+        else:
+            # Nuclear-spin statistical weights: ortho (triplet, g=3) : para (singlet, g=1) = 3:1, the natural
+            # equilibrium ortho:para mixing ratio. This is how an isomer-unresolved bulk measurement (like the
+            # H2O/He/H partner data below) would implicitly average over the two isomers if both were present
+            # in a real gas sample, so it's the natural way to collapse this one isomer-resolved dataset down to
+            # match the rest, rather than an unweighted mean. Combined before interpolation (not after), so the
+            # log-linear temperature interpolation only ever sees one physically-consistent rate array.
+            for (v1u, v2u, v3u, v1l, v2l, v3l), ortho_array in h2o_h2_ortho_rates.items():
+                para_array = h2o_h2_para_rates[(v1u, v2u, v3u, v1l, v2l, v3l)]
+                combined_array = (3.0 * ortho_array + 1.0 * para_array) / 4.0
                 interpolated_rate = CollisionalRatesDatabase._interp_rate(
-                    layer_temp, h2o_h2_t_list, rate_array
+                    layer_temp, h2o_h2_t_list, combined_array
                 )
+                upper_key, lower_key = _make_keys(v1u, v2u, v3u, v1l, v2l, v3l, None)
                 rates.append(RateTransition(
-                    upper_key=(v1u, v2u, v3u, isomer_label),
-                    lower_key=(v1l, v2l, v3l, isomer_label),
-                    rate=interpolated_rate,
-                    mol_depend="H2",
+                    upper_key=upper_key, lower_key=lower_key, rate=interpolated_rate, mol_depend="H2",
                 ))
 
         # Data from P. F. Zittel & D. E. Masturzo (1998), doi:10.1063/1.456122
@@ -1189,57 +1234,51 @@ class CollisionalRatesDatabase:
             # (2,2,0),(0,2,2) is next, get into actual data.
         }
 
-        for isomer_label in ("o", "p"):
+        # Every partner below has no isomer-resolved data of its own - it's applied identically to both isomers
+        # when resolve_isomer is True (duplicated), or emitted once per transition when False (isomer-unresolved
+        # state keys, matching an H2O NLTEProcessor built with a 3-column agg_col_nums).
+        isomer_labels = ("o", "p") if resolve_isomer else (None,)
+        for isomer_label in isomer_labels:
             for (v1u, v2u, v3u, v1l, v2l, v3l), rate_array in h2o_h2o_stretch_t_depend_rates.items():
                 interpolated_rate = CollisionalRatesDatabase._interp_rate(
                     layer_temp, h2o_h2o_stretch_t_list, rate_array
                 )
+                upper_key, lower_key = _make_keys(v1u, v2u, v3u, v1l, v2l, v3l, isomer_label)
                 rates.append(RateTransition(
-                    upper_key=(v1u, v2u, v3u, isomer_label),
-                    lower_key=(v1l, v2l, v3l, isomer_label),
-                    rate=interpolated_rate,
-                    mol_depend="H2O",
+                    upper_key=upper_key, lower_key=lower_key, rate=interpolated_rate, mol_depend="H2O",
                 ))
 
             for (v1u, v2u, v3u, v1l, v2l, v3l), rate_array in h2o_h2o_bend_t_depend_rates.items():
                 interpolated_rate = CollisionalRatesDatabase._interp_rate(
                     layer_temp, h2o_h2o_bend_t_list, rate_array
                 )
+                upper_key, lower_key = _make_keys(v1u, v2u, v3u, v1l, v2l, v3l, isomer_label)
                 rates.append(RateTransition(
-                    upper_key=(v1u, v2u, v3u, isomer_label),
-                    lower_key=(v1l, v2l, v3l, isomer_label),
-                    rate=interpolated_rate,
-                    mol_depend="H2O",
+                    upper_key=upper_key, lower_key=lower_key, rate=interpolated_rate, mol_depend="H2O",
                 ))
 
             for (v1u, v2u, v3u, v1l, v2l, v3l), rate_array in h2o_he_stretch_t_depend_rates.items():
                 interpolated_rate = CollisionalRatesDatabase._interp_rate(
                     layer_temp, h2o_he_stretch_t_list, rate_array
                 )
+                upper_key, lower_key = _make_keys(v1u, v2u, v3u, v1l, v2l, v3l, isomer_label)
                 rates.append(RateTransition(
-                    upper_key=(v1u, v2u, v3u, isomer_label),
-                    lower_key=(v1l, v2l, v3l, isomer_label),
-                    rate=interpolated_rate,
-                    mol_depend="He",
+                    upper_key=upper_key, lower_key=lower_key, rate=interpolated_rate, mol_depend="He",
                 ))
 
             for (v1u, v2u, v3u, v1l, v2l, v3l), rate_array in h2o_he_bend_t_depend_rates.items():
                 interpolated_rate = CollisionalRatesDatabase._interp_rate(
                     layer_temp, h2o_he_bend_t_list, rate_array
                 )
+                upper_key, lower_key = _make_keys(v1u, v2u, v3u, v1l, v2l, v3l, isomer_label)
                 rates.append(RateTransition(
-                    upper_key=(v1u, v2u, v3u, isomer_label),
-                    lower_key=(v1l, v2l, v3l, isomer_label),
-                    rate=interpolated_rate,
-                    mol_depend="He",
+                    upper_key=upper_key, lower_key=lower_key, rate=interpolated_rate, mol_depend="He",
                 ))
 
             for (v1u, v2u, v3u, v1l, v2l, v3l), rate in h2o_h_rates.items():
+                upper_key, lower_key = _make_keys(v1u, v2u, v3u, v1l, v2l, v3l, isomer_label)
                 rates.append(RateTransition(
-                    upper_key=(v1u, v2u, v3u, isomer_label),
-                    lower_key=(v1l, v2l, v3l, isomer_label),
-                    rate=rate,
-                    mol_depend="H",
+                    upper_key=upper_key, lower_key=lower_key, rate=rate, mol_depend="H",
                 ))
 
         return rates
