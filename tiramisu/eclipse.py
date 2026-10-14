@@ -2,113 +2,22 @@ import logging
 import typing as t
 import numpy.typing as npt
 from astropy import units as u
-from astropy import constants as ac
 import numpy as np
 
 from .chemistry import ChemicalProfile, SpeciesFormula
-from .atmos import (
-    build_pressure_profiles,
-    planet_gravity,
-    density_profile,
-    solve_scaleheight,
-)
+from .atmos import build_pressure_profiles, density_profile, hydrostatic_radii
 from .xsec import XSecCollection
-from .nlte import blackbody, formal_solve_general
+from .nlte import (effective_source_tau_mu, four_pi_j_hemispheres, four_pi_j_spherical, emergent_flux,
+                   emergent_flux_spherical, mu_quadrature, spherical_rays)
 from .config import output_dir
 
 log = logging.getLogger(__name__)
 
 
-def emission_quadratures(
-        ngauss: int,
-) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-    """Compute the emission quadratures.
-
-    Args:
-        ngauss: Number of gauss points
-
-    Returns:
-        t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]: abscissa and weights
-    """
-    mu, weight = np.polynomial.legendre.leggauss(ngauss)
-    return (mu + 1) * 0.5, weight / 2
-
-
-def emission_1d(
-        dtau: u.Quantity,
-        mu_tau: npt.NDArray[np.float64],
-        source_function: u.Quantity,
-) -> t.Tuple[u.Quantity, u.Quantity]:
-    """1D emission.
-
-    Args:
-        dtau: Optical depth for each layer
-        mu_tau: Cosine of the angle between the ray and the normal
-        source_function: Source function
-
-    Returns:
-        t.Tuple[u.Quantity, u.Quantity]: Emission at each quadrature and optical depth
-
-    """
-    # dtau goes from boa to toa so we need to reverse it
-    dtau_toa = dtau[::-1]
-
-    inv_mu = 1 / mu_tau
-
-    tau = dtau_toa.cumsum(axis=0)[::-1]
-
-    layer_tau = tau - dtau
-
-    emission_tau = np.exp(-layer_tau.value) - np.exp(-tau.value)
-
-    intensity = (
-                        np.exp(-inv_mu[:, None, None] * layer_tau[None, ...].value)
-                        - np.exp(-inv_mu[:, None, None] * tau[None, ...].value)
-                ) * source_function[None, ...]
-
-    surface = np.exp(-inv_mu[:, None] * tau[None, 0, ...].value) * source_function[None, 0]
-
-    return intensity.sum(axis=1) + surface, emission_tau
-
-
-def boa_toa_optical_depth(xsec_opacity: t.List[u.Quantity], dz: u.Quantity) -> u.Quantity:
-    """Compute the boa to toa optical depth.
-
-    Args:
-        xsec_opacity: Cross-section opacity
-        dz: Layer thickness
-
-    Returns:
-        npt.NDArray[np.float64]: Optical depth for the layer
-    """
-    sum_opacity = sum(xsec_opacity)
-    res = sum_opacity * dz[:, None]
-    return res.decompose()
-
-
-def integrate_emission_quadrature(
-        emission_mu: u.Quantity,
-        mu_tau: npt.NDArray[np.float64],
-        mu_weights: npt.NDArray[np.float64],
-) -> u.Quantity:
-    """
-    Deprecated. See :func:`formal_solve_general` for the current implementation.
-
-    :param emission_mu:
-    :param mu_tau:
-    :param mu_weights:
-    :return:
-    """
-    emission_mu = emission_mu
-
-    return 2 * np.pi * (emission_mu * mu_tau[:, None] * mu_weights[:, None]).sum(axis=0) * u.sr
-
-
 class ExoplanetEmission:
     __slots__ = [
-        "planet_mass", "planet_radius", "boa_pressure", "toa_pressure", "nlayers", "chemistry_profile",
-        "temperature_profile", "ngauss", "central_pressure", "pressure_levels", "planet_gravity", "altitude",
-        "scale_height", "gravity", "dz", "density",
+        "planet_mass", "planet_radius", "chemistry_profile", "temperature_profile", "central_pressure",
+        "pressure_levels", "dz", "density", "geometry", "interface_radii",
     ]
 
     def __init__(
@@ -120,54 +29,69 @@ class ExoplanetEmission:
             toa_pressure: u.Quantity,
             nlayers: int,
             chemistry_profile: ChemicalProfile,
-            ngauss: int = 4,
             central_pressure: u.Quantity = None,
             pressure_levels: u.Quantity = None,
+            geometry: str = "plane_parallel",
+            reference_pressure: u.Quantity = None,
     ):
+        """
+        ``planet_radius`` is the radius at ``reference_pressure``, which must lie within the pressure grid; by default
+        the bottom interface (``pressure_levels[0]``, or ``boa_pressure`` when the levels are built here from
+        ``boa_pressure``, ``toa_pressure`` and ``nlayers``). The layers are in hydrostatic equilibrium with
+        g(r) = G M / r^2 (:func:`tiramisu.atmos.hydrostatic_radii`). For a measured transit radius, use the pressure
+        it probes (the optical transit photosphere is ~1-20 mbar). The emission spectrum is normalised to
+        ``planet_radius``: the flux received at distance d is (planet_radius / d)^2 times it.
 
+        ``geometry`` sets the radiative transfer for the NLTE solution and the emission spectrum: ``"plane_parallel"``
+        (the same directions at every layer) or ``"spherical"`` (rays through the concentric shells, see
+        :func:`tiramisu.nlte.spherical_rays`). Transmission chords are always spherical.
+        """
+        if geometry not in ("plane_parallel", "spherical"):
+            raise ValueError(f"geometry must be 'plane_parallel' or 'spherical', not {geometry!r}.")
+        if central_pressure is None or pressure_levels is None:
+            pressure_levels, central_pressure = build_pressure_profiles(
+                boa_pressure=boa_pressure, toa_pressure=toa_pressure, nlayers=nlayers
+            )
+        self.interface_radii = hydrostatic_radii(
+            temperature=temperature_profile,
+            pressure_levels=pressure_levels,
+            mu_profile=chemistry_profile.mean_molecular_weight,
+            planet_mass=planet_mass,
+            planet_radius=planet_radius,
+            reference_pressure=pressure_levels[0] if reference_pressure is None else reference_pressure,
+        )
+        self.dz = np.diff(self.interface_radii)
+        self.geometry = geometry
         self.planet_mass = planet_mass
         self.planet_radius = planet_radius
-        self.boa_pressure = boa_pressure
-        self.toa_pressure = toa_pressure
-        self.nlayers = nlayers
         self.chemistry_profile = chemistry_profile
         self.temperature_profile = temperature_profile
-        self.ngauss = ngauss
-        self.central_pressure = central_pressure
         self.pressure_levels = pressure_levels
-        self.build_atmosphere()
+        self.central_pressure = central_pressure
+        self.density = density_profile(temperature=temperature_profile, central_pressure=central_pressure)
 
-    def build_atmosphere(self):
-        self.planet_gravity = planet_gravity(self.planet_mass, self.planet_radius)
-
-        if self.central_pressure is None or self.pressure_levels is None:
-            self.pressure_levels, self.central_pressure = build_pressure_profiles(
-                self.boa_pressure, self.toa_pressure, self.nlayers
-            )
-
-        self.altitude, self.scale_height, self.gravity, self.dz = solve_scaleheight(
-            self.temperature_profile,
-            self.pressure_levels,
-            self.chemistry_profile.mean_molecular_weight,
-            self.planet_gravity,
-        )
-
-        self.density = density_profile(self.temperature_profile, self.central_pressure)
+    @property
+    def _nlte_interface_radii(self) -> t.Optional[u.Quantity]:
+        return self.interface_radii if self.geometry == "spherical" else None
 
     def compute_emission(
             self,
             xsecs: XSecCollection,
             spectral_grid: t.Optional[u.Quantity] = None,
             output_intensity: bool = False,
-            incident_radiation_field: u.Quantity = None,
-    ) -> t.Tuple[u.Quantity, u.Quantity, u.Quantity, npt.NDArray[np.float64], t.Dict[SpeciesFormula, u.Quantity]]:
-
+            incident_radiation_field: t.Union[u.Quantity, t.Callable[..., u.Quantity], None] = None,
+    ) -> t.Tuple[u.Quantity, u.Quantity, npt.NDArray[np.float64], t.Dict[SpeciesFormula, u.Quantity]]:
+        """
+        Returns the spectral grid, the emergent flux [W / (m^2 Hz)] (:func:`tiramisu.nlte.emergent_flux`, or
+        :func:`tiramisu.nlte.emergent_flux_spherical` normalised to ``planet_radius``), the per-layer optical depth and
+        the per-species opacities. With ``output_intensity``, also writes the emergent flux and the hemispheric 4*pi*J
+        profiles (at interfaces, :func:`tiramisu.nlte.four_pi_j_hemispheres`, or at layer centres,
+        :func:`tiramisu.nlte.four_pi_j_spherical`) to ``output_dir``. ``incident_radiation_field`` is as for
+        :class:`tiramisu.xsec.XSecCollection`.
+        """
         if spectral_grid is None:
             spectral_grid = xsecs.unified_grid
 
-        spectral_grid = spectral_grid
-
-        # self.mu_tau, self.mu_weights = emission_quadratures(4)
         opacities = xsecs.compute_opacities_profile(
             chem_profile=self.chemistry_profile,
             density_profile=self.density,
@@ -175,63 +99,62 @@ class ExoplanetEmission:
             temperature=self.temperature_profile,
             pressure=self.central_pressure,
             spectral_grid=spectral_grid,
+            interface_radii=self._nlte_interface_radii,
         )
-        source_func, global_chi, global_eta = self.source_function(spectral_grid, xsecs)
-        np.save(
-            fr"/mnt/c/PhD/NLTE/Models/KELT-20b/approximation/ohx1e0_source.npy",
-            source_func.value
-        )
+        source_func, global_chi = self.source_function(xsecs=xsecs)
 
-        mu_values, mu_weights = np.polynomial.legendre.leggauss(50)
-        mu_values, mu_weights = (mu_values + 1) * 0.5, mu_weights / 2
         res = global_chi * self.density[:, None] * self.dz[:, None]
         dtau = res.decompose().value
-        # tau = dtau[::-1].cumsum(axis=0)[::-1]
-        i_up, i_down = formal_solve_general(
-            dtau=dtau,
-            source_function=source_func,
-            mu_values=mu_values,
-            mu_weights=mu_weights,
-            incident_radiation_field=incident_radiation_field,
-        )
+        spherical = self.geometry == "spherical"
+        if spherical:
+            flux_up = emergent_flux_spherical(dtau=dtau, source_function=source_func,
+                                              interface_radii=self.interface_radii, planet_radius=self.planet_radius)
+        else:
+            mu_values, mu_weights = mu_quadrature()
+            flux_up = emergent_flux(dtau=dtau, source_function=source_func, mu_values=mu_values,
+                                    mu_weights=mu_weights)
 
         if output_intensity:
-            if xsecs._is_converged:
-                out_name = "KELT-20b_nLTE_intensity_"
+            if spherical:
+                rays = spherical_rays(interface_radii=self.interface_radii)
+                incident = incident_radiation_field
+                if callable(incident):
+                    incident = incident(mu_values=rays.mu[-1], mu_weights=rays.weights[-1])
+                four_pi_j_up, four_pi_j_down = four_pi_j_spherical(
+                    dtau=dtau, source_function=source_func, rays=rays, incident_radiation_field=incident,
+                )
             else:
-                out_name = "KELT-20b_LTE_intensity_"
-            up_name = out_name + "up.txt"
-            np.savetxt(
-                (output_dir / up_name).resolve(),
-                i_up.value,
-                fmt="%17.8E",
-            )
-            down_name = out_name + "down.txt"
-            np.savetxt(
-                (output_dir / down_name).resolve(),
-                i_down.value,
-                fmt="%17.8E",
-            )
+                incident = incident_radiation_field
+                if callable(incident):
+                    incident = incident(mu_values=mu_values, mu_weights=mu_weights)
+                four_pi_j_up, four_pi_j_down = four_pi_j_hemispheres(
+                    dtau=dtau,
+                    source_function=source_func,
+                    mu_values=mu_values,
+                    mu_weights=mu_weights,
+                    incident_radiation_field=incident,
+                )
+            out_name = "KELT-20b_nLTE_" if xsecs._is_converged else "KELT-20b_LTE_"
+            # emergent_flux [W/(m^2 Hz)]; four_pi_j_up/down [J/m^2], bottom first, at every interface (plane-parallel)
+            # or layer centre (spherical).
+            for name, quantity in (
+                    ("emergent_flux", flux_up), ("four_pi_j_up", four_pi_j_up), ("four_pi_j_down", four_pi_j_down)
+            ):
+                np.save((output_dir / f"{out_name}{name}.npy").resolve(), quantity.value)
 
-        # return spectral_grid, emission, emission_tau, opacities
-        return spectral_grid, i_up, i_down, dtau, opacities
+        return spectral_grid, flux_up, dtau, opacities
 
-    def source_function(
-            self, spectral_grid: u.Quantity, xsecs: XSecCollection,
-    ) -> t.Tuple[u.Quantity, u.Quantity, u.Quantity]:
-        lte_source_func = blackbody(spectral_grid, self.temperature_profile)
-
-        negative_chi_cap = - 1e-6 * xsecs._global_chi_matrix.max(axis=1)[:, None]
-        effective_chi = np.clip(xsecs._global_chi_matrix, min=negative_chi_cap)
-        negative_source_func_cap = - lte_source_func.max(axis=1)[:, None]
-
-        effective_source_func = (xsecs._global_eta_matrix / (ac.c * effective_chi)).to(u.J / (u.sr * u.m ** 2),
-                                                                                       equivalencies=u.spectral())
-        # Limit the effects of stimulated emission to avoid exponential overflows.
-        # combined_source_func[combined_source_func < negative_source_func_cap] = negative_source_func_cap
-        effective_source_func = np.clip(effective_source_func, min=negative_source_func_cap)
-
-        return effective_source_func, effective_chi, xsecs._global_eta_matrix
+    def source_function(self, xsecs: XSecCollection) -> t.Tuple[u.Quantity, u.Quantity]:
+        """Source function and opacity of the last ``xsecs.compute_opacities_profile``, with negative (masing) opacity
+        shielded as in the NLTE iteration (:func:`tiramisu.nlte.effective_source_tau_mu`)."""
+        effective_source_func, _, effective_chi, _ = effective_source_tau_mu(
+            global_source_func_matrix=xsecs._global_source_func_matrix,
+            global_chi_matrix=xsecs._global_chi_matrix,
+            global_eta_matrix=xsecs._global_eta_matrix,
+            density_profile=self.density,
+            dz_profile=self.dz,
+        )
+        return effective_source_func, effective_chi
 
     def compute_transmission(
             self,
@@ -247,7 +170,7 @@ class ExoplanetEmission:
         The transmission spectrum quantifies the wavenumber-dependent loss of stellar flux during transit:
 
         .. math::
-            \\delta(\\tilde{\\nu}) = \\left( \\frac{R_{\\mathrm{p,eff}}(\\tilde{\\nu})}{R_{star}} \\right)^{2,
+            \\delta(\\tilde{\\nu}) = \\left( \\frac{R_{\\mathrm{p,eff}}(\\tilde{\\nu})}{R_{star}} \\right)^{2},
 
         where :math:`R_{\\mathrm{p,eff}}(\\tilde{\\nu})` is the effective radius of an opaque disk that would block the
         same stellar flux as the semi-transparent atmosphere.
@@ -300,10 +223,11 @@ class ExoplanetEmission:
             temperature=self.temperature_profile,
             pressure=self.central_pressure,
             spectral_grid=spectral_grid,
+            interface_radii=self._nlte_interface_radii,
         )
 
         # global_chi: (n_layers, n_wn) is mixing ratio weighted sum of absorption cross-sections [cm^2].
-        _, global_chi, _ = self.source_function(spectral_grid, xsecs)
+        _, global_chi = self.source_function(xsecs=xsecs)
 
         # Kappa is the mass extinction coefficient [m^2 / kg] and rho is mass density [kg/m^3].
         # alpha_nu_r is kappa*rho = (sigma/mu)*rho, but our self.density is number density i.e. n=rho/mu.
@@ -311,17 +235,10 @@ class ExoplanetEmission:
         # Volume extinction alpha: (n_wn, n_layers) [1/m]
         alpha_nu_r = (global_chi * self.density[:, None]).T.to(1 / u.m)
 
-        # Geometry: build shell edges
-        # self.altitude is ALWAYS stored at layer centers (length n_layers),
-        # so reconstruct layer-edge radii from dz:
-        dz = self.dz.to(u.m)  # (n_layers,)
-        cumulative = np.concatenate(([0.0], np.cumsum(dz.value))) * u.m
-        r_edges = (self.planet_radius + cumulative).to(u.m)  # (n_layers+1,)
-
-        # Impact parameter grid (same as shell edges)
-        b_edges = r_edges
+        # Shell edges and impact-parameter annulus edges are both the layer interfaces; one chord per shell midpoint.
+        b_edges = self.interface_radii.to(u.m)  # (n_layers+1,)
         b_mid = 0.5 * (b_edges[:-1] + b_edges[1:])  # (n_layers,)
-        tau_b_nu = slant_tau(alpha_nu_r, r_edges, b_mid)  # (n_layers, n_wn)
+        tau_b_nu = slant_tau(alpha_nu_r=alpha_nu_r, r_edges=b_edges, b_mid=b_mid)  # (n_layers, n_wn)
 
         planet_radius_sq = effective_radius_squared(tau_b_nu, b_edges=b_edges)  # (n_wn,)
         planet_radius_eff = np.sqrt(planet_radius_sq).to(u.m)
@@ -332,54 +249,6 @@ class ExoplanetEmission:
             delta = ((planet_radius_eff / star_radius) ** 2).decompose()
 
         return spectral_grid, delta, planet_radius_eff
-
-
-def chord_lengths_through_shells(b: float, r_edges: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
-    """
-    Compute the geometric path length of a slant/tangent ray through each atmospheric layer, assuming spherically
-    symmetric shells, for a given impact parameter :math:`b`.
-
-    A straight ray at impact parameter :math:`b` intersects each shell bounded by radii :math:`r_{\\mathrm{in}}` and
-    :math:`r_{\\mathrm{out}}` over a path length:
-
-    .. math::
-        \\Delta{}s_{j}(b) = 2 \\left[
-            \\sqrt{r_{\\mathrm{out}}^{2} - b^{2}}
-            - \\sqrt{max(r_{\\mathrm{in}}, b)^{2} - b^{2}}
-            \\right],
-
-    uch that only shells with :math:`r_{\\mathrm{out}} \\lt b` contribute (others are not intersected).
-
-    Parameters
-    ----------
-    b : float
-        Impact parameter (distance of the ray’s closest approach to the planet’s center) [m]. Corresponds to the tangent
-        altitude of a slant path through the atmosphere.
-    r_edges : ndarray, shape (n_layers + 1, )
-        Radii of the layer boundaries :math:`r_0, r_1, ..., r_{n}` defining :math:`n_{\\mathrm{layers}}` spherical
-        shells [m].
-
-    Returns
-    -------
-    ds : ndarray, shape (n_layers,)
-        Geometric path length through each shell [m]. This array represents :math:`\\Delta{}s_{j}(b)` for each layer
-        :math:`j` and is used in the slant optical depth integral:
-
-        .. math::
-            \\tau(b, \\tilde{\\nu}) = \\sum_{j=1}^{n_{\\mathrm{layers}}} \\alpha_j(\\tilde{\\nu}) \\, \\Delta s_j(b),
-
-        where :math:`\\alpha_j(\\tilde{\\nu})` is the volume extinction coefficient in layer :math:`j`.
-    """
-    r_in = r_edges[:-1]
-    r_out = r_edges[1:]
-    ds = np.zeros_like(r_in)
-    # Only shells with outer radius > b are intersected.
-    impact_mask = b < r_out
-    if not np.any(impact_mask):
-        return ds
-    rin_eff = np.maximum(r_in[impact_mask], b)
-    ds[impact_mask] = 2.0 * (np.sqrt(r_out[impact_mask] ** 2 - b ** 2) - np.sqrt(rin_eff ** 2 - b ** 2))
-    return ds
 
 
 def slant_tau(alpha_nu_r: u.Quantity, r_edges: u.Quantity, b_mid: u.Quantity) -> npt.NDArray[np.float64]:
@@ -417,20 +286,29 @@ def slant_tau(alpha_nu_r: u.Quantity, r_edges: u.Quantity, b_mid: u.Quantity) ->
     tau : ndarray, shape (n_layers, n_wn)
         Slant optical depth :math:`\\tau(b_k, \\tilde{\\nu}_i)`: first dimension indexes impact parameters :math:`b_k`,
         second dimension indexes wavenumber grid points :math:`\\tilde{\\nu}_i`. These values describe the total
-        extinction along each chord [1/m].
+        extinction along each chord (dimensionless).
     """
-    n_wn, n_layers = alpha_nu_r.shape
-    n_impacts = len(b_mid)
     r_edges_m = r_edges.to(u.m)
     b_mid_m = b_mid.to(u.m)
     alpha_nu_r = alpha_nu_r.to(1 / u.m)
 
-    ds_mat = np.zeros((n_impacts, n_layers)) << r_edges_m.unit
-    for k, b in enumerate(b_mid_m):
-        ds_mat[k, :] = chord_lengths_through_shells(b, r_edges_m)
+    # Vectorized version of chord_lengths_through_shells over all impact parameters at once (broadcasting
+    # (n_impacts, 1) against (1, n_layers)), rather than looping per-b and calling it once per row. The clip
+    # before each sqrt keeps entries outside impact_mask from generating NaN/RuntimeWarning before being zeroed
+    # out below - impact_mask guarantees r_out^2-b^2 >= 0 and rin_eff^2-b^2 >= 0 wherever it's True, matching the
+    # unclipped per-b version exactly for those entries.
+    r_in = r_edges_m[:-1].value
+    r_out = r_edges_m[1:].value
+    b = b_mid_m.value
+
+    impact_mask = b[:, None] < r_out[None, :]
+    r_in_eff = np.maximum(r_in[None, :], b[:, None])
+    r_out_term = np.clip(r_out[None, :] ** 2 - b[:, None] ** 2, 0, None)
+    r_in_term = np.clip(r_in_eff ** 2 - b[:, None] ** 2, 0, None)
+    ds_mat_val = np.where(impact_mask, 2.0 * (np.sqrt(r_out_term) - np.sqrt(r_in_term)), 0.0)
 
     # alpha: (n_wn, n_layers), ds_mat: (n_impacts, n_layers) -> tau: (n_impacts,n_wn) [m * 1/m -> dimensionless]
-    tau = np.einsum('kn,ln->kl', ds_mat.value, alpha_nu_r.value)
+    tau = np.einsum('kn,ln->kl', ds_mat_val, alpha_nu_r.value)
     return tau
 
 

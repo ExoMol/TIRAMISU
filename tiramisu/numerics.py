@@ -100,37 +100,11 @@ def loglinear_integral_1d_nonnegative(
 
         lr = np.log(y1 / y0)
         if abs(lr) < 1e-12:
-            # result += 0.5 * dk * (y0 + y1)
             # y0 roughly equals y1, i.e.: 0.5 * (y0 + y1) ~ y0
             result += dk * y0
         else:
-            # result += dk * (y1 - y0) / lr
             # If y1 = y0 * exp(lr), then (y1 - y0)/lr = y0 * (exp(lr) - 1) / lr; the latter is more stable for small lr.
             result += dk * y0 * np.expm1(lr) / lr
-    return result
-
-
-@numba.njit(parallel=True, cache=True, error_model="numpy")
-def loglinear_integral_2d(
-        y_data: npt.NDArray[np.float64],
-        dx: npt.NDArray[np.float64],
-) -> npt.NDArray[np.float64]:
-    """
-    Vectorised log-linear quadrature over rows of y_data.
-
-    Parameters
-    ----------
-    y_data : np.ndarray, shape (n_rows, n_grid)
-    dx : np.ndarray, shape (n_grid - 1,)
-
-    Returns
-    -------
-    np.ndarray, shape (n_rows,)
-    """
-    n_rows = y_data.shape[0]
-    result = np.zeros(n_rows, dtype=np.float64)
-    for row in numba.prange(n_rows):
-        result[row] = loglinear_integral_1d(y_data[row], dx)
     return result
 
 
@@ -159,33 +133,6 @@ def loglinear_integral_2d_nonnegative(
 
 
 @numba.njit(cache=True, error_model="numpy", inline="always")
-def loglinear_normalise_1d(
-        y_data: npt.NDArray[np.float64],
-        dx: npt.NDArray[np.float64],
-) -> npt.NDArray[np.float64]:
-    """
-    Normalise y_data by its log-linear integral.
-
-    Uses the same quadrature as loglinear_integral_1d.
-
-    Parameters
-    ----------
-    y_data : np.ndarray, shape (n_grid,)
-        Cross-section values. Non-negative; zeros trigger trapezoidal fallback.
-    dx : np.ndarray, shape (n_grid - 1,)
-        Wavenumber grid steps.
-
-    Returns
-    -------
-    float
-    """
-    integral = loglinear_integral_1d(y_data=y_data, dx=dx)
-    if integral == 0.0:
-        return np.zeros_like(y_data)
-    return y_data / integral
-
-
-@numba.njit(cache=True, error_model="numpy", inline="always")
 def loglinear_normalise_1d_nonnegative(
         y_data: npt.NDArray[np.float64],
         dx: npt.NDArray[np.float64],
@@ -210,34 +157,6 @@ def loglinear_normalise_1d_nonnegative(
     if integral == 0.0:
         return np.zeros_like(y_data)
     return y_data / integral
-
-
-@numba.njit(parallel=True, cache=True, error_model="numpy")
-def loglinear_normalise_2d(
-        y_data: npt.NDArray[np.float64],
-        dx: npt.NDArray[np.float64],
-) -> npt.NDArray[np.float64]:
-    """
-    Normalise each row of y_data by its log-linear integral.
-
-    Parameters
-    ----------
-    y_data : np.ndarray, shape (n_rows, n_grid)
-    dx : np.ndarray, shape (n_grid - 1,)
-
-    Returns
-    -------
-    np.ndarray, shape (n_rows, n_grid)
-        Each row divided by its log-linear integral.
-    """
-    n_rows, n_cols = y_data.shape
-    result = np.empty((n_rows, n_cols), dtype=np.float64)
-    for row in numba.prange(n_rows):
-        integral = loglinear_integral_1d(y_data[row], dx)
-        inv = 1.0 / integral if integral != 0.0 else 0.0
-        for col in range(n_cols):
-            result[row, col] = y_data[row, col] * inv
-    return result
 
 
 @numba.njit(parallel=True, cache=True, error_model="numpy")
@@ -311,26 +230,6 @@ def loglinear_integral_quantity_1d_nonnegative(
     return result * (y_data.unit * dx.unit)
 
 
-def loglinear_integral_quantity_2d(
-        y_data: u.Quantity,
-        dx: u.Quantity,
-) -> u.Quantity:
-    """
-
-    Parameters
-    ----------
-    y_data : astropy.units.Quantity, shape (n_rows, n_grid)
-    dx : astropy.units.Quantity, shape (n_grid - 1,)
-
-    Returns
-    -------
-    integral : astropy.units.Quantity, shape (n_rows,)
-        Integral of each row of y_data with respect to x_data. Has units of y_data.unit * x_data.unit.
-    """
-    result = loglinear_integral_2d(y_data.value, dx.value)
-    return result << (y_data.unit * dx.unit)
-
-
 def loglinear_integral_quantity_2d_nonnegative(
         y_data: u.Quantity,
         dx: u.Quantity,
@@ -352,27 +251,6 @@ def loglinear_integral_quantity_2d_nonnegative(
     return result << (y_data.unit * dx.unit)
 
 
-def loglinear_normalise_quantity_1d(
-        y_data: u.Quantity,
-        dx: u.Quantity,
-) -> u.Quantity:
-    """
-
-    Parameters
-    ----------
-    y_data : astropy.units.Quantity, shape (n_grid,)
-    dx : astropy.units.Quantity, shape (n_grid - 1,)
-
-    Returns
-    -------
-    normalised : astropy.units.Quantity, shape (n_grid,)
-        y_data / integral(y_data, x_data). Units of 1/x_data.unit.
-        Returned unchanged if the integral is zero.
-    """
-    result = loglinear_normalise_1d(y_data.value, dx.value)
-    return result << (1 / dx.unit)
-
-
 def loglinear_normalise_quantity_1d_nonnegative(
         y_data: u.Quantity,
         dx: u.Quantity,
@@ -391,233 +269,82 @@ def loglinear_normalise_quantity_1d_nonnegative(
         y_data / integral(y_data, x_data). Units of 1/x_data.unit.
         Returned unchanged if the integral is zero.
     """
-    result = loglinear_normalise_1d(y_data.value, dx.value)
+    result = loglinear_normalise_1d_nonnegative(y_data=y_data.value, dx=dx.value)
     return result << (1 / dx.unit)
 
 
-def loglinear_normalise_quantity_2d(
-        y_data: u.Quantity,
-        dx: u.Quantity,
-) -> u.Quantity:
-    """
-
-    Parameters
-    ----------
-    y_data : astropy.units.Quantity, shape (n_rows, n_grid)
-    dx : astropy.units.Quantity, shape (n_grid - 1,)
-
-    Returns
-    -------
-    normalised : astropy.units.Quantity, shape (n_rows, n_grid)
-        Each row divided by its integral; units are 1 / x_data.unit.
-    """
-    result = loglinear_normalise_2d(y_data.value, dx.value)
-    return result << (1 / dx.unit)
-
-
-def loglinear_normalise_quantity_2d_nonnegative(
-        y_data: u.Quantity,
-        dx: u.Quantity,
-) -> u.Quantity:
-    """
-    All y_data must be non-negative.
-
-    Parameters
-    ----------
-    y_data : astropy.units.Quantity, shape (n_rows, n_grid)
-    dx : astropy.units.Quantity, shape (n_grid - 1,)
-
-    Returns
-    -------
-    normalised : astropy.units.Quantity, shape (n_rows, n_grid)
-        Each row divided by its integral; units are 1 / x_data.unit.
-    """
-    result = loglinear_normalise_2d_nonnegative(y_data.value, dx.value)
-    return result << (1 / dx.unit)
-
-
-# ----------------------------- NUMBA SIMPSON INTEGRALS AND NORMALISATION -----------------------------
+# ----------------------------- LOG-LINEAR / LINEAR INTERPOLATION -----------------------------
+# Interpolation counterparts to the log-linear quadrature above: log(y) varies linearly in x between nodes, i.e. the
+# interpolant is piecewise exponential. Falls back to linear interpolation when either node is non-positive.
 
 @numba.njit(cache=True, error_model="numpy", inline="always")
-def simpson_integral_numba(y_data: npt.NDArray[np.float64], x_data: npt.NDArray[np.float64]) -> float:
+def _loglinear_interp_point(y0: float, y1: float, w: float) -> float:
     """
-    Fast Simpson's rule integration using numba.
-    Assumes evenly or unevenly spaced x values.
+    Piecewise log-linear interpolation between two nodes.
+
+    Evaluates y0 * (y1 / y0)**w, the exponential passing through (0, y0) and (1, y1). Falls back to linear
+    interpolation when either node is non-positive (zero-padded or masked cross-sections).
+
+    Parameters
+    ----------
+    y0 : float
+        y data value at the lower node.
+    y1 : float
+        y data value at the upper node.
+    w : float
+        Fractional distance from the lower node, in [0, 1].
+
+    Returns
+    ----------
+    float
     """
-    n_points = len(y_data)
-    if n_points < 2:
-        return 0.0
-
-    if n_points == 2:
-        # Trapezoidal for 2 points
-        return 0.5 * (y_data[0] + y_data[1]) * (x_data[1] - x_data[0])
-
-    # Simpson's 1/3 rule
-    h = x_data[1:] - x_data[:-1]
-    result = 0.0
-
-    for i in range(0, n_points - 2, 2):
-        # Simpson's rule for each pair of intervals
-        h0 = h[i]
-        h1 = h[i + 1]
-
-        if abs(h0 - h1) < 1e-10:  # Uniform spacing
-            result += (h0 / 3.0) * (y_data[i] + 4 * y_data[i + 1] + y_data[i + 2])
-        else:  # Non-uniform spacing
-            alpha = (2 * h0 ** 2 + 2 * h0 * h1 - h1 ** 2) / (6 * h0)
-            beta = (h0 ** 2 + h0 * h1) / (3 * h1)
-            result += alpha * y_data[i] + beta * y_data[i + 1] + (h0 + h1 - alpha - beta) * y_data[i + 2]
-
-    # Handle last interval if odd number of points (use trapezoidal)
-    if n_points % 2 == 0:
-        result += 0.5 * (y_data[n_points - 2] + y_data[n_points - 1]) * h[n_points - 2]
-
-    return result
+    if y0 <= 0.0 or y1 <= 0.0:
+        return y0 + w * (y1 - y0)
+    return y0 * np.exp(w * np.log(y1 / y0))
 
 
 @numba.njit(parallel=True, cache=True, error_model="numpy")
-def simpson_integral_2d(
-        y_data: npt.NDArray[np.float64],
-        x_data: npt.NDArray[np.float64],
+def linear_loglinear_interp_2d(
+        data: npt.NDArray[np.float64],
+        idx_x0: npt.NDArray[np.int32],
+        w_x: npt.NDArray[np.float64],
+        idx_y0: npt.NDArray[np.int32],
+        w_y: npt.NDArray[np.float64],
 ) -> npt.NDArray[np.float64]:
     """
-    Vectorized Simpson integration over axis 1.
-    Each row is integrated independently.
+    Interpolate a (n_x, n_y, n_grid) table linearly along axis 0 and log-linearly along axis 1.
+
+    For each output point the table is first interpolated log-linearly in y on the two bracketing x rows, and those
+    results are then combined linearly in x. Bracketing indices and weights are precomputed by the caller, which
+    handles clamping/extrapolation.
+
+    Parameters
+    ----------
+    data : np.ndarray, shape (n_x, n_y, n_grid)
+        Tabulated values (e.g. cross-sections over pressure, temperature, wavenumber).
+    idx_x0 : np.ndarray, shape (n_points,)
+        Lower bracketing index along axis 0; idx_x0 + 1 must be valid.
+    w_x : np.ndarray, shape (n_points,)
+        Fractional distance from idx_x0 towards idx_x0 + 1.
+    idx_y0 : np.ndarray, shape (n_points,)
+        Lower bracketing index along axis 1; idx_y0 + 1 must be valid.
+    w_y : np.ndarray, shape (n_points,)
+        Fractional distance from idx_y0 towards idx_y0 + 1.
+
+    Returns
+    -------
+    np.ndarray, shape (n_points, n_grid)
     """
-    num_rows, num_grid = y_data.shape
-    result = np.zeros(num_rows, dtype=np.float64)
-
-    if num_grid < 2:
-        return result
-
-    for row in numba.prange(num_rows):
-        result[row] = simpson_integral_numba(y_data=y_data[row], x_data=x_data)
-
+    n_points = idx_x0.shape[0]
+    n_grid = data.shape[2]
+    result = np.empty((n_points, n_grid))
+    for i in numba.prange(n_points):
+        ix0 = idx_x0[i]
+        iy0 = idx_y0[i]
+        wx = w_x[i]
+        wy = w_y[i]
+        for k in range(n_grid):
+            lower = _loglinear_interp_point(data[ix0, iy0, k], data[ix0, iy0 + 1, k], wy)
+            upper = _loglinear_interp_point(data[ix0 + 1, iy0, k], data[ix0 + 1, iy0 + 1, k], wy)
+            result[i, k] = lower + wx * (upper - lower)
     return result
-
-
-def simpson_quantity(y_data: u.Quantity, x_data: u.Quantity) -> u.Quantity:
-    """Simpson integration preserving units."""
-    result = simpson_integral_numba(y_data.value, x_data.value)
-    return result * (y_data.unit * x_data.unit)
-
-
-def simpson_quantity_2d(
-        y_data: u.Quantity,
-        x_data: u.Quantity,
-) -> u.Quantity:
-    """Vectorized Simpson integration preserving units."""
-    result = simpson_integral_2d(y_data=y_data.value, x_data=x_data.value)
-    return result << (y_data.unit * x_data.unit)
-
-
-@numba.njit(cache=True, error_model="numpy")
-def simpson_normalise_1d(
-        y_data: npt.NDArray[np.float64],
-        x_data: npt.NDArray[np.float64],
-) -> npt.NDArray[np.float64]:
-    """
-    Normalise y_data by its Simpson integral over x_data.
-
-    Parameters
-    ----------
-    y_data : np.ndarray, shape (n_grid,)
-    x_data : np.ndarray, shape (n_grid,)
-
-    Returns
-    -------
-    normalised : np.ndarray, shape (n_grid,)
-        y_data / integral(y_data, x_data). Units of 1/x_data.unit.
-        Returned unchanged if the integral is zero.
-    """
-    integral = simpson_integral_numba(y_data=y_data, x_data=x_data)
-    if integral == 0.0:
-        return y_data.copy()
-    return y_data / integral
-
-
-def simpson_normalise_quantity_1d(
-        y_data: u.Quantity,
-        x_data: u.Quantity,
-) -> u.Quantity:
-    """
-    Normalise y_data by its Simpson integral, preserving units.
-
-    Parameters
-    ----------
-    y_data : astropy.units.Quantity, shape (n_grid,)
-    x_data : astropy.units.Quantity, shape (n_grid,)
-
-    Returns
-    -------
-    astropy.units.Quantity, shape (n_grid,)
-        Units are 1 / x_data.unit.
-    """
-    result = simpson_normalise_1d(y_data=y_data.value, x_data=x_data.value)
-    return result << (1 / x_data.unit)
-
-
-@numba.njit(parallel=True, cache=True, error_model="numpy", inline="always")
-def simpson_normalise_2d(
-        y_data: npt.NDArray[np.float64],
-        x_data: npt.NDArray[np.float64],
-) -> npt.NDArray[np.float64]:
-    """
-    Normalise each row of y_data by its Simpson integral over x_data.
-
-    Each row of the output is y_data[row] / integral(y_data[row], x_data).
-    Rows whose integral is zero are left as-is (no division).
-
-    Parameters
-    ----------
-    y_data : np.ndarray, shape (n_rows, n_grid)
-        2D array where each row is an independent distribution to normalise.
-    x_data : np.ndarray, shape (n_grid,)
-        Shared x-axis for all rows.
-
-    Returns
-    -------
-    normalised : np.ndarray, shape (n_rows, n_grid)
-        Row-normalised y_data. Units of 1/x_data.unit (normalisation removes y units).
-    """
-    num_rows, num_grid = y_data.shape
-    result = np.empty((num_rows, num_grid), dtype=np.float64)
-
-    if num_grid < 2:
-        for row in numba.prange(num_rows):
-            for col in range(num_grid):
-                result[row, col] = y_data[row, col]
-        return result
-
-    for row in numba.prange(num_rows):
-        integral = simpson_integral_numba(y_data=y_data[row], x_data=x_data)
-        if integral != 0.0:
-            inv = 1.0 / integral
-            for col in range(num_grid):
-                result[row, col] = y_data[row, col] * inv
-        else:
-            for col in range(num_grid):
-                result[row, col] = y_data[row, col]
-
-    return result
-
-
-def simpson_normalise_quantity_2d(
-        y_data: u.Quantity,
-        x_data: u.Quantity,
-) -> u.Quantity:
-    """
-    Normalise each row of y_data by its Simpson integral, preserving units.
-
-    Parameters
-    ----------
-    y_data : astropy.units.Quantity, shape (n_rows, n_grid)
-    x_data : astropy.units.Quantity, shape (n_grid,)
-
-    Returns
-    -------
-    astropy.units.Quantity, shape (n_rows, n_grid)
-        Each row divided by its integral; units are 1 / x_data.unit.
-    """
-    result = simpson_normalise_2d(y_data=y_data.value, x_data=x_data.value)
-    return result << (1 / x_data.unit)

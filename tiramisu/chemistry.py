@@ -16,22 +16,44 @@ class SpeciesFormula(Formula):
             formula = formula.formula
 
         super().__init__(formula, *args, **kwargs)
+        # Composition is fixed once constructed (formula string never changes after __init__), so cache it here -
+        # __hash__/__eq__ are called on every dict/set operation involving a species (ChemicalProfile lookups,
+        # XSecCollection keys, etc.), and recomputing composition().asdict() from scratch each time was showing up
+        # as real overhead on those hot paths.
+        self._composition_frozenset = frozenset(self.composition().asdict().values())
+        self._cached_hash = hash(self._composition_frozenset)
+
+    @property
+    def reduced_mass(self) -> float:
+        """
+        Product of the atomic masses over their sum [Da]: the reduced mass for a diatomic. Each element is taken as its
+        most abundant isotope unless the formula names one (molmass notation, e.g. "[13C]O").
+
+        Not a reduced mass for polyatomics: it is only used for the continuum (dissociation) box broadening, which is
+        not implemented for polyatomics yet.
+        """
+        mass_sum, mass_prod = 0.0, 1.0
+        for symbol, (count, _, _) in self.composition().asdict().items():
+            # Composition keys are element symbols, or mass-number-prefixed isotopes ("13C") where the formula names one.
+            mass = Formula(f"[{symbol}]" if symbol[0].isdigit() else symbol).isotope.mass
+            mass_sum += mass * count
+            mass_prod *= mass ** count
+        return mass_prod / mass_sum
 
     def __hash__(self) -> int:
         """Hash function. Necessary for sets and dicts."""
-        val = self.composition().asdict().values()
-
-        return hash(frozenset(val))
+        return self._cached_hash
 
     def __eq__(self, other):
         """Equality check. Necessary for sets and dicts."""
         if isinstance(other, str):
-            return self == SpeciesFormula(other)
+            other = SpeciesFormula(other)
 
-        comp_self = self.composition().asdict().values()
-        comp_other = other.composition().asdict().values()
+        comp_other = getattr(other, "_composition_frozenset", None)
+        if comp_other is None:
+            comp_other = frozenset(other.composition().asdict().values())
 
-        return frozenset(comp_self) == frozenset(comp_other)
+        return self._composition_frozenset == comp_other
 
 
 def build_chemical_profile(

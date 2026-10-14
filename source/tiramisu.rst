@@ -1,6 +1,14 @@
 tiramisu package
 ================
 
+Subpackages
+-----------
+
+.. toctree::
+   :maxdepth: 4
+
+   tiramisu.colchem
+
 Submodules
 ----------
 
@@ -20,26 +28,10 @@ tiramisu.atmos module
    :show-inheritance:
    :undoc-members:
 
-tiramisu.atomic\_nuclear\_data module
--------------------------------------
-
-.. automodule:: tiramisu.atomic_nuclear_data
-   :members:
-   :show-inheritance:
-   :undoc-members:
-
 tiramisu.chemistry module
 -------------------------
 
 .. automodule:: tiramisu.chemistry
-   :members:
-   :show-inheritance:
-   :undoc-members:
-
-tiramisu.colchem module
------------------------
-
-.. automodule:: tiramisu.colchem
    :members:
    :show-inheritance:
    :undoc-members:
@@ -56,22 +48,6 @@ tiramisu.eclipse module
 -----------------------
 
 .. automodule:: tiramisu.eclipse
-   :members:
-   :show-inheritance:
-   :undoc-members:
-
-tiramisu.exocross module
-------------------------
-
-.. automodule:: tiramisu.exocross
-   :members:
-   :show-inheritance:
-   :undoc-members:
-
-tiramisu.format module
-----------------------
-
-.. automodule:: tiramisu.format
    :members:
    :show-inheritance:
    :undoc-members:
@@ -96,6 +72,14 @@ tiramisu.profiles module
 ------------------------
 
 .. automodule:: tiramisu.profiles
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
+tiramisu.profiles\_gpu module
+-----------------------------
+
+.. automodule:: tiramisu.profiles_gpu
    :members:
    :show-inheritance:
    :undoc-members:

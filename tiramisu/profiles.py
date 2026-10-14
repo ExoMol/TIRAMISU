@@ -4,7 +4,6 @@ import math
 import pathlib
 import typing as t
 from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
 
 import numba
 import numpy as np
@@ -15,9 +14,9 @@ from pyarrow import parquet as pq
 from dask import dataframe as dd
 from numpy import typing as npt
 
-from .config import _DEFAULT_NUM_THREADS, _INTENSITY_CUTOFF, _PARQUET_BATCH_SIZE, _DASK_BLOCK_SIZE, _LOG_VERBOSE_1, \
-    _LOG_VERBOSE_2
-from .numerics import loglinear_normalise_2d_nonnegative
+from . import config
+from .config import _DEFAULT_NUM_THREADS, _INTENSITY_CUTOFF, _PARQUET_BATCH_SIZE, _DASK_BLOCK_SIZE, _LOG_VERBOSE_2
+from .numerics import loglinear_normalise_2d_nonnegative, loglinear_integral_1d
 
 log = logging.getLogger(__name__)
 
@@ -25,11 +24,7 @@ log = logging.getLogger(__name__)
 ac_h_on_8_c = ac.h.cgs / (8 * ac.c.cgs)
 ac_4_pi_c = 4 * np.pi * ac.c.cgs
 ac_8_pi_c = 2 * ac_4_pi_c
-ac_8_pi_five_halves_c = ac_8_pi_c * (np.pi ** 1.5)
-ac_16_pi_c = 2 * ac_8_pi_c
 ac_h_c_on_4_pi = ac.h.cgs * ac.c.cgs / (4 * np.pi)
-ac_h_c_on_4_pi_five_halves = ac_h_c_on_4_pi / (np.pi ** 1.5)
-ac_h_c_on_8_pi = ac_h_c_on_4_pi / 2.0
 ac_sqrt_NA_kB_on_c = (np.sqrt(ac.N_A * ac.k_B.cgs) / ac.c.cgs).to(
     u.g ** 0.5 / (u.K ** 0.5 * u.mol ** 0.5), equivalencies=u.spectral()
 )
@@ -41,242 +36,708 @@ const_h_on_8_c = ac_h_on_8_c.value
 const_h_on_8_c_amu = const_h_on_8_c / const_amu
 const_4_pi_c = ac_4_pi_c.value
 const_8_pi_c = ac_8_pi_c.value
-const_16_pi_c = ac_16_pi_c.value
-const_8_pi_five_halves_c = ac_8_pi_five_halves_c.value
 const_h_c_on_4_pi = ac_h_c_on_4_pi.value
-const_h_c_on_4_pi_five_halves = ac_h_c_on_4_pi_five_halves.value
-const_h_c_on_8_pi = ac_h_c_on_8_pi.value
 const_sqrt_NA_kB_on_c = ac_sqrt_NA_kB_on_c.value
 const_sqrt_2_NA_kB_log2_on_c = ac_sqrt_2_NA_kB_log2_on_c.value
 const_c_sq_on_2h = ac_c_sq_on_2h.value
+const_c_cgs = ac.c.cgs.value
+
+
+@numba.njit(parallel=True, nogil=True, cache=True, error_model="numpy")
+def _filter_trans_batch(
+        id_f: npt.NDArray,
+        id_i: npt.NDArray,
+        a_fi: npt.NDArray[np.float64],
+        energy_lookup: npt.NDArray[np.float64],
+        wn_min: float,
+        wn_max: float,
+) -> t.Tuple[npt.NDArray[np.int32], npt.NDArray[np.int32], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """
+    Keeps, in input order, the transitions between known states (energy_lookup not NaN) whose wavenumber
+    energy_f - energy_i lies in [wn_min, wn_max]. Replaces joining each batch with the states table.
+
+    Each of n_chunks contiguous chunks counts its kept transitions, then writes them at its offset.
+    """
+    n = id_f.shape[0]
+    n_states = energy_lookup.shape[0]
+    n_chunks = max(1, min(_DEFAULT_NUM_THREADS, n))
+    chunk_len = (n + n_chunks - 1) // n_chunks
+    offsets = np.zeros(n_chunks + 1, dtype=np.int64)
+    for c in numba.prange(n_chunks):
+        kept = 0
+        for p in range(c * chunk_len, min(n, (c + 1) * chunk_len)):
+            f = id_f[p]
+            i = id_i[p]
+            # NaN (absent state) fails the range test.
+            if 0 <= f < n_states and 0 <= i < n_states and wn_min <= energy_lookup[f] - energy_lookup[i] <= wn_max:
+                kept += 1
+        offsets[c + 1] = kept
+    for c in range(n_chunks):
+        offsets[c + 1] += offsets[c]
+
+    n_kept = offsets[n_chunks]
+    id_f_out = np.empty(n_kept, dtype=np.int32)
+    id_i_out = np.empty(n_kept, dtype=np.int32)
+    a_fi_out = np.empty(n_kept, dtype=np.float64)
+    energy_fi_out = np.empty(n_kept, dtype=np.float64)
+    for c in numba.prange(n_chunks):
+        q = offsets[c]
+        for p in range(c * chunk_len, min(n, (c + 1) * chunk_len)):
+            f = id_f[p]
+            i = id_i[p]
+            if 0 <= f < n_states and 0 <= i < n_states:
+                energy_fi_p = energy_lookup[f] - energy_lookup[i]
+                if wn_min <= energy_fi_p <= wn_max:
+                    id_f_out[q] = f
+                    id_i_out[q] = i
+                    a_fi_out[q] = a_fi[p]
+                    energy_fi_out[q] = energy_fi_p
+                    q += 1
+    return id_f_out, id_i_out, a_fi_out, energy_fi_out
 
 
 def _iter_trans_batches(
         trans_file: pathlib.Path,
-        trans_columns: list[str],
-        states_i: pl.DataFrame,
-        states_f: pl.DataFrame,
+        energy_lookup: npt.NDArray[np.float64],
         wn_min: float,
         wn_max: float,
-        parquet_batch_size: int,
-        dask_dtypes: dict,
-        do_super_lines: bool,
-) -> t.Iterator[pl.DataFrame]:
+) -> t.Iterator[t.Tuple[npt.NDArray[np.int32], npt.NDArray[np.int32], npt.NDArray[np.float64],
+npt.NDArray[np.float64]]]:
     """
-    Yields filtered, joined trans batches regardless of file format.
+    Yields the (id_f, id_i, A_fi, energy_fi) arrays of the transitions in a line list (.trans text or parquet) that
+    fall on the grid, batch by batch (see :func:`_filter_trans_batch`), skipping batches with none.
 
     Called by :func:`~xsec.NLTEProcessor.compute_rates_profiles`.
 
     Parameters
     ----------
     trans_file
-    trans_columns
-    states_i
-    states_f
+    energy_lookup : ndarray, shape (n_states + 1,)
+        State energy [cm^-1] by state ID, NaN for states not in the states table.
     wn_min
     wn_max
-    dask_dtypes
-    do_super_lines
-
-    Returns
-    -------
-
     """
-
-    def _process(raw: pl.DataFrame) -> pl.DataFrame:
-        out = (
-            raw
-            .with_columns([
-                pl.col("id_i").cast(pl.Int32),
-                pl.col("id_f").cast(pl.Int32),
-            ])
-            .join(states_i, on="id_i", how="inner")
-            .join(states_f, on="id_f", how="inner")
-            .with_columns(
-                (pl.col("energy_f") - pl.col("energy_i")).alias("energy_fi")
-            )
-            .filter(
-                (pl.col("energy_fi") >= wn_min)
-                & (pl.col("energy_fi") <= wn_max)
-            )
-        )
-        if not do_super_lines:
-            return out.sort(["id_agg_f", "id_agg_i"])
-        return out
-
+    columns = ["id_f", "id_i", "A_fi"]
     if str(trans_file).endswith(".parquet"):
         with pq.ParquetFile(trans_file) as pq_file:
-            for arrow_batch in pq_file.iter_batches(
-                    batch_size=parquet_batch_size,
-                    columns=trans_columns,
-                    use_threads=True,
-            ):
-                yield _process(pl.from_arrow(arrow_batch))
+            for arrow_batch in pq_file.iter_batches(batch_size=_PARQUET_BATCH_SIZE, columns=columns, use_threads=True):
+                id_f, id_i, a_fi = (arrow_batch.column(c).to_numpy() for c in columns)
+                batch = _filter_trans_batch(
+                    id_f=id_f, id_i=id_i, a_fi=a_fi, energy_lookup=energy_lookup, wn_min=wn_min, wn_max=wn_max,
+                )
+                if batch[0].shape[0] > 0:
+                    yield batch
     else:
         ddf = dd.read_csv(
             trans_file,
             sep=r"\s+",
-            engine="python",
+            # pandas' C engine has a fast native whitespace tokenizer for sep=r"\s+" - engine="python" forces the
+            # much slower pure-Python regex parser for no benefit here (benchmarked ~4.8x faster with engine="c"
+            # on a real 97MB/1.68M-line trans file, identical output), while keeping the same dask
+            # blocksize-chunked/parallel read structure.
+            engine="c",
             header=None,
-            names=trans_columns,
+            names=columns,
             usecols=[0, 1, 2],
-            dtype=dask_dtypes,
+            dtype={"id_f": "int32", "id_i": "int32", "A_fi": "float64"},
             blocksize=_DASK_BLOCK_SIZE,
         )
         for delayed_batch in ddf.to_delayed():
-            yield _process(pl.from_pandas(delayed_batch.compute()))
+            frame = delayed_batch.compute()
+            batch = _filter_trans_batch(
+                id_f=frame["id_f"].to_numpy(), id_i=frame["id_i"].to_numpy(), a_fi=frame["A_fi"].to_numpy(),
+                energy_lookup=energy_lookup, wn_min=wn_min, wn_max=wn_max,
+            )
+            if batch[0].shape[0] > 0:
+                yield batch
 
 
-@numba.njit(parallel=False, cache=True, error_model="numpy", inline="always")
-def _find_groups_from_ids(
-        id_agg_f: npt.NDArray[np.int32],
-        id_agg_i: npt.NDArray[np.int32],
-        band_indices: npt.NDArray[np.int32],
-) -> t.Tuple[npt.NDArray[np.int32], npt.NDArray[np.int32], npt.NDArray[np.int32]]:
+def _read_ahead(batches: t.Iterator[t.Tuple]) -> t.Iterator[t.Tuple]:
     """
+    Yields the items of batches (from :func:`_iter_trans_batches`), reading the next one in a background thread while
+    the caller works on the current one. The batch loops' numba kernels are nogil=True so that both threads run at
+    once (1.1-1.6x on the full H2O line list, CPU and GPU, tests/prefetch_nogil_bench.py); the caller does all
+    accumulation, in batch order, so results are bit-identical. Needs a threadsafe numba threading layer (config.py
+    sets TBB).
+    """
+    # set_num_threads is thread-local: the reader thread would otherwise run at NUMBA_NUM_THREADS.
+    with ThreadPoolExecutor(max_workers=1, initializer=numba.set_num_threads, initargs=(_DEFAULT_NUM_THREADS,)) as pool:
+        future = pool.submit(next, batches, None)
+        while (batch := future.result()) is not None:
+            future = pool.submit(next, batches, None)
+            yield batch
+
+
+@numba.njit(parallel=True, nogil=True, cache=True, error_model="numpy")
+def _assign_band_indices(
+        id_f: npt.NDArray[np.int32],
+        id_i: npt.NDArray[np.int32],
+        id_agg_lookup: npt.NDArray[np.int32],
+        band_lookup: npt.NDArray[np.int32],
+        id_agg_offset: int,
+        n_bands_used: int,
+) -> t.Tuple[npt.NDArray[np.int32], int]:
+    """
+    Maps each transition's (id_agg_f, id_agg_i) pair to a global band index through a dense lookup table, registering
+    any pairs not seen in earlier batches.
+
+    Called by :func:`~nlte._update_band_registry`.
+
     Parameters
     ----------
-    id_agg_f : ndarray, shape (n_trans,)
-    id_agg_i : ndarray, shape (n_trans,)
-    band_indices : ndarray, shape (n_trans,)
+    id_f : ndarray, shape (n_trans,)
+    id_i : ndarray, shape (n_trans,)
+    id_agg_lookup : ndarray, shape (n_states + 1,)
+        Aggregate state ID by state ID.
+    band_lookup : ndarray, shape (n_agg_ids, n_agg_ids)
+        Entry [id_agg_f + id_agg_offset, id_agg_i + id_agg_offset] holds the band index of that pair, or -1 if it has
+        not been registered yet. Updated in place with any new bands.
+    id_agg_offset : int
+        Offset applied to aggregate IDs so the smallest one (e.g. -1 for unaggregated continuum states) maps to 0.
+    n_bands_used : int
+        Number of bands registered before this batch.
 
     Returns
     -------
-    band_group_indices : ndarray, shape (n_bands_in_batch,)
-        Maps the bands in the current batch to the band index stored in the external band_indices map.
-    group_starts : ndarray, shape (n_bands_in_batch,)
-        Start index in the transition arrays for each band.
-    group_ends : ndarray, shape (n_bands_in_batch,)
-        End index (exclusive) in the transition arrays for each band.
+    band_indices : ndarray, shape (n_trans,)
+    n_bands_used : int
+        Number of bands registered after this batch.
     """
-    n_keys = id_agg_f.shape[0]
-    n_groups = 1
+    n_trans = id_f.shape[0]
+    band_indices = np.empty(n_trans, dtype=np.int32)
+    n_missing = 0
+    for t in numba.prange(n_trans):
+        band_t = band_lookup[id_agg_lookup[id_f[t]] + id_agg_offset, id_agg_lookup[id_i[t]] + id_agg_offset]
+        band_indices[t] = band_t
+        if band_t < 0:
+            n_missing += 1
 
-    starts = np.empty(n_keys, dtype=np.int32)
-    starts[0] = 0
+    if n_missing > 0:
+        # New bands only appear in the first few batches; registering them serially keeps band indices deterministic.
+        for t in range(n_trans):
+            if band_indices[t] >= 0:
+                continue
+            f = id_agg_lookup[id_f[t]] + id_agg_offset
+            i = id_agg_lookup[id_i[t]] + id_agg_offset
+            band_t = band_lookup[f, i]
+            if band_t < 0:
+                band_t = n_bands_used
+                band_lookup[f, i] = band_t
+                n_bands_used += 1
+            band_indices[t] = band_t
 
-    for i in range(1, n_keys):
-        if id_agg_f[i] != id_agg_f[i - 1] or id_agg_i[i] != id_agg_i[i - 1]:
-            starts[n_groups] = i
+    return band_indices, n_bands_used
+
+
+@numba.njit(parallel=True, nogil=True, cache=True, error_model="numpy")
+def _group_by_band(
+        band_indices: npt.NDArray[np.int32],
+        n_bands: int,
+        id_f: npt.NDArray[np.int32],
+        id_i: npt.NDArray[np.int32],
+        a_fi: npt.NDArray[np.float64],
+        energy_fi: npt.NDArray[np.float64],
+) -> t.Tuple[
+    npt.NDArray[np.int32], npt.NDArray[np.int32], npt.NDArray[np.float64], npt.NDArray[np.float64],
+    npt.NDArray[np.int32], npt.NDArray[np.int32], npt.NDArray[np.int32]
+]:
+    """
+    Stable, parallel counting sort of a transition batch by band index, so that each band's transitions are contiguous.
+
+    Replaces sorting the batch on (id_agg_f, id_agg_i): O(n_trans + n_bands) rather than O(n_trans log n_trans).
+
+    Parameters
+    ----------
+    band_indices : ndarray, shape (n_trans,)
+    n_bands : int
+        Total number of registered bands; all band_indices are < n_bands.
+    id_f, id_i, a_fi, energy_fi : ndarray, shape (n_trans,)
+
+    Returns
+    -------
+    id_f, id_i, a_fi, energy_fi : ndarray, shape (n_trans,)
+        Inputs reordered so each band's transitions are contiguous.
+    group_bands : ndarray, shape (n_bands_in_batch,)
+        Global band index of each band present in the batch.
+    group_starts : ndarray, shape (n_bands_in_batch,)
+        Start index in the sorted arrays of each band's transitions.
+    group_ends : ndarray, shape (n_bands_in_batch,)
+        End index (exclusive) in the sorted arrays of each band's transitions.
+    """
+    n_trans = band_indices.shape[0]
+    n_chunks = max(1, min(_DEFAULT_NUM_THREADS, n_trans))
+    chunk_len = (n_trans + n_chunks - 1) // n_chunks
+
+    # Per-chunk band histograms.
+    counts = np.zeros((n_chunks, n_bands), dtype=np.int32)
+    for c in numba.prange(n_chunks):
+        for t in range(c * chunk_len, min(n_trans, (c + 1) * chunk_len)):
+            counts[c, band_indices[t]] += 1
+
+    # Exclusive prefix sum in (band, chunk) order: each chunk writes its share of a band after earlier chunks, so the
+    # sort is stable.
+    chunk_offsets = np.empty((n_chunks, n_bands), dtype=np.int32)
+    band_starts = np.empty(n_bands + 1, dtype=np.int32)
+    running = 0
+    for b in range(n_bands):
+        band_starts[b] = running
+        for c in range(n_chunks):
+            chunk_offsets[c, b] = running
+            running += counts[c, b]
+    band_starts[n_bands] = running
+
+    id_f_out = np.empty_like(id_f)
+    id_i_out = np.empty_like(id_i)
+    a_fi_out = np.empty_like(a_fi)
+    energy_fi_out = np.empty_like(energy_fi)
+    for c in numba.prange(n_chunks):
+        positions = chunk_offsets[c].copy()
+        for t in range(c * chunk_len, min(n_trans, (c + 1) * chunk_len)):
+            b = band_indices[t]
+            p = positions[b]
+            id_f_out[p] = id_f[t]
+            id_i_out[p] = id_i[t]
+            a_fi_out[p] = a_fi[t]
+            energy_fi_out[p] = energy_fi[t]
+            positions[b] = p + 1
+
+    n_groups = 0
+    for b in range(n_bands):
+        if band_starts[b + 1] > band_starts[b]:
             n_groups += 1
-    starts = starts[:n_groups]
+    group_bands = np.empty(n_groups, dtype=np.int32)
+    group_starts = np.empty(n_groups, dtype=np.int32)
+    group_ends = np.empty(n_groups, dtype=np.int32)
+    g = 0
+    for b in range(n_bands):
+        if band_starts[b + 1] > band_starts[b]:
+            group_bands[g] = b
+            group_starts[g] = band_starts[b]
+            group_ends[g] = band_starts[b + 1]
+            g += 1
 
-    ends = np.empty(n_groups, dtype=np.int32)
-    for g in range(n_groups - 1):
-        ends[g] = starts[g + 1]
-    ends[n_groups - 1] = n_keys
+    return id_f_out, id_i_out, a_fi_out, energy_fi_out, group_bands, group_starts, group_ends
 
-    band_group_indices = np.empty(n_groups, dtype=band_indices.dtype, )
 
-    for g in range(n_groups):
-        band_group_indices[g] = band_indices[starts[g]]
+def _bin_edges(wn_arr: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    """Edges of the bins centred on the grid points: the midpoints, plus half a step beyond each end."""
+    return np.concatenate([[wn_arr[0] - (wn_arr[1] - wn_arr[0]) * 0.5], (wn_arr[:-1] + wn_arr[1:]) * 0.5,
+                           [wn_arr[-1] + (wn_arr[-1] - wn_arr[-2]) * 0.5]])
 
-    return band_group_indices, starts, ends
+
+def rebin_spectrum(
+        x_in: npt.NDArray[np.float64],
+        y_in: npt.NDArray[np.float64],
+        new_centers: npt.NDArray[np.float64]
+) -> npt.NDArray[np.float64]:
+    """
+    Re-bin a high-resolution spectrum onto bins centered at `new_centers` (edges from :func:`_bin_edges`), as the bin
+    average of its piecewise log-linear interpolant. `x_in` must be ascending.
+    """
+
+    edges = _bin_edges(new_centers)
+    # Exact edge values via interpolation.
+    y_edges = np.interp(edges, x_in, y_in)
+    # Interior points of bin i are x_in[lo[i]:hi[i]], i.e. left < x < right (a slice, as x_in is sorted).
+    lo = np.searchsorted(x_in, edges[:-1], side="right")
+    hi = np.searchsorted(x_in, edges[1:], side="left")
+
+    y_out = np.zeros_like(new_centers)
+
+    for i in range(len(new_centers)):
+        x_bin = np.concatenate(([edges[i]], x_in[lo[i]:hi[i]], [edges[i + 1]]))
+        y_bin = np.concatenate(([y_edges[i]], y_in[lo[i]:hi[i]], [y_edges[i + 1]]))
+        # Bin average
+        bin_integral = loglinear_integral_1d(y_data=y_bin, dx=np.diff(x_bin))
+        y_out[i] = bin_integral / (edges[i + 1] - edges[i])
+
+    return y_out
+
+
+@numba.njit(parallel=True, cache=True, error_model="numpy")
+def gamma_lifetime_lookup_from_tau(tau_lookup: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    """
+    Lifetime (natural) broadening contribution of each state to the Lorentzian HWHM, 1 / (4 pi c tau) [cm^-1].
+
+    The HWHM of a transition is the sum of its upper and lower state contributions. States without a finite, positive
+    lifetime (tau is sanitised to 0 where it is missing or infinite, e.g. the ground state) contribute nothing.
+
+    Parameters
+    ----------
+    tau_lookup : ndarray, shape (n_states + 1,)
+        State lifetimes [s].
+
+    Returns
+    -------
+    gamma_lifetime_lookup : ndarray, shape (n_states + 1,)
+    """
+    n_states = tau_lookup.shape[0]
+    gamma_lifetime_lookup = np.zeros(n_states, dtype=np.float64)
+    for s in numba.prange(n_states):
+        tau_s = tau_lookup[s]
+        if tau_s > 0.0 and np.isfinite(tau_s):
+            gamma_lifetime_lookup[s] = 1.0 / (const_4_pi_c * tau_s)
+    return gamma_lifetime_lookup
+
+
+@numba.njit(parallel=True, cache=True, error_model="numpy")
+def _profile_windows(
+        wn_grid: npt.NDArray[np.float64], cutoff: float
+) -> t.Tuple[npt.NDArray[np.int32], npt.NDArray[np.int32]]:
+    """
+    Grid index window [j_start, j_end) over which a line centred on each grid point is evaluated, for a fixed
+    +/- cutoff [cm^-1]. Both bounds are non-decreasing in the grid index.
+    """
+    n_grid = wn_grid.shape[0]
+    j_starts = np.empty(n_grid, dtype=np.int32)
+    j_ends = np.empty(n_grid, dtype=np.int32)
+    for i in numba.prange(n_grid):
+        j_starts[i] = max(0, _binary_search_left(wn_grid, wn_grid[i] - cutoff))
+        j_ends[i] = min(n_grid, _binary_search_right(wn_grid, wn_grid[i] + cutoff) + 1)
+    return j_starts, j_ends
+
+
+@numba.njit(cache=True, error_model="numpy")
+def _layer_broadening_terms(
+        temperatures: npt.NDArray[np.float64],
+        pressures: npt.NDArray[np.float64],
+        broad_n: npt.NDArray[np.float64],
+        broad_gamma: npt.NDArray[np.float64],
+        species_mass: float,
+        t_ref: float,
+        pressure_ref: float,
+) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """
+    Per-layer Voigt broadening terms shared by the CPU and GPU profile kernels.
+
+    Returns
+    -------
+    inv_doppler : ndarray, shape (n_layers,)
+        1 / (sigma_D * sqrt(2)) = inv_doppler[l] / energy for a line or bin at wavenumber energy.
+    gamma_pressure : ndarray, shape (n_layers,)
+        Pressure-broadening HWHM [cm^-1].
+    """
+    n_layers = temperatures.shape[0]
+    sqrt2_NA_kB_on_c = np.sqrt(2.0) * const_sqrt_NA_kB_on_c
+    inv_doppler = np.empty(n_layers, dtype=np.float64)
+    gamma_pressure = np.zeros(n_layers, dtype=np.float64)
+    for l in range(n_layers):
+        temp_l = temperatures[l]
+        inv_doppler[l] = 1.0 / (sqrt2_NA_kB_on_c * np.sqrt(temp_l / species_mass))
+        for b in range(broad_n.shape[0]):
+            gamma_pressure[l] += broad_gamma[b, l] * pressures[l] * (t_ref / temp_l) ** broad_n[b] / pressure_ref
+    return inv_doppler, gamma_pressure
+
+
+@numba.njit(parallel=True, cache=True, error_model="numpy")
+def _band_layer_work_order(
+        profile_buffer: npt.NDArray[np.float64],
+        j_starts: npt.NDArray[np.int32],
+        j_ends: npt.NDArray[np.int32],
+) -> t.Tuple[npt.NDArray[np.int32], npt.NDArray[np.int64]]:
+    """
+    Estimated broadening cost of every (band, layer) pair of a super-line buffer, and the pairs sorted heaviest first.
+
+    The cost of a pair is the number of Voigt evaluations it needs: the summed profile window length of its occupied
+    bins. Pair bl stands for (band, layer) = (bl // n_layers, bl % n_layers).
+
+    Parameters
+    ----------
+    profile_buffer : ndarray, shape (x, n_bands, n_layers, n_grid)
+        Channels 0-2 hold the super-line coefficients; a bin is occupied if any of them is non-zero.
+    j_starts, j_ends : ndarray, shape (n_grid,)
+        Profile windows from :func:`_profile_windows`.
+
+    Returns
+    -------
+    order : ndarray, shape (n_bands * n_layers,)
+        Pair indices sorted by decreasing cost.
+    cost : ndarray, shape (n_bands * n_layers,)
+        int64: a pair's summed window lengths can exceed 2^31 on fine grids at low wavenumber.
+    """
+    n_bands, n_layers, n_grid = profile_buffer.shape[1], profile_buffer.shape[2], profile_buffer.shape[3]
+    n_pairs = n_bands * n_layers
+    cost = np.zeros(n_pairs, dtype=np.int64)
+    for bl in numba.prange(n_pairs):
+        band = bl // n_layers
+        l = bl % n_layers
+        c = 0
+        for i in range(n_grid):
+            if profile_buffer[0, band, l, i] != 0.0 or profile_buffer[1, band, l, i] != 0.0 \
+                    or profile_buffer[2, band, l, i] != 0.0:
+                c += j_ends[i] - j_starts[i]
+        cost[bl] = c
+    order = np.argsort(-cost, kind="mergesort").astype(np.int32)
+    return order, cost
 
 
 # ------------------------------------- EINSTEIN COEFFICIENTS -------------------------------------
-@numba.njit(parallel=True, cache=True, error_model="numpy")
-def calc_einstein_bs(
-        id_i: npt.NDArray[np.int32],
+@numba.njit(parallel=True, nogil=True, cache=True, error_model="numpy")
+def _band_rate_sums(
+        band_indices: npt.NDArray[np.int32],
+        n_bands: int,
         id_f: npt.NDArray[np.int32],
+        id_i: npt.NDArray[np.int32],
         a_fi: npt.NDArray[np.float64],
         energy_fi: npt.NDArray[np.float64],
         g_lookup: npt.NDArray[np.float64],
         inv_g_lookup: npt.NDArray[np.float64],
-) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+        n_frac_lookup: npt.NDArray[np.float64],
+) -> npt.NDArray[np.float64]:
+    """
+    Per-band, per-layer population-weighted sums of the Einstein coefficients A_fi, B_fi and B_if over a batch of
+    transitions, with B in the frequency domain [m^2 / (J s)].
+
+    Each line is weighted by its source state's fraction of the aggregate population (``n_frac_lookup``, the same
+    within-aggregate distribution the band profiles are built with): the upper state's for A_fi and B_fi, the lower
+    state's for B_if. A band's sum is then a rate per molecule in the source aggregate, to be multiplied by that
+    aggregate's population in the rate matrix. Unweighted sums would count the aggregate's population once per state
+    (e.g. 8246 s^-1 instead of ~18 s^-1 for OH X v=1->0), and break detailed balance: with J = B_nu(T) and no
+    collisions, the aggregate equations only return LTE when the weights are the within-aggregate Boltzmann fractions.
+
+    Parameters
+    ----------
+    n_frac_lookup : ndarray, shape (max_state_id + 1, n_layers)
+        Fraction of its aggregate's population in each state, per layer (state-major).
+
+    Returns
+    -------
+    rate_sums : ndarray, shape (n_bands, n_layers, 3)
+    """
     n_trans = a_fi.shape[0]
-    b_fi = np.zeros(n_trans, dtype=np.float64)
-    b_if = np.zeros(n_trans, dtype=np.float64)
-    inv_energy_fi_cubed = 1.0 / (energy_fi ** 3)
-
-    for t in numba.prange(n_trans):
-        a_fi_t = a_fi[t]
-        g_f_t = g_lookup[id_f[t]]
-        inv_g_i_t = inv_g_lookup[id_i[t]]
-        inv_energy_fi_cubed_t = inv_energy_fi_cubed[t]
-        # b_fi_t = a_fi_t * inv_energy_fi_cubed_t / (2 * ac.h * ac.c)  # Wavenumber domain.
-        # b_fi_t = a_fi_t / (inv_energy_fi_cubed_t * 2* ac.h * ac.c)  # Wavelength domain.
-        b_fi_t = a_fi_t * const_c_sq_on_2h * inv_energy_fi_cubed_t  # Frequency domain.
-        b_fi[t] = b_fi_t
-        b_if[t] = b_fi_t * g_f_t * inv_g_i_t
-
-    return b_fi, b_if
+    n_layers = n_frac_lookup.shape[1]
+    n_chunks = max(1, min(_DEFAULT_NUM_THREADS, n_trans))
+    chunk_len = (n_trans + n_chunks - 1) // n_chunks
+    partial = np.zeros((n_chunks, n_bands, n_layers, 3), dtype=np.float64)
+    for c in numba.prange(n_chunks):
+        for t in range(c * chunk_len, min(n_trans, (c + 1) * chunk_len)):
+            nu_t = energy_fi[t] * const_c_cgs
+            b_fi_t = a_fi[t] * const_c_sq_on_2h / (nu_t * nu_t * nu_t)
+            b_if_t = b_fi_t * g_lookup[id_f[t]] * inv_g_lookup[id_i[t]]
+            band_t = band_indices[t]
+            for layer in range(n_layers):
+                frac_f = n_frac_lookup[id_f[t], layer]
+                partial[c, band_t, layer, 0] += a_fi[t] * frac_f
+                partial[c, band_t, layer, 1] += b_fi_t * frac_f
+                partial[c, band_t, layer, 2] += b_if_t * n_frac_lookup[id_i[t], layer]
+    return partial.sum(axis=0)
 
 
 # ------------------------------------- PROCESS BATCH HELPERS -------------------------------------
 @numba.njit(parallel=True, cache=True, error_model="numpy")
+def _super_line_bins(bin_edges: npt.NDArray[np.float64], energy_fi: npt.NDArray[np.float64]) -> npt.NDArray[np.int32]:
+    """Grid bin of each transition's super-line, clamped to the grid."""
+    n_trans = energy_fi.shape[0]
+    max_idx = bin_edges.shape[0] - 2
+    bins = np.empty(n_trans, dtype=np.int32)
+    for t in numba.prange(n_trans):
+        bin_idx = _binary_search_right(bin_edges, energy_fi[t]) - 1
+        if bin_idx < 0:
+            bin_idx = 0
+        elif bin_idx > max_idx:
+            bin_idx = max_idx
+        bins[t] = bin_idx
+    return bins
+
+
+@numba.njit(parallel=True, cache=True, error_model="numpy")
+def _counting_sort_order(
+        keys: npt.NDArray[np.int32], n_keys: int,
+) -> t.Tuple[npt.NDArray[np.int32], npt.NDArray[np.int32], npt.NDArray[np.int32], npt.NDArray[np.int32]]:
+    """
+    Stable parallel counting sort of keys in [0, n_keys), returned as a permutation plus the groups of equal keys.
+
+    Returns
+    -------
+    order : ndarray, shape (n,)
+        keys[order] is sorted; equal keys keep their input order.
+    group_keys, group_starts, group_ends : ndarray, shape (n_groups,)
+        Each present key and the [start, end) range of its entries in order.
+    """
+    n = keys.shape[0]
+    n_chunks = max(1, min(_DEFAULT_NUM_THREADS, n))
+    chunk_len = (n + n_chunks - 1) // n_chunks
+    counts = np.zeros((n_chunks, n_keys), dtype=np.int32)
+    for c in numba.prange(n_chunks):
+        for p in range(c * chunk_len, min(n, (c + 1) * chunk_len)):
+            counts[c, keys[p]] += 1
+    chunk_offsets = np.empty((n_chunks, n_keys), dtype=np.int32)
+    key_starts = np.empty(n_keys + 1, dtype=np.int32)
+    running = 0
+    for k in range(n_keys):
+        key_starts[k] = running
+        for c in range(n_chunks):
+            chunk_offsets[c, k] = running
+            running += counts[c, k]
+    key_starts[n_keys] = running
+    order = np.empty(n, dtype=np.int32)
+    for c in numba.prange(n_chunks):
+        positions = chunk_offsets[c].copy()
+        for p in range(c * chunk_len, min(n, (c + 1) * chunk_len)):
+            k = keys[p]
+            order[positions[k]] = p
+            positions[k] += 1
+    n_groups = 0
+    for k in range(n_keys):
+        if key_starts[k + 1] > key_starts[k]:
+            n_groups += 1
+    group_keys = np.empty(n_groups, dtype=np.int32)
+    group_starts = np.empty(n_groups, dtype=np.int32)
+    group_ends = np.empty(n_groups, dtype=np.int32)
+    g = 0
+    for k in range(n_keys):
+        if key_starts[k + 1] > key_starts[k]:
+            group_keys[g] = k
+            group_starts[g] = key_starts[k]
+            group_ends[g] = key_starts[k + 1]
+            g += 1
+    return order, group_keys, group_starts, group_ends
+
+
+@numba.njit(parallel=True, cache=True, error_model="numpy")
+def _group_by_bin_and_band(
+        bin_indices: npt.NDArray[np.int32], band_indices: npt.NDArray[np.int32], n_grid: int, n_bands: int,
+) -> t.Tuple[npt.NDArray[np.int32], npt.NDArray[np.int32], npt.NDArray[np.int32], npt.NDArray[np.int32],
+npt.NDArray[np.int32]]:
+    """
+    Stable permutation grouping a batch's transitions by (band, bin) super-line: a counting sort by bin, then a stable
+    counting sort by band within each bin. Keeps the count tables small (n_grid, then n_bands per bin) where a single
+    sort on the combined key would need (n_chunks, n_bands * n_grid) tables.
+
+    Returns
+    -------
+    order : ndarray, shape (n_trans,)
+    group_bands, group_bins, group_starts, group_ends : ndarray, shape (n_groups,)
+        Each occupied (band, bin) and the [start, end) range of its transitions in order.
+    """
+    order_bin, bin_keys, bin_starts, bin_ends = _counting_sort_order(keys=bin_indices, n_keys=n_grid)
+    n_bin_groups = bin_keys.shape[0]
+    order = np.empty_like(order_bin)
+    n_sub = np.zeros(n_bin_groups, dtype=np.int32)
+    for g in numba.prange(n_bin_groups):
+        counts = np.zeros(n_bands, dtype=np.int32)
+        for p in range(bin_starts[g], bin_ends[g]):
+            counts[band_indices[order_bin[p]]] += 1
+        positions = np.empty(n_bands, dtype=np.int32)
+        running = bin_starts[g]
+        n_present = 0
+        for b in range(n_bands):
+            positions[b] = running
+            running += counts[b]
+            if counts[b] > 0:
+                n_present += 1
+        for p in range(bin_starts[g], bin_ends[g]):
+            t_ = order_bin[p]
+            b = band_indices[t_]
+            order[positions[b]] = t_
+            positions[b] += 1
+        n_sub[g] = n_present
+    sub_offsets = np.zeros(n_bin_groups + 1, dtype=np.int32)
+    for g in range(n_bin_groups):
+        sub_offsets[g + 1] = sub_offsets[g] + n_sub[g]
+    n_groups = sub_offsets[n_bin_groups]
+    group_bands = np.empty(n_groups, dtype=np.int32)
+    group_bins = np.empty(n_groups, dtype=np.int32)
+    group_starts = np.empty(n_groups, dtype=np.int32)
+    group_ends = np.empty(n_groups, dtype=np.int32)
+    for g in numba.prange(n_bin_groups):
+        q = sub_offsets[g]
+        p = bin_starts[g]
+        while p < bin_ends[g]:
+            b = band_indices[order[p]]
+            start = p
+            while p < bin_ends[g] and band_indices[order[p]] == b:
+                p += 1
+            group_bands[q] = b
+            group_bins[q] = bin_keys[g]
+            group_starts[q] = start
+            group_ends[q] = p
+            q += 1
+    return order, group_bands, group_bins, group_starts, group_ends
+
+
+@numba.njit(parallel=True, nogil=True, cache=True, error_model="numpy")
 def _accumulate_superline_batch(
         profile_buffer: npt.NDArray[np.float64],
         bin_edges: npt.NDArray[np.float64],
         n_lookup: npt.NDArray[np.float64],
         g_lookup: npt.NDArray[np.float64],
         inv_g_lookup: npt.NDArray[np.float64],
+        gamma_lifetime_lookup: npt.NDArray[np.float64],
         id_f: npt.NDArray[np.int32],
         id_i: npt.NDArray[np.int32],
         a_fi: npt.NDArray[np.float64],
         energy_fi: npt.NDArray[np.float64],
+        n_workers: int = _DEFAULT_NUM_THREADS,
 ) -> None:
     """
+    Bins a batch of transitions into super-lines on the grid for every layer (no band axis): net absorption
+    (absorption minus stimulated emission) in channel 0 and spontaneous emission in channel 1. Channels 2 and 3
+    accumulate sum(abs * gamma_lifetime) and sum(abs) over the (gross) absorption; their ratio is the
+    absorption-weighted mean lifetime HWHM of each super-line used in :func:`_broaden_superline_buffer`, as for the
+    per-band super-lines of :func:`_accumulate_superline_band_batch`.
+
+    Each occupied bin is owned by one task: the batch is counting-sorted by bin, and a task sums all of its bin's
+    transitions for every layer in local accumulators before writing that bin once. This replaces a loop over layers
+    that, for every (layer, transition), gathered two scattered populations and scatter-added into the buffer. Tasks
+    are dealt round-robin to n_workers workers, heaviest first. Per-bin sums keep the transitions' input order.
 
     Parameters
     ----------
-    profile_buffer : ndarray, shape (2, n_layers, n_grid)
+    profile_buffer : ndarray, shape (4, n_layers, n_grid)
     bin_edges : ndarray, shape (n_grid + 1,)
     n_lookup : ndarray, shape (n_states + 1, n_layers)
+        State-major, so a state's populations in every layer are contiguous.
     g_lookup : ndarray, shape (n_states + 1)
     inv_g_lookup : ndarray, shape (n_states + 1)
+    gamma_lifetime_lookup : ndarray, shape (n_states + 1,)
+        Per-state lifetime HWHM contributions [cm^-1], from :func:`gamma_lifetime_lookup_from_tau`.
     id_f : ndarray, shape (n_trans,)
     id_i : ndarray, shape (n_trans,)
     a_fi : ndarray, shape (n_trans,)
     energy_fi : ndarray (n_trans,)
-
-    Returns
-    -------
-
+    n_workers : int
     """
-    n_trans = energy_fi.shape[0]
     n_layers = n_lookup.shape[1]
-    max_idx = bin_edges.shape[0] - 2
+    n_grid = bin_edges.shape[0] - 1
+    order, group_bins, group_starts, group_ends = _counting_sort_order(
+        keys=_super_line_bins(bin_edges=bin_edges, energy_fi=energy_fi), n_keys=n_grid,
+    )
+    n_groups = group_bins.shape[0]
+    task_order = np.argsort(-(group_ends - group_starts), kind="mergesort")
 
-    bin_indices = np.empty(n_trans, dtype=np.int32)
-    abs_prefactor = np.empty(n_trans, np.float64)
-    emi_prefactor = np.empty(n_trans, np.float64)
-
-    for t in numba.prange(n_trans):
-        a_fi_t = a_fi[t]
-        energy_fi_t = energy_fi[t]
-        abs_prefactor[t] = a_fi_t / (const_8_pi_c * energy_fi_t * energy_fi_t)
-        emi_prefactor[t] = a_fi_t * energy_fi_t * const_h_c_on_4_pi
-
-        bin_idx = _binary_search_right(bin_edges, energy_fi_t) - 1
-        if bin_idx < 0:
-            bin_idx = 0
-        elif bin_idx > max_idx:
-            bin_idx = max_idx
-
-        bin_indices[t] = bin_idx
-
-    for l in numba.prange(n_layers):
-        for t in range(n_trans):
-            bin_t = bin_indices[t]
-            abs_prefactor_t = abs_prefactor[t]
-            emi_prefactor_t = emi_prefactor[t]
-            # Populations.
-            n_il = n_lookup[id_i[t], l]
-            n_fl = n_lookup[id_f[t], l]
-            # Degeneracies.
-            g_f_t = g_lookup[id_f[t]]
-            inv_g_i_t = inv_g_lookup[id_i[t]]
-            # Accumulate into buffers.
-            profile_buffer[0, l, bin_t] += (
-                    abs_prefactor_t * ((n_il * g_f_t * inv_g_i_t) - n_fl)
-            )
-            profile_buffer[1, l, bin_t] += (
-                    emi_prefactor_t * n_fl
-            )
+    for w in numba.prange(n_workers):
+        acc = np.empty((4, n_layers), dtype=np.float64)
+        for k in range(w, n_groups, n_workers):
+            gk = task_order[k]
+            bin_t = group_bins[gk]
+            acc[:] = 0.0
+            for p in range(group_starts[gk], group_ends[gk]):
+                t_ = order[p]
+                a_fi_t = a_fi[t_]
+                energy_fi_t = energy_fi[t_]
+                id_f_t = id_f[t_]
+                id_i_t = id_i[t_]
+                ste_prefactor_t = a_fi_t / (const_8_pi_c * energy_fi_t * energy_fi_t)
+                abs_prefactor_t = ste_prefactor_t * g_lookup[id_f_t] * inv_g_lookup[id_i_t]
+                emi_prefactor_t = a_fi_t * energy_fi_t * const_h_c_on_4_pi
+                gamma_lifetime_t = gamma_lifetime_lookup[id_f_t] + gamma_lifetime_lookup[id_i_t]
+                n_i = n_lookup[id_i_t]
+                n_f = n_lookup[id_f_t]
+                for l in range(n_layers):
+                    abs_tl = abs_prefactor_t * n_i[l]
+                    acc[0, l] += abs_tl - ste_prefactor_t * n_f[l]
+                    acc[1, l] += emi_prefactor_t * n_f[l]
+                    acc[2, l] += abs_tl * gamma_lifetime_t
+                    acc[3, l] += abs_tl
+            for l in range(n_layers):
+                profile_buffer[0, l, bin_t] += acc[0, l]
+                profile_buffer[1, l, bin_t] += acc[1, l]
+                profile_buffer[2, l, bin_t] += acc[2, l]
+                profile_buffer[3, l, bin_t] += acc[3, l]
 
 
-@numba.njit(parallel=True, cache=True, error_model="numpy")
+@numba.njit(parallel=True, nogil=True, cache=True, error_model="numpy")
 def _accumulate_continuum_superline_batch(
         profile_buffer: npt.NDArray[np.float64],
         bin_edges: npt.NDArray[np.float64],
@@ -290,15 +751,19 @@ def _accumulate_continuum_superline_batch(
         energy_fi: npt.NDArray[np.float64],
         reduced_mass: float,
         box_length: float,
+        n_workers: int = _DEFAULT_NUM_THREADS,
 ) -> None:
     """
-    Can be modified to add in photoassociation cross-section if desired.
+    Bins a batch of bound-free transitions into super-lines on the grid for every layer (no band axis): absorption in
+    channel 0 and the absorption-weighted box broadening in channel 1. Can be modified to add in photoassociation
+    cross-section if desired. Bin-owned tasks as in :func:`_accumulate_superline_batch`.
 
     Parameters
     ----------
     profile_buffer : ndarray, shape (2, n_layers, n_grid)
     bin_edges : ndarray, shape (n_grid + 1,)
     n_lookup : ndarray, shape (n_states + 1, n_layers)
+        State-major, so a state's populations in every layer are contiguous.
     g_lookup : ndarray, shape (n_states + 1, )
     inv_g_lookup : ndarray, shape (n_states + 1, )
     v_lookup : ndarray, shape (n_states + 1, )
@@ -307,45 +772,46 @@ def _accumulate_continuum_superline_batch(
     a_fi : ndarray, shape (n_trans,)
     energy_fi : ndarray (n_trans,)
     reduced_mass : float
-    box_length : floatawdasdasda
-
+    box_length : float
+    n_workers : int
     """
-    n_trans = energy_fi.shape[0]
     n_layers = n_lookup.shape[1]
+    n_grid = bin_edges.shape[0] - 1
     n_states = v_lookup.shape[0]
-    max_idx = bin_edges.shape[0] - 2
-
-    bin_indices = np.empty(n_trans, dtype=np.int32)
-    abs_prefactor = np.empty(n_trans, np.float64)
-
-    for t in numba.prange(n_trans):
-        a_fi_t = a_fi[t]
-        energy_fi_t = energy_fi[t]
-        abs_prefactor[t] = a_fi_t / (const_8_pi_c * energy_fi_t * energy_fi_t)
-
-        bin_idx = _binary_search_right(bin_edges, energy_fi_t) - 1
-        if bin_idx < 0:
-            bin_idx = 0
-        elif bin_idx > max_idx:
-            bin_idx = max_idx
-
-        bin_indices[t] = bin_idx
-
     alpha_box_lookup = np.empty(n_states, dtype=np.float64)
     alpha_box_prefactor = const_h_on_8_c_amu / (box_length * box_length * reduced_mass)
     for s in numba.prange(n_states):
         alpha_box_lookup[s] = alpha_box_prefactor * (2.0 * v_lookup[s] + 1.0)
 
-    for l in numba.prange(n_layers):
-        for t in range(n_trans):
-            bin_t = bin_indices[t]
-            abs_tl = abs_prefactor[t] * g_lookup[id_f[t]] * inv_g_lookup[id_i[t]] * n_lookup[id_i[t], l]
-            # Accumulate into buffers.
-            profile_buffer[0, l, bin_t] += abs_tl
-            profile_buffer[1, l, bin_t] += abs_tl * alpha_box_lookup[id_f[t]]
+    order, group_bins, group_starts, group_ends = _counting_sort_order(
+        keys=_super_line_bins(bin_edges=bin_edges, energy_fi=energy_fi), n_keys=n_grid,
+    )
+    n_groups = group_bins.shape[0]
+    task_order = np.argsort(-(group_ends - group_starts), kind="mergesort")
+
+    for w in numba.prange(n_workers):
+        acc = np.empty((2, n_layers), dtype=np.float64)
+        for k in range(w, n_groups, n_workers):
+            gk = task_order[k]
+            bin_t = group_bins[gk]
+            acc[:] = 0.0
+            for p in range(group_starts[gk], group_ends[gk]):
+                t_ = order[p]
+                energy_fi_t = energy_fi[t_]
+                abs_prefactor_t = a_fi[t_] / (const_8_pi_c * energy_fi_t * energy_fi_t)
+                abs_scale_t = abs_prefactor_t * g_lookup[id_f[t_]] * inv_g_lookup[id_i[t_]]
+                alpha_box_t = alpha_box_lookup[id_f[t_]]
+                n_i = n_lookup[id_i[t_]]
+                for l in range(n_layers):
+                    abs_tl = abs_scale_t * n_i[l]
+                    acc[0, l] += abs_tl
+                    acc[1, l] += abs_tl * alpha_box_t
+            for l in range(n_layers):
+                profile_buffer[0, l, bin_t] += acc[0, l]
+                profile_buffer[1, l, bin_t] += acc[1, l]
 
 
-@numba.njit(parallel=True, cache=True, error_model="numpy")
+@numba.njit(parallel=True, nogil=True, cache=True, error_model="numpy")
 def _accumulate_superline_band_batch(
         profile_buffer: npt.NDArray[np.float64],
         band_indices: npt.NDArray[np.int32],
@@ -353,69 +819,85 @@ def _accumulate_superline_band_batch(
         n_frac_lookup: npt.NDArray[np.float64],
         g_lookup: npt.NDArray[np.float64],
         inv_g_lookup: npt.NDArray[np.float64],
+        gamma_lifetime_lookup: npt.NDArray[np.float64],
         id_f: npt.NDArray[np.int32],
         id_i: npt.NDArray[np.int32],
         a_fi: npt.NDArray[np.float64],
         energy_fi: npt.NDArray[np.float64],
+        n_workers: int = _DEFAULT_NUM_THREADS,
 ) -> None:
     """
+    Bins a batch of transitions into per-band super-lines on the grid, for every layer.
+
+    Channels 0-2 of profile_buffer accumulate the absorption, stimulated emission and spontaneous emission
+    coefficients. Channel 3 accumulates the absorption-weighted lifetime broadening, sum(abs * gamma_lifetime); dividing
+    it by channel 0 gives the intensity-weighted mean lifetime HWHM of each super-line, used in
+    :func:`_broaden_superline_band_buffer`. This mirrors the box-broadening channel of
+    :func:`_accumulate_continuum_superline_band_batch`.
+
+    Each occupied (band, bin) super-line is owned by one task: the batch is grouped by (band, bin)
+    (:func:`_group_by_bin_and_band`), and a task sums its transitions for every layer in local accumulators before
+    writing its cells once. Tasks are dealt round-robin to n_workers workers, heaviest first.
 
     Parameters
     ----------
-    profile_buffer : ndarray, shape (3, n_bands, n_layers, n_grid)
+    profile_buffer : ndarray, shape (4, n_bands, n_layers, n_grid)
     band_indices : ndarray, shape (n_trans,)
     bin_edges : ndarray, shape (n_grid + 1,)
     n_frac_lookup : ndarray, shape (n_states + 1, n_layers)
+        State-major, so a state's populations in every layer are contiguous.
     g_lookup : ndarray, shape (n_states + 1,)
     inv_g_lookup : ndarray, shape (n_states + 1,)
+    gamma_lifetime_lookup : ndarray, shape (n_states + 1,)
+        Per-state lifetime HWHM contributions [cm^-1], from :func:`gamma_lifetime_lookup_from_tau`.
     id_f : ndarray, shape (n_trans,)
     id_i : ndarray, shape (n_trans,)
     a_fi : ndarray, shape (n_trans,)
     energy_fi : ndarray (n_trans,)
+    n_workers : int
     """
-    n_trans = energy_fi.shape[0]
     n_layers = n_frac_lookup.shape[1]
-    max_idx = bin_edges.shape[0] - 2
+    n_grid = bin_edges.shape[0] - 1
+    order, group_bands, group_bins, group_starts, group_ends = _group_by_bin_and_band(
+        bin_indices=_super_line_bins(bin_edges=bin_edges, energy_fi=energy_fi), band_indices=band_indices,
+        n_grid=n_grid, n_bands=profile_buffer.shape[1],
+    )
+    n_groups = group_bins.shape[0]
+    task_order = np.argsort(-(group_ends - group_starts), kind="mergesort")
 
-    bin_indices = np.empty(n_trans, dtype=np.int32)
-    abs_ste_prefactor = np.empty(n_trans, np.float64)
-    spe_prefactor = np.empty(n_trans, np.float64)
-
-    for t in numba.prange(n_trans):
-        a_fi_t = a_fi[t]
-        energy_fi_t = energy_fi[t]
-        abs_ste_prefactor[t] = a_fi_t / (const_8_pi_c * energy_fi_t * energy_fi_t)
-        spe_prefactor[t] = a_fi_t * energy_fi_t * const_h_c_on_4_pi
-
-        bin_idx = _binary_search_right(bin_edges, energy_fi_t) - 1
-        if bin_idx < 0:
-            bin_idx = 0
-        elif bin_idx > max_idx:
-            bin_idx = max_idx
-
-        bin_indices[t] = bin_idx
-
-    for l in numba.prange(n_layers):
-        for t in range(n_trans):
-            band_t = band_indices[t]
-            bin_t = bin_indices[t]
-            abs_ste_prefactor_t = abs_ste_prefactor[t]
-            abs_prefactor_t = abs_ste_prefactor_t * g_lookup[id_f[t]] * inv_g_lookup[id_i[t]]
-            ste_prefactor_t = abs_ste_prefactor_t
-            spe_prefactor_t = spe_prefactor[t]
-            # Accumulate into buffers.
-            profile_buffer[0, band_t, l, bin_t] += (
-                    abs_prefactor_t * n_frac_lookup[id_i[t], l]
-            )
-            profile_buffer[1, band_t, l, bin_t] += (
-                    ste_prefactor_t * n_frac_lookup[id_f[t], l]
-            )
-            profile_buffer[2, band_t, l, bin_t] += (
-                    spe_prefactor_t * n_frac_lookup[id_f[t], l]
-            )
+    for w in numba.prange(n_workers):
+        acc = np.empty((4, n_layers), dtype=np.float64)
+        for k in range(w, n_groups, n_workers):
+            gk = task_order[k]
+            band_t = group_bands[gk]
+            bin_t = group_bins[gk]
+            acc[:] = 0.0
+            for p in range(group_starts[gk], group_ends[gk]):
+                t_ = order[p]
+                a_fi_t = a_fi[t_]
+                energy_fi_t = energy_fi[t_]
+                id_f_t = id_f[t_]
+                id_i_t = id_i[t_]
+                ste_prefactor_t = a_fi_t / (const_8_pi_c * energy_fi_t * energy_fi_t)
+                abs_prefactor_t = ste_prefactor_t * g_lookup[id_f_t] * inv_g_lookup[id_i_t]
+                spe_prefactor_t = a_fi_t * energy_fi_t * const_h_c_on_4_pi
+                gamma_lifetime_t = gamma_lifetime_lookup[id_f_t] + gamma_lifetime_lookup[id_i_t]
+                n_i = n_frac_lookup[id_i_t]
+                n_f = n_frac_lookup[id_f_t]
+                for l in range(n_layers):
+                    abs_tl = abs_prefactor_t * n_i[l]
+                    acc[0, l] += abs_tl
+                    acc[1, l] += ste_prefactor_t * n_f[l]
+                    acc[2, l] += spe_prefactor_t * n_f[l]
+                    acc[3, l] += abs_tl * gamma_lifetime_t
+            for l in range(n_layers):
+                profile_buffer[0, band_t, l, bin_t] += acc[0, l]
+                profile_buffer[1, band_t, l, bin_t] += acc[1, l]
+                profile_buffer[2, band_t, l, bin_t] += acc[2, l]
+                profile_buffer[3, band_t, l, bin_t] += acc[3, l]
 
 
-@numba.njit(parallel=True, cache=True, error_model="numpy")
+@numba.njit(parallel=True, nogil=True, cache=True, error_model="numpy")
 def _accumulate_continuum_superline_band_batch(
         profile_buffer: npt.NDArray[np.float64],
         band_indices: npt.NDArray[np.int32],
@@ -430,9 +912,12 @@ def _accumulate_continuum_superline_band_batch(
         energy_fi: npt.NDArray[np.float64],
         reduced_mass: float,
         box_length: float,
+        n_workers: int = _DEFAULT_NUM_THREADS,
 ) -> None:
     """
-    Can be modified to add in photoassociation cross-section if desired.
+    Bins a batch of bound-free transitions into per-band super-lines: absorption in channel 0 and the
+    absorption-weighted box broadening in channel 1. Can be modified to add in photoassociation cross-section if
+    desired. (band, bin)-owned tasks as in :func:`_accumulate_superline_band_batch`.
 
     Parameters
     ----------
@@ -440,6 +925,7 @@ def _accumulate_continuum_superline_band_batch(
     band_indices : ndarray, shape (n_trans,)
     bin_edges : ndarray, shape (n_grid + 1,)
     n_frac_lookup : ndarray, shape (n_states + 1, n_layers)
+        State-major, so a state's populations in every layer are contiguous.
     g_lookup : ndarray, shape (n_states + 1, )
     inv_g_lookup : ndarray, shape (n_states + 1,)
     v_lookup : ndarray, shape (n_states + 1, )
@@ -449,41 +935,44 @@ def _accumulate_continuum_superline_band_batch(
     energy_fi : ndarray (n_trans,)
     reduced_mass : float
     box_length : float
+    n_workers : int
     """
-    n_trans = energy_fi.shape[0]
     n_layers = n_frac_lookup.shape[1]
+    n_grid = bin_edges.shape[0] - 1
     n_states = v_lookup.shape[0]
-    max_idx = bin_edges.shape[0] - 2
-
-    bin_indices = np.empty(n_trans, dtype=np.int32)
-    abs_prefactor = np.empty(n_trans, np.float64)
-
-    for t in numba.prange(n_trans):
-        a_fi_t = a_fi[t]
-        energy_fi_t = energy_fi[t]
-        abs_prefactor[t] = a_fi_t / (const_8_pi_c * energy_fi_t * energy_fi_t)
-
-        bin_idx = _binary_search_right(bin_edges, energy_fi_t) - 1
-        if bin_idx < 0:
-            bin_idx = 0
-        elif bin_idx > max_idx:
-            bin_idx = max_idx
-
-        bin_indices[t] = bin_idx
-
     alpha_box_lookup = np.empty(n_states, dtype=np.float64)
     alpha_box_prefactor = const_h_on_8_c_amu / (box_length * box_length * reduced_mass)
     for s in numba.prange(n_states):
         alpha_box_lookup[s] = alpha_box_prefactor * (2.0 * v_lookup[s] + 1.0)
 
-    for l in numba.prange(n_layers):
-        for t in range(n_trans):
-            band_t = band_indices[t]
-            bin_t = bin_indices[t]
-            abs_tl = abs_prefactor[t] * g_lookup[id_f[t]] * inv_g_lookup[id_i[t]] * n_frac_lookup[id_i[t], l]
-            # Accumulate into buffers.
-            profile_buffer[0, band_t, l, bin_t] += abs_tl
-            profile_buffer[1, band_t, l, bin_t] += abs_tl * alpha_box_lookup[id_f[t]]
+    order, group_bands, group_bins, group_starts, group_ends = _group_by_bin_and_band(
+        bin_indices=_super_line_bins(bin_edges=bin_edges, energy_fi=energy_fi), band_indices=band_indices,
+        n_grid=n_grid, n_bands=profile_buffer.shape[1],
+    )
+    n_groups = group_bins.shape[0]
+    task_order = np.argsort(-(group_ends - group_starts), kind="mergesort")
+
+    for w in numba.prange(n_workers):
+        acc = np.empty((2, n_layers), dtype=np.float64)
+        for k in range(w, n_groups, n_workers):
+            gk = task_order[k]
+            band_t = group_bands[gk]
+            bin_t = group_bins[gk]
+            acc[:] = 0.0
+            for p in range(group_starts[gk], group_ends[gk]):
+                t_ = order[p]
+                energy_fi_t = energy_fi[t_]
+                abs_prefactor_t = a_fi[t_] / (const_8_pi_c * energy_fi_t * energy_fi_t)
+                abs_scale_t = abs_prefactor_t * g_lookup[id_f[t_]] * inv_g_lookup[id_i[t_]]
+                alpha_box_t = alpha_box_lookup[id_f[t_]]
+                n_i = n_frac_lookup[id_i[t_]]
+                for l in range(n_layers):
+                    abs_tl = abs_scale_t * n_i[l]
+                    acc[0, l] += abs_tl
+                    acc[1, l] += abs_tl * alpha_box_t
+            for l in range(n_layers):
+                profile_buffer[0, band_t, l, bin_t] += acc[0, l]
+                profile_buffer[1, band_t, l, bin_t] += acc[1, l]
 
 
 # ------------------------------------- COMPACT PROFILE & STORE CLASSES -------------------------------------
@@ -491,11 +980,11 @@ def _accumulate_continuum_superline_band_batch(
 @numba.njit(parallel=True, cache=True, error_model="numpy")
 def _analyse_profiles(
         profile_matrix_2d: npt.NDArray[np.float64], cutoff: float
-) -> t.Tuple[npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.bool_]]:
+) -> t.Tuple[npt.NDArray[np.int32], npt.NDArray[np.int32], npt.NDArray[np.bool_]]:
     # profile_matrix_2d: (n_profiles, n_grid) - caller reshapes
     n_profiles, n_grid = profile_matrix_2d.shape
-    start_idxs = np.empty(n_profiles, dtype=np.int64)
-    end_idxs = np.empty(n_profiles, dtype=np.int64)
+    start_idxs = np.empty(n_profiles, dtype=np.int32)
+    end_idxs = np.empty(n_profiles, dtype=np.int32)
     valid = np.zeros(n_profiles, dtype=np.bool_)
 
     for i in numba.prange(n_profiles):
@@ -520,8 +1009,8 @@ def _write_profiles(
         profile_matrix_2d: npt.NDArray[np.float64],
         profiles_out: npt.NDArray[np.float64],
         offsets_full: npt.NDArray[np.int64],
-        start_idxs: npt.NDArray[np.int64],
-        end_idxs: npt.NDArray[np.int64],
+        start_idxs: npt.NDArray[np.int32],
+        end_idxs: npt.NDArray[np.int32],
         valid: npt.NDArray[np.bool_]
 ) -> None:
     n_profiles = valid.shape[0]
@@ -539,8 +1028,8 @@ def _write_profiles(
 def _build_xsec(
         profiles: npt.NDArray[np.float64],
         offsets: npt.NDArray[np.int64],
-        start_idxs: npt.NDArray[np.int64],
-        key_idx_array: npt.NDArray[np.int64],
+        start_idxs: npt.NDArray[np.int32],
+        key_idx_array: npt.NDArray[np.int32],
         pop_matrix: npt.NDArray[np.float64],
         wn_grid_len: int,
         is_abs: bool,
@@ -577,24 +1066,27 @@ def _build_xsec(
     # Note: This allocation is performed inside the njit function; it is ok and reused only for the scope of this call.
     buffers = np.zeros((numba_num_threads, wn_grid_len), dtype=np.float64)
 
-    # Accumulate profile in buffers[thread_id,:] per thread.
-    for i in numba.prange(n_profiles):
-        thread_id = numba.get_thread_id()  # Thread ID [0..n_threads-1]
+    # Profiles are dealt round-robin to numba_num_threads workers, each accumulating into its own buffer row. Not a
+    # buffer per thread (numba.get_thread_id()): TBB hands out prange chunks dynamically, so which profiles a thread's
+    # row summed changed from call to call, and with it the floating-point rounding of the result (up to ~1e-16
+    # relative per call, amplified by the NLTE iteration). The round-robin split makes it reproducible, at the same
+    # speed (tests/check_build_xsec_determinism.py).
+    for w in numba.prange(numba_num_threads):
+        for i in range(w, n_profiles, numba_num_threads):
+            # Absorption depends on ID_l population; Emission depends on ID_u population.
+            if is_abs:
+                pop_val = pop_matrix[key_idx_array[i, 1]]
+            else:
+                pop_val = pop_matrix[key_idx_array[i, 0]]
 
-        # Absorption depends on ID_l population; Emission depends on ID_u population.
-        if is_abs:
-            pop_val = pop_matrix[key_idx_array[i, 1]]
-        else:
-            pop_val = pop_matrix[key_idx_array[i, 0]]
+            offset_start = offsets[i]
+            offset_end = offsets[i + 1]
+            profile_len = offset_end - offset_start
+            start_idx = start_idxs[i]
 
-        offset_start = offsets[i]
-        offset_end = offsets[i + 1]
-        profile_len = offset_end - offset_start
-        start_idx = start_idxs[i]
-
-        # Element-wise accumulation into the thread's buffer row.
-        for j in range(profile_len):
-            buffers[thread_id, start_idx + j] += pop_val * profiles[offset_start + j]
+            # Element-wise accumulation into the worker's buffer row.
+            for j in range(profile_len):
+                buffers[w, start_idx + j] += pop_val * profiles[offset_start + j]
 
     # Parallelize over grid indices, avoids race conditions.
     xsec_out = np.zeros(wn_grid_len, dtype=np.float64)
@@ -610,10 +1102,10 @@ def _build_xsec(
 @numba.njit(parallel=False, cache=True, error_model="numpy")
 def _rebuild_all_ox_profiles(
         id_agg_cutoff: int,
-        key_idx_map: npt.NDArray[np.int64],
+        key_idx_map: npt.NDArray[np.int32],
         profiles: npt.NDArray[np.float64],
         offsets: npt.NDArray[np.int64],
-        start_idxs: npt.NDArray[np.int64],
+        start_idxs: npt.NDArray[np.int32],
         num_grid: int,
 ) -> npt.NDArray[np.float64]:
     """
@@ -665,45 +1157,18 @@ def _rebuild_all_ox_profiles(
     return all_profiles
 
 
-# @numba.njit(parallel=True, cache=True, error_model="numpy")
-# def _compute_all_cross_terms_vectorized(
-#         emission_profiles: npt.NDArray[np.float64],
-#         chem_factor: float,
-# ) -> npt.NDArray[np.float64]:
-#     """
-#
-#     Parameters
-#     ----------
-#     emission_profiles
-#     chem_factor
-#
-#     Returns
-#     -------
-#
-#     """
-#     n_agg_states, num_grid = emission_profiles.shape
-#     result = np.zeros((n_agg_states, num_grid), dtype=np.float64)
-#
-#     for o_idx in numba.prange(n_agg_states):
-#         for wn_idx in range(num_grid):
-#             result[o_idx, wn_idx] = (
-#                     emission_profiles[o_idx, wn_idx] * chem_factor
-#             )
-#
-#     return result
-
-
 class CompactProfile:
     __slots__ = ["profiles", "offsets", "start_idxs", "key_idx_map", "key_lookup"]
 
     def __init__(self):
         self.profiles: npt.NDArray[np.float64] | None = None
+        # int64: offsets index the concatenated profiles, whose total length (bands x grid points) can exceed 2^31.
         self.offsets: npt.NDArray[np.int64] | None = None
-        self.start_idxs: npt.NDArray[np.int64] | None = None
-        self.key_idx_map: npt.NDArray[np.int64] | None = None
+        self.start_idxs: npt.NDArray[np.int32] | None = None
+        self.key_idx_map: npt.NDArray[np.int32] | None = None
         self.key_lookup: t.Dict[t.Tuple[int, int], int] = {}
 
-    def finalise_from_buffer(self, profile_matrix: npt.NDArray[np.float64], keys: npt.NDArray[np.int64]):
+    def finalise_from_buffer(self, profile_matrix: npt.NDArray[np.float64], keys: npt.NDArray[np.int32]):
         """
         Finalise a set of band profiles stored in the compact super-line representation.
 
@@ -780,8 +1245,8 @@ class CompactProfile:
         n_valid = int(valid.sum())
 
         self.offsets = np.empty(n_valid + 1, dtype=np.int64)
-        self.start_idxs = np.empty(n_valid, dtype=np.int64)
-        self.key_idx_map = np.empty((n_valid, 2), dtype=np.int64)
+        self.start_idxs = np.empty(n_valid, dtype=np.int32)
+        self.key_idx_map = np.empty((n_valid, 2), dtype=np.int32)
         self.key_lookup.clear()
 
         store_idx = 0
@@ -796,7 +1261,8 @@ class CompactProfile:
 
         self.offsets[n_valid] = total_len
         self.profiles = profiles_out
-        log.log(_LOG_VERBOSE_2, f"Finalised CompactProfile with {total_len} points for {n_valid} bands.")
+        if log.isEnabledFor(_LOG_VERBOSE_2):
+            log.log(_LOG_VERBOSE_2, f"Finalised CompactProfile with {total_len} points for {n_valid} bands.")
 
     def get_profile(self, key: t.Tuple[int, int] | int) -> t.Tuple[npt.NDArray[np.float64], int] | None:
         profile_idx = self.key_lookup.get(key)
@@ -810,33 +1276,10 @@ class CompactProfile:
     def build_xsec(
             self, pop_matrix: npt.NDArray[np.float64], wn_grid: npt.NDArray[np.float64], is_abs: bool
     ) -> npt.NDArray[np.float64]:
-        # Ensure arrays are the right dtype and contiguous
-        profiles = np.ascontiguousarray(self.profiles, dtype=np.float64)
-        offsets = np.ascontiguousarray(self.offsets, dtype=np.int64)
-        start_idxs = np.ascontiguousarray(self.start_idxs, dtype=np.int64)
-        key_idx_map = np.ascontiguousarray(self.key_idx_map, dtype=np.int64)
-
+        # finalise_from_buffer builds every array contiguous with the kernel's dtype.
         return _build_xsec(
-            profiles, offsets, start_idxs, key_idx_map, pop_matrix, wn_grid.shape[0], is_abs
-        )
-
-    def get_all_emission_from_upper(
-            self, id_agg_cutoff: int, num_grid: int
-    ) -> npt.NDArray[np.float64]:
-        """
-        Rebuild spontaneous emission profiles for all upper states in a single pass.
-
-        Returns
-        -------
-        all_profiles : np.ndarray, shape (id_agg_cutoff, num_grid)
-        """
-        return _rebuild_all_ox_profiles(
-            id_agg_cutoff=id_agg_cutoff,
-            key_idx_map=np.ascontiguousarray(self.key_idx_map, dtype=np.int64),
-            profiles=np.ascontiguousarray(self.profiles, dtype=np.float64),
-            offsets=np.ascontiguousarray(self.offsets, dtype=np.int64),
-            start_idxs=np.ascontiguousarray(self.start_idxs, dtype=np.int64),
-            num_grid=num_grid,
+            profiles=self.profiles, offsets=self.offsets, start_idxs=self.start_idxs, key_idx_array=self.key_idx_map,
+            pop_matrix=pop_matrix, wn_grid_len=wn_grid.shape[0], is_abs=is_abs,
         )
 
 
@@ -845,7 +1288,7 @@ class ProfileStore:
     Store :class:`tiramisu.nlte.CompactProfile` objects representing the species' absorption, stimulated emission and
     spontaneous emission profiles. Used for bound-bound transitions (including quasi-bound).
     """
-    __slots__ = ["n_layers", "abs_profiles", "ste_profiles", "spe_profiles"]
+    __slots__ = ["n_layers", "abs_profiles", "ste_profiles", "spe_profiles", "_profile_cache"]
 
     def __init__(self, n_layers: int):
         self.n_layers = n_layers
@@ -853,11 +1296,15 @@ class ProfileStore:
         self.abs_profiles = [CompactProfile() for _ in range(n_layers)]  # Absorption
         self.ste_profiles = [CompactProfile() for _ in range(n_layers)]  # Stimulated Emission
         self.spe_profiles = [CompactProfile() for _ in range(n_layers)]  # Spontaneous Emission
+        # Instance-level (not class-level lru_cache!) cache for get_profile: an lru_cache on an instance method
+        # binds self into the cache key, which both pins every ProfileStore instance in memory forever and
+        # shares one global-size cache across all instances/species/iterations.
+        self._profile_cache: t.Dict[t.Tuple[int, t.Tuple[int, int], str], t.Tuple[npt.NDArray[np.float64], int]] = {}
 
     def finalise_from_buffer(
             self,
             profile_buffer: npt.NDArray[np.float64],
-            band_keys: npt.NDArray[np.int64],
+            band_keys: npt.NDArray[np.int32],
             save: bool = False,
             species: str = None,
     ) -> None:
@@ -876,29 +1323,16 @@ class ProfileStore:
         """
         # TEMP below!
         export_dir = pathlib.Path(r"/mnt/c/PhD/programs/TIRAMISU/tests/outputs/")
-        export_dir.mkdir(parents=True, exist_ok=True)
+        if save:
+            export_dir.mkdir(parents=True, exist_ok=True)
         #####
         for l in range(self.n_layers):
-            self.abs_profiles[l].finalise_from_buffer(
-                profile_matrix=profile_buffer[0, :, l, :],
-                keys=band_keys,
-            )
-            self.ste_profiles[l].finalise_from_buffer(
-                profile_matrix=profile_buffer[1, :, l, :],
-                keys=band_keys,
-            )
-            self.spe_profiles[l].finalise_from_buffer(
-                profile_matrix=profile_buffer[2, :, l, :],
-                keys=band_keys,
-            )
-            if save:
-                for label, store in (
-                        ("abs", self.abs_profiles[l]),
-                        ("ste", self.ste_profiles[l]),
-                        ("spe", self.spe_profiles[l]),
-                ):
-                    if store.profiles is None:
-                        continue
+            for channel, (label, stores) in enumerate(
+                    (("abs", self.abs_profiles), ("ste", self.ste_profiles), ("spe", self.spe_profiles))
+            ):
+                store = stores[l]
+                store.finalise_from_buffer(profile_matrix=profile_buffer[channel, :, l, :], keys=band_keys)
+                if save:
                     np.savez_compressed(
                         export_dir / f"{species}_L{l:03d}_{label}.npz",
                         profiles=store.profiles,  # flat 1D array of all profile data
@@ -907,31 +1341,24 @@ class ProfileStore:
                         key_idx_map=store.key_idx_map,
                     )
 
-    # def get_profiles(
-    #         self, layer_idx: int, key: t.Tuple[int, int]
-    # ) -> t.Tuple[
-    #     t.Tuple[npt.NDArray[np.float64], int],
-    #     t.Tuple[npt.NDArray[np.float64], int],
-    #     t.Tuple[npt.NDArray[np.float64], int]
-    # ]:
-    #     return (
-    #         self.abs_profiles[layer_idx].get_profile(key),
-    #         self.ste_profiles[layer_idx].get_profile(key),
-    #         self.spe_profiles[layer_idx].get_profile(key),
-    #     )
-
-    @lru_cache(maxsize=1000)
     def get_profile(
             self, layer_idx: int, key: t.Tuple[int, int], profile_type: str
     ) -> t.Tuple[npt.NDArray[np.float64], int]:
+        cache_key = (layer_idx, key, profile_type)
+        if cache_key in self._profile_cache:
+            return self._profile_cache[cache_key]
+
         if profile_type == "abs":
-            return self.abs_profiles[layer_idx].get_profile(key)
-        if profile_type == "ste":
-            return self.ste_profiles[layer_idx].get_profile(key)
-        if profile_type == "spe":
-            return self.spe_profiles[layer_idx].get_profile(key)
+            result = self.abs_profiles[layer_idx].get_profile(key)
+        elif profile_type == "ste":
+            result = self.ste_profiles[layer_idx].get_profile(key)
+        elif profile_type == "spe":
+            result = self.spe_profiles[layer_idx].get_profile(key)
         else:
             raise RuntimeError(f"ProfileStore profile type {profile_type} not implemented.")
+
+        self._profile_cache[cache_key] = result
+        return result
 
     def build_abs_emi(
             self, layer_idx: int, pop_matrix: npt.NDArray[np.float64], wn_grid: npt.NDArray[np.float64]
@@ -968,122 +1395,75 @@ class ProfileStore:
             Normalised emission profiles; each row integrates to 1 (or is zero).
             Units are 1/wn_grid.unit.
         """
-        all_profiles = self.spe_profiles[layer_idx].get_all_emission_from_upper(
-            id_agg_cutoff=id_agg_cutoff,
-            num_grid=wn_grid.shape[0],
+        spe = self.spe_profiles[layer_idx]
+        # Summed over lower states in one pass: row o_idx is the emission from upper state o_idx.
+        all_profiles = _rebuild_all_ox_profiles(
+            id_agg_cutoff=id_agg_cutoff, key_idx_map=spe.key_idx_map, profiles=spe.profiles, offsets=spe.offsets,
+            start_idxs=spe.start_idxs, num_grid=wn_grid.shape[0],
         )
         wn_dx = np.diff(wn_grid.value)
-        # return simpson_normalise_2d(y_data=all_profiles, x_data=wn_grid.value) << 1 / wn_grid.unit
-        return loglinear_normalise_2d_nonnegative(y_data=all_profiles, dx=wn_dx) << 1 / wn_grid.unit
+        # Normalised as photon-counting weights: emission profiles are energy rates (h nu per photon), while the cross
+        # terms they feed count transitions, so divide by nu first (see "Photon-counting weights" in nlte.py).
+        photon_profiles = all_profiles / wn_grid.value[None, :]
+        return loglinear_normalise_2d_nonnegative(y_data=photon_profiles, dx=wn_dx) << 1 / wn_grid.unit
 
     def get_sorted_band_keys(
-            self, agg_energies: npt.NDArray[np.float64], profile_type: str = "abs",  id_cutoff: int = 0,
-            num_max: int = -1
+            self, agg_energies: npt.NDArray[np.float64], id_cutoff: int = 0,
     ) -> t.List[t.Tuple[int, int]]:
         """
-        Returns band keys (id_agg_f, id_agg_i) from the CompactProfile for the given layer, sorted by energy gap
-        (id_agg_f - id_agg_i) ascending, then by id_agg_i, then by id_agg_f. Returns at most num_max keys.
+        Returns the absorption band keys (id_agg_f, id_agg_i) present in every layer, sorted by energy gap
+        (id_agg_f - id_agg_i) ascending, then by id_agg_i, then by id_agg_f.
 
         Parameters
         ----------
         agg_energies : ndarray
             Array containing the energies for each aggregate state ordered on id_agg (ascending).
-        profile_type : str
-            One of "abs", "ste", "spe" - selects which CompactProfile to inspect.
         id_cutoff : int
             ID above which states are fixed, so key pairs containing IDs above this should be excluded. If not provided,
             returned keys include band keys involving the cutoff state.
-        num_max : int
-            Maximum number of keys to return. If not set to a psoitive value, return all band keys.
 
         Returns
         -------
         List of (id_agg_f, id_agg_i) tuples in the above order.
         """
-        match profile_type:
-            case "abs":
-                profiles = self.abs_profiles
-            case "ste":
-                profiles = self.ste_profiles
-            case "spe":
-                profiles = self.spe_profiles
-            case _:
-                raise ValueError(f"Unknown profile_type '{profile_type}': expected 'abs', 'ste' or 'spe'.")
-
-        key_sets = [set(compact.key_lookup.keys()) for compact in profiles]
+        key_sets = [set(compact.key_lookup.keys()) for compact in self.abs_profiles]
         common_keys = key_sets[0].intersection(*key_sets[1:])
         if id_cutoff > 0:
             common_keys = [k for k in common_keys if id_cutoff >= k[0] > k[1] >= 0]
         else:
             common_keys = [k for k in common_keys if k[0] > k[1] >= 0]
 
-        def sort_key(k):
-            id_f, id_i = k
-            e_i = agg_energies[id_i]  # lower state energy
-            e_f = agg_energies[id_f]  # upper state energy
-            nu = e_f - e_i  # band centre frequency
-            return e_i, nu
+        if not common_keys:
+            return []
 
-        common_keys.sort(key=sort_key)
-        if num_max > 0:
-            return common_keys[:num_max]
-        else:
-            return common_keys
+        # Vectorized equivalent of sorting by (e_i, nu) with a per-comparison Python closure: gather id_f/id_i via
+        # fancy indexing and let np.lexsort do the ordering (primary key last: e_i, then nu) instead.
+        common_keys_arr = np.array(common_keys, dtype=np.int32)
+        id_f_arr = common_keys_arr[:, 0]
+        id_i_arr = common_keys_arr[:, 1]
+        e_i_arr = agg_energies[id_i_arr]  # lower state energy
+        e_f_arr = agg_energies[id_f_arr]  # upper state energy
+        nu_arr = e_f_arr - e_i_arr  # band centre frequency
 
-
-    def get_cutoff_band_keys(
-            self, id_cutoff: int, profile_type: str = "abs",
-    ) -> t.List[t.Tuple[int, int]]:
-        """
-
-        Parameters
-        ----------
-        id_cutoff : int
-            ID above which states are fixed, so key pairs containing IDs above this should be excluded.
-        profile_type : str
-            One of "abs", "ste", "spe" - selects which CompactProfile to inspect.
-
-        Returns
-        -------
-        List of (id_agg_f, id_agg_i) tuples in the above order.
-        """
-        match profile_type:
-            case "abs":
-                profiles = self.abs_profiles
-            case "ste":
-                profiles = self.ste_profiles
-            case "spe":
-                profiles = self.spe_profiles
-            case _:
-                raise ValueError(f"Unknown profile_type '{profile_type}': expected 'abs', 'ste' or 'spe'.")
-
-        key_sets = [set(compact.key_lookup.keys()) for compact in profiles]
-        common_keys = key_sets[0].intersection(*key_sets[1:])
-        common_keys = [k for k in common_keys if k[0] == id_cutoff or k[1] == id_cutoff]
-
-        return common_keys
+        order = np.lexsort((nu_arr, e_i_arr))
+        return [(int(id_f_arr[i]), int(id_i_arr[i])) for i in order]
 
 
 class ContinuumProfileStore:
     __slots__ = [
         "n_layers", "abs_profiles",
         # "ste_profiles", "spe_profiles"
+        "_profile_cache",
     ]
 
     def __init__(self, n_layers: int):
         self.n_layers = n_layers
         # Storage for final profiles.
         self.abs_profiles = [CompactProfile() for _ in range(n_layers)]  # Absorption
-        # self.ste_profiles = [CompactProfile() for _ in range(n_layers)]  # Stimulated Emission
-        # self.spe_profiles = [CompactProfile() for _ in range(n_layers)]  # Spontaneous Emission
+        # Instance-level cache (see ProfileStore.get_profile for why not a class-level lru_cache).
+        self._profile_cache: t.Dict[t.Tuple[int, int, str], t.Tuple[npt.NDArray, int]] = {}
 
-    def finalise_from_buffer(
-            self,
-            profile_buffer: npt.NDArray[np.float64],
-            band_keys: npt.NDArray[np.int64],
-            save: bool = False,
-            species: str = None,
-    ) -> None:
+    def finalise_from_buffer(self, profile_buffer: npt.NDArray[np.float64], band_keys: npt.NDArray[np.int32]) -> None:
         """
 
         Parameters
@@ -1091,51 +1471,22 @@ class ContinuumProfileStore:
         profile_buffer : ndarray, shape (1, n_bands, n_layers, n_grid)
         band_keys : ndarray, shape (n_bands, 2)
             Contains the (id_f_agg, id_i_agg) pairs for each band.
-        save : bool
-            Flag for whether compressed ProfileStore outputs should be saved.
-        species : str
-            String label for the species for naming saved outputs.
         """
-        # TEMP below!
-        export_dir = pathlib.Path(r"/mnt/c/PhD/programs/TIRAMISU/tests/outputs/")
-        export_dir.mkdir(parents=True, exist_ok=True)
-        #####
         for l in range(self.n_layers):
-            self.abs_profiles[l].finalise_from_buffer(
-                profile_matrix=profile_buffer[0, :, l, :],
-                keys=band_keys,
-            )
-            if save:
-                for label, store in (
-                        ("abs", self.abs_profiles[l]),
-                ):
-                    if store.profiles is None:
-                        continue
-                    np.savez_compressed(
-                        export_dir / f"{species}_L{l:03d}_{label}.npz",
-                        profiles=store.profiles,  # flat 1D array of all profile data
-                        offsets=store.offsets,  # ragged array boundaries
-                        start_idxs=store.start_idxs,  # position of each profile on wn_grid
-                        key_idx_map=store.key_idx_map,
-                    )
+            self.abs_profiles[l].finalise_from_buffer(profile_matrix=profile_buffer[0, :, l, :], keys=band_keys)
 
-    @lru_cache(maxsize=1000)
     def get_profile(self, layer_idx: int, key: int, profile_type: str) -> t.Tuple[npt.NDArray, int]:
-        if type(key) is int:
-            get_key = (-1, key)
-        else:
-            get_key = key
+        cache_key = (layer_idx, key, profile_type)
+        if cache_key in self._profile_cache:
+            return self._profile_cache[cache_key]
+
         if profile_type == "abs":
             # Continuum profiles are stored with an arbitrary index for the upper continuum state (-1).
-            return self.abs_profiles[layer_idx].get_profile(get_key)
+            result = self.abs_profiles[layer_idx].get_profile((-1, key))
+            self._profile_cache[cache_key] = result
+            return result
         else:
             raise RuntimeError(f"ContinuumProfileStore profile type {profile_type} not implemented.")
-
-    # def get_keys(self, layer_idx: int, profile_type: str):
-    #     if profile_type == "abs":
-    #         return self.abs_profiles[layer_idx].key_lookup.keys()
-    #     else:
-    #         raise RuntimeError(f"ContinuumProfileStore profile type {profile_type} not implemented.")
 
     def build_abs(
             self, layer_idx: int, pop_matrix: npt.NDArray[np.float64], wn_grid: npt.NDArray[np.float64]
@@ -1178,66 +1529,44 @@ def abs_emi_xsec(
     abs_xsec : ndarray, shape (n_grid,)
     emi_xsec : ndarray, shape (n_grid,)
     """
-    trans_columns = ["id_f", "id_i", "A_fi"]
-    dask_dtypes = {"id_f": "int64", "id_i": "int64", "A_fi": "float64", }
-
     # Plain float arrays - no astropy units - passed directly to Numba.
     temperature_slice = temperature_profile[n_lte_layers:].value  # (n_nlte_layers,)
     pressure_slice = pressure_profile[n_lte_layers:].value  # (n_nlte_layers,)
-
-    invariant_cols = ["id", "energy", "id_agg"]
-    states_i = (
-        states
-        .select(invariant_cols)
-        .rename({col: f"{col}_i" for col in invariant_cols})
-    )
-    states_f = (
-        states
-        .select(invariant_cols)
-        .rename({col: f"{col}_f" for col in invariant_cols})
-    )
 
     wn_arr = wn_grid.value
     wn_min = wn_arr[0]
     wn_max = wn_arr[-1]
     # Bin edges for finding trans bins (super-lines).
     n_grid = wn_grid.shape[0]
-    bin_edges = np.empty(n_grid + 1, dtype=np.float64)
-    bin_edges[0] = wn_arr[0] - (wn_arr[1] - wn_arr[0]) * 0.5
-    for j in range(1, n_grid):
-        bin_edges[j] = (wn_arr[j - 1] + wn_arr[j]) * 0.5
-    bin_edges[-1] = wn_arr[-1] + (wn_arr[-1] - wn_arr[-2]) * 0.5
+    bin_edges = _bin_edges(wn_arr)
 
     # States lookup - much more memory efficient than duplicating it all with polars joins!
     state_ids = states["id"].to_numpy()
     max_state_id = int(state_ids.max())
-    # State ID lookup offset by 1 as IDs are 1-indexed!
+    # State ID lookup offset by 1 as IDs are 1-indexed! NaN energy marks IDs missing from the states table.
+    energy_lookup = np.full(max_state_id + 1, np.nan, dtype=np.float64)
+    energy_lookup[state_ids] = states["energy"].to_numpy()
     n_lookup = np.zeros(
         (max_state_id + 1, n_nlte_layers),
         dtype=np.float64,
     )
-    for l in range(n_nlte_layers):
-        nlte_col = f"n_nlte_L{n_lte_layers + l}"
-        lte_col = f"n_L{n_lte_layers + l}"
-        # We need to check for the existence of the nLTE column here because n_nlte_Lx doesn't exist in layers that are
-        # marked as skipped due to negligible VMR; these layers are unchanged so we use the LTE values.
-        if nlte_col in states.columns:
-            n_lookup[state_ids, l] = states[nlte_col].to_numpy()
-        else:
-            n_lookup[state_ids, l] = states[lte_col].to_numpy()
-
-    n_lookup = np.ascontiguousarray(n_lookup)
+    # We need to check for the existence of the nLTE column here because n_nlte_Lx doesn't exist in layers that are
+    # marked as skipped due to negligible VMR; these layers are unchanged so we use the LTE values. Resolve the
+    # per-layer column choice first, then pull all layers out of polars in one bulk select/to_numpy call.
+    cols_to_use = [
+        f"n_nlte_L{n_lte_layers + l}" if f"n_nlte_L{n_lte_layers + l}" in states.columns else f"n_L{n_lte_layers + l}"
+        for l in range(n_nlte_layers)
+    ]
+    n_lookup[state_ids, :] = states.select(cols_to_use).to_numpy()
 
     g_lookup = np.zeros(max_state_id + 1, dtype=np.float64)
     g_lookup[state_ids] = states["g"].to_numpy()
-    g_lookup = np.ascontiguousarray(g_lookup)
     inv_g_lookup = np.zeros_like(g_lookup)
     inv_g_lookup[1:] = 1.0 / g_lookup[1:]
-    inv_g_lookup = np.ascontiguousarray(inv_g_lookup)
 
     tau_lookup = np.zeros(max_state_id + 1, dtype=np.float64)
     tau_lookup[state_ids] = states["tau"].to_numpy()
-    tau_lookup = np.ascontiguousarray(tau_lookup)
+    gamma_lifetime_lookup = gamma_lifetime_lookup_from_tau(tau_lookup)
 
     broad_n = np.zeros(1, dtype=np.float64)
     broad_gamma = np.zeros((1, n_nlte_layers), dtype=np.float64)
@@ -1245,53 +1574,59 @@ def abs_emi_xsec(
         broad_n = broadening_params[1]
         broad_gamma = broadening_params[0][:, n_lte_layers:]
 
-    # Super-lines accumulator.
-    profile_buffer = np.zeros((2, n_nlte_layers, n_grid), dtype=np.float64)
-    profile_buffer = np.ascontiguousarray(profile_buffer)
+    # Super-lines accumulate net absorption and emission, plus sum(abs * gamma_lifetime) and sum(abs) in channels 2 and
+    # 3; direct profiles only the first two.
+    profile_buffer = np.zeros((4 if do_super_lines else 2, n_nlte_layers, n_grid), dtype=np.float64)
+    # Super-lines are accumulated on the GPU when that pays off (profiles_gpu.gpu_pays_off): the buffer stays on the
+    # device for the whole batch loop and is copied back once.
+    d_buffer = None
+    if do_super_lines and config.USE_GPU:
+        from . import profiles_gpu
+        if profiles_gpu.gpu_pays_off(trans_files=trans_files, n_layers=n_nlte_layers,
+                                     buffer_bytes=profile_buffer.nbytes, label="abs_emi_xsec"):
+            d_lookups = profiles_gpu.to_device(bin_edges=bin_edges, n_frac=n_lookup, g=g_lookup, inv_g=inv_g_lookup,
+                                               gamma_lifetime=gamma_lifetime_lookup)
+            d_buffer = profiles_gpu._device_zeros(profile_buffer.shape)
 
     process_time = time.perf_counter()
 
     for trans_file in trans_files:
         log.info(f"Processing file {trans_file}.")
-        for trans_batch in _iter_trans_batches(
+        for id_f, id_i, a_fi, energy_fi in _read_ahead(batches=_iter_trans_batches(
                 trans_file=trans_file,
-                trans_columns=trans_columns,
-                states_i=states_i,
-                states_f=states_f,
+                energy_lookup=energy_lookup,
                 wn_min=wn_min,
                 wn_max=wn_max,
-                parquet_batch_size=_PARQUET_BATCH_SIZE // 3,
-                dask_dtypes=dask_dtypes,
-                do_super_lines=do_super_lines,
-        ):
-            if trans_batch.height == 0:
-                log.log(_LOG_VERBOSE_1, "No valid trans in batch.")
-                continue
-
-            if do_super_lines:
+        )):
+            if d_buffer is not None:
+                profiles_gpu.accumulate_superlines(profile_buffer=d_buffer, lookups=d_lookups, id_f=id_f, id_i=id_i,
+                                                   a_fi=a_fi, energy_fi=energy_fi)
+            elif do_super_lines:
                 _accumulate_superline_batch(
                     profile_buffer=profile_buffer,
                     bin_edges=bin_edges,
                     n_lookup=n_lookup,
                     g_lookup=g_lookup,
                     inv_g_lookup=inv_g_lookup,
-                    id_f=np.ascontiguousarray(trans_batch["id_f"].to_numpy()),
-                    id_i=np.ascontiguousarray(trans_batch["id_i"].to_numpy()),
-                    a_fi=np.ascontiguousarray(trans_batch["A_fi"].to_numpy()),
-                    energy_fi=np.ascontiguousarray(trans_batch["energy_fi"].to_numpy()),
+                    gamma_lifetime_lookup=gamma_lifetime_lookup,
+                    id_f=id_f,
+                    id_i=id_i,
+                    a_fi=a_fi,
+                    energy_fi=energy_fi,
+                    n_workers=_DEFAULT_NUM_THREADS,
                 )
             else:
                 _abs_emi_sampled_voigt(
                     profile_buffer=profile_buffer,
                     wn_grid=wn_arr,
-                    id_i=np.ascontiguousarray(trans_batch["id_i"].to_numpy()),
-                    id_f=np.ascontiguousarray(trans_batch["id_f"].to_numpy()),
+                    id_i=id_i,
+                    id_f=id_f,
                     n_lookup=n_lookup,
                     g_lookup=g_lookup,
                     inv_g_lookup=inv_g_lookup,
-                    tau_lookup=tau_lookup,
-                    a_fi=np.ascontiguousarray(trans_batch["A_fi"].to_numpy()),
-                    energy_fi=np.ascontiguousarray(trans_batch["energy_fi"].to_numpy()),
+                    gamma_lifetime_lookup=gamma_lifetime_lookup,
+                    a_fi=a_fi,
+                    energy_fi=energy_fi,
                     temperatures=temperature_slice,
                     pressures=pressure_slice,
                     broad_n=broad_n,
@@ -1299,6 +1634,8 @@ def abs_emi_xsec(
                     species_mass=species_mass,
                 )
     # Finalise.
+    if d_buffer is not None:
+        profile_buffer = d_buffer.copy_to_host()
     if do_super_lines:
         abs_xsec, emi_xsec = _broaden_superline_buffer(
             profile_buffer=profile_buffer,
@@ -1312,7 +1649,8 @@ def abs_emi_xsec(
     else:
         abs_xsec = profile_buffer[0]
         emi_xsec = profile_buffer[1]
-    log.log(_LOG_VERBOSE_2, f"New rates/profiles duration = {time.perf_counter() - process_time:.3f}.")
+    if log.isEnabledFor(_LOG_VERBOSE_2):
+        log.log(_LOG_VERBOSE_2, f"New rates/profiles duration = {time.perf_counter() - process_time:.3f}.")
     return abs_xsec, emi_xsec
 
 
@@ -1349,94 +1687,60 @@ def continuum_xsec(
     -------
     abs_xsec : ndarray, shape (n_grid,)
     """
-    trans_columns = ["id_f", "id_i", "A_fi"]
-    dask_dtypes = {"id_f": "int64", "id_i": "int64", "A_fi": "float64"}
-
     # Plain float arrays - no astropy units - passed directly to Numba.
     temperature_slice = temperature_profile[n_lte_layers:].value  # (n_nlte_layers,)
 
-    n_cols = [f"n_nlte_L{n_lte_layers + nlte_idx}" for nlte_idx in range(n_nlte_layers)]
-    # select_cols = ["id", "g", "v"] + n_cols
-    select_cols = ["id"] + n_cols  # g and v are stored on cont_states.
-    cont_states = cont_states.join(states.select(select_cols), on="id", how="left")
-
-    invariant_cols = ["id", "energy", "id_agg"]
-    states_i = (
-        cont_states
-        .select(invariant_cols)
-        .rename({col: f"{col}_i" for col in invariant_cols})
-    )
-    states_f = (
-        cont_states
-        .select(invariant_cols)
-        .rename({col: f"{col}_f" for col in invariant_cols})
-    )
+    # We need to check for the existence of the nLTE column here because n_nlte_Lx doesn't exist in layers that are
+    # marked as skipped due to negligible VMR; these layers are unchanged so we use the LTE values. Resolve the
+    # per-layer column choice first, then pull all layers out of polars in one bulk select/to_numpy call.
+    cols_to_use = [
+        f"n_nlte_L{n_lte_layers + l}" if f"n_nlte_L{n_lte_layers + l}" in states.columns else f"n_L{n_lte_layers + l}"
+        for l in range(n_nlte_layers)
+    ]
+    # g and v are stored on cont_states.
+    cont_states = cont_states.join(states.select(["id"] + cols_to_use), on="id", how="left")
 
     wn_arr = wn_grid.value
     wn_min = wn_arr[0]
     wn_max = wn_arr[-1]
     # Bin edges for finding trans bins (super-lines).
     n_grid = wn_grid.shape[0]
-    bin_edges = np.empty(n_grid + 1, dtype=np.float64)
-    bin_edges[0] = wn_arr[0] - (wn_arr[1] - wn_arr[0]) * 0.5
-    for j in range(1, n_grid):
-        bin_edges[j] = (wn_arr[j - 1] + wn_arr[j]) * 0.5
-    bin_edges[-1] = wn_arr[-1] + (wn_arr[-1] - wn_arr[-2]) * 0.5
+    bin_edges = _bin_edges(wn_arr)
 
     # States lookup - much more memory efficient than duplicating it all with polars joins!
     state_ids = cont_states["id"].to_numpy()
     max_state_id = int(state_ids.max())
-    # State ID lookup offset by 1 as IDs are 1-indexed!
+    # State ID lookup offset by 1 as IDs are 1-indexed! NaN energy marks IDs missing from the states table.
+    energy_lookup = np.full(max_state_id + 1, np.nan, dtype=np.float64)
+    energy_lookup[state_ids] = cont_states["energy"].to_numpy()
     n_lookup = np.zeros(
         (max_state_id + 1, n_nlte_layers),
         dtype=np.float64,
     )
-    for l in range(n_nlte_layers):
-        nlte_col = f"n_nlte_L{n_lte_layers + l}"
-        lte_col = f"n_L{n_lte_layers + l}"
-        # We need to check for the existence of the nLTE column here because n_nlte_Lx doesn't exist in layers that are
-        # marked as skipped due to negligible VMR; these layers are unchanged so we use the LTE values.
-        if nlte_col in states.columns:
-            n_lookup[state_ids, l] = cont_states[nlte_col].to_numpy()
-        else:
-            n_lookup[state_ids, l] = cont_states[lte_col].to_numpy()
-    n_lookup = np.ascontiguousarray(n_lookup)
+    n_lookup[state_ids, :] = cont_states.select(cols_to_use).to_numpy()
 
     g_lookup = np.zeros(max_state_id + 1, dtype=np.float64)
     g_lookup[state_ids] = cont_states["g"].to_numpy()
-    g_lookup = np.ascontiguousarray(g_lookup)
     zero_g_map = g_lookup == 0
     inv_g_lookup = np.zeros_like(g_lookup)
     inv_g_lookup[~zero_g_map] = 1.0 / g_lookup[~zero_g_map]
-    inv_g_lookup = np.ascontiguousarray(inv_g_lookup)
 
     v_lookup = np.zeros(max_state_id + 1, dtype=np.float64)
     v_lookup[state_ids] = cont_states["v"].to_numpy()
-    v_lookup = np.ascontiguousarray(v_lookup)
 
     # Super-lines accumulator.
     profile_buffer = np.zeros((2, n_nlte_layers, n_grid), dtype=np.float64)
-    profile_buffer = np.ascontiguousarray(profile_buffer)
 
     process_time = time.perf_counter()
 
     for trans_file in cont_trans_files:
         log.info(f"Processing file {trans_file}.")
-        for trans_batch in _iter_trans_batches(
+        for id_f, id_i, a_fi, energy_fi in _read_ahead(batches=_iter_trans_batches(
                 trans_file=trans_file,
-                trans_columns=trans_columns,
-                states_i=states_i,
-                states_f=states_f,
+                energy_lookup=energy_lookup,
                 wn_min=wn_min,
                 wn_max=wn_max,
-                parquet_batch_size=_PARQUET_BATCH_SIZE // 3,
-                dask_dtypes=dask_dtypes,
-                do_super_lines=do_super_lines,
-        ):
-            if trans_batch.height == 0:
-                log.log(_LOG_VERBOSE_1, "No valid trans in batch.")
-                continue
-
+        )):
             if do_super_lines:
                 _accumulate_continuum_superline_batch(
                     profile_buffer=profile_buffer,
@@ -1445,25 +1749,26 @@ def continuum_xsec(
                     g_lookup=g_lookup,
                     inv_g_lookup=inv_g_lookup,
                     v_lookup=v_lookup,
-                    id_f=np.ascontiguousarray(trans_batch["id_f"].to_numpy()),
-                    id_i=np.ascontiguousarray(trans_batch["id_i"].to_numpy()),
-                    a_fi=np.ascontiguousarray(trans_batch["A_fi"].to_numpy()),
-                    energy_fi=np.ascontiguousarray(trans_batch["energy_fi"].to_numpy()),
+                    id_f=id_f,
+                    id_i=id_i,
+                    a_fi=a_fi,
+                    energy_fi=energy_fi,
                     reduced_mass=reduced_mass,
                     box_length=cont_box_length,
+                    n_workers=_DEFAULT_NUM_THREADS,
                 )
             else:
                 _continuum_sampled_gauss(
                     profile_buffer=profile_buffer,
                     wn_grid=wn_arr,
-                    id_i=np.ascontiguousarray(trans_batch["id_i"].to_numpy()),
-                    id_f=np.ascontiguousarray(trans_batch["id_f"].to_numpy()),
+                    id_i=id_i,
+                    id_f=id_f,
                     n_lookup=n_lookup,
                     g_lookup=g_lookup,
                     inv_g_lookup=inv_g_lookup,
                     v_lookup=v_lookup,
-                    a_fi=np.ascontiguousarray(trans_batch["A_fi"].to_numpy()),
-                    energy_fi=np.ascontiguousarray(trans_batch["energy_fi"].to_numpy()),
+                    a_fi=a_fi,
+                    energy_fi=energy_fi,
                     temperatures=temperature_slice,
                     species_mass=species_mass,
                     reduced_mass=reduced_mass,
@@ -1479,7 +1784,8 @@ def continuum_xsec(
         )
     else:
         abs_xsec = profile_buffer[0]
-    log.log(_LOG_VERBOSE_2, f"New rates/profiles duration = {time.perf_counter() - process_time:.3f}.")
+    if log.isEnabledFor(_LOG_VERBOSE_2):
+        log.log(_LOG_VERBOSE_2, f"New rates/profiles duration = {time.perf_counter() - process_time:.3f}.")
     return abs_xsec
 
 
@@ -1520,8 +1826,8 @@ def _voigt_humlicek_w(x: float, y: float) -> float:
     Real part of the Faddeeva function w(z) = exp(-z²) * erfc(-iz) via the Humlíček (1979) 4-region rational
     approximation.
 
-    Relative accuracy ~1e-6. x and y are the real and imaginary parts of z = (nu - nu0) / (sigma_D * sqrt(2)), where
-    y > 0 always (it is the ratio of Lorentzian to Gaussian halfwidths).
+    Relative accuracy ~1e-4 (measured against scipy.special.wofz). x and y are the real and imaginary parts of
+    z = (nu - nu0) / (sigma_D * sqrt(2)), where y > 0 always (it is the ratio of Lorentzian to Gaussian halfwidths).
 
     Parameters
     ----------
@@ -1582,11 +1888,14 @@ def _broaden_superline_buffer(
         pressure_ref=1.0,
 ) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
     """
+    Broadens super-lines with a Voigt profile combining Doppler, pressure and lifetime broadening, the lifetime HWHM
+    of each (layer, bin) being channel 2 / channel 3 of profile_buffer (see :func:`_accumulate_superline_batch`).
+
     Parameters
     ----------
-    profile_buffer : (2, n_layers, n_grid)
-        Accumulated super-line coefficients per layer per grid bin. Absorption is stored in profile_buffer[0] and
-        emission in profile_buffer[1].
+    profile_buffer : (4, n_layers, n_grid)
+        Accumulated super-line coefficients per layer per grid bin, from :func:`_accumulate_superline_batch`. Net
+        absorption is stored in profile_buffer[0] and emission in profile_buffer[1].
     wn_grid : ndarray, shape (n_grid,)
     temperatures : ndarray, shape (n_layers,)
     pressures : ndarray, shape (n_layers,)
@@ -1602,76 +1911,45 @@ def _broaden_superline_buffer(
     """
     n_layers = temperatures.shape[0]
     n_grid = wn_grid.shape[0]
-    n_broad = broad_n.shape[0]
     cutoff = 25.0
-
     out_abs = np.zeros((n_layers, n_grid), dtype=np.float64)
     out_emi = np.zeros((n_layers, n_grid), dtype=np.float64)
-
-    sqrt2 = np.sqrt(2.0)
-    sqrt2_NA_kB_on_c = sqrt2 * const_sqrt_NA_kB_on_c
     inv_sqrt_pi = 1 / np.sqrt(np.pi)
 
-    inv_sigma_sqrt2 = np.empty((n_grid, n_layers), dtype=np.float64)
-    # gamma_total = np.empty((n_layers, n_grid), dtype=np.float64)
-    gamma_total = np.empty((n_layers,), dtype=np.float64)
-    # Voigt y-parameter: gamma_L / (sigma_D * sqrt(2)).
-    # sigma here is the Gaussian sigma (standard deviation), so
-    y_voigt = np.empty((n_grid, n_layers), dtype=np.float64)
-    # gamma_lifetime = 1.0 / (const_4_pi_c * lifetimes)  # (n_trans,)
+    # Per-layer broadening terms: 1 / (sigma_D * sqrt(2)) = inv_doppler[l] / energy, and the pressure HWHM.
+    inv_doppler, gamma_pressure = _layer_broadening_terms(
+        temperatures=temperatures, pressures=pressures, broad_n=broad_n, broad_gamma=broad_gamma,
+        species_mass=species_mass, t_ref=t_ref, pressure_ref=pressure_ref,
+    )
+    j_starts, j_ends = _profile_windows(wn_grid=wn_grid, cutoff=cutoff)
 
+    # Parallelised over layers, not grid points: adjacent grid points' +/-cutoff windows
+    # overlap, so a thread-per-grid-point scheme would race on out_abs/out_emi writes from
+    # different threads. Each thread here owns an exclusive output row (out_abs/out_emi[l, :]).
     for l in numba.prange(n_layers):
-        temp_l = temperatures[l]
-        pres_l = pressures[l]
-        inv_sigma_sqrt2_l = 1 / (wn_grid * sqrt2_NA_kB_on_c * np.sqrt(temp_l / species_mass))
-        inv_sigma_sqrt2[:, l] = inv_sigma_sqrt2_l
-
-        gamma_pressure_l = 0.0
-        for b in range(n_broad):
-            gamma_pressure_l += broad_gamma[b, l] * pres_l * (t_ref / temp_l) ** broad_n[b] / pressure_ref
-        # gamma_total[l] = gamma_lifetime + gamma_pressure_l
-        gamma_total[l] = gamma_pressure_l
-        y_voigt[:, l] = gamma_total[l] * inv_sigma_sqrt2_l
-
-    # Precompute occupation mask: True if any layer has nonzero coefficients.
-    occupied = np.zeros(n_grid, dtype=numba.boolean)
-    for i in numba.prange(n_grid):
-        for l in range(n_layers):
-            # Loop and l/i index ordering could maybe be changed.
-            if profile_buffer[0, l, i] != 0.0 or profile_buffer[1, l, i] != 0.0:
-                occupied[i] = True
-                break
-
-    # As in other implementations, "i" tracks transitions.
-    for i in numba.prange(n_grid):
-        # Super-line centre is the bin centre.
-        if not occupied[i]:
-            continue
-        energy_i = wn_grid[i]
-        transition_min = energy_i - cutoff
-        transition_max = energy_i + cutoff
-        j_start = max(0, _binary_search_left(wn_grid, transition_min))
-        j_end = min(n_grid, _binary_search_right(wn_grid, transition_max) + 1)
-
-        for l in range(n_layers):
+        for i in range(n_grid):
             abs_li = profile_buffer[0, l, i]
             emi_li = profile_buffer[1, l, i]
             # Skip empty bins.
             if abs_li == 0.0 and emi_li == 0.0:
                 continue
-            inv_sigma_sqrt2_il = inv_sigma_sqrt2[i, l]
-            y_il = y_voigt[i, l]
+            # Super-line centre is the bin centre.
+            energy_i = wn_grid[i]
+            inv_sigma_sqrt2_il = inv_doppler[l] / energy_i
+            gamma_lifetime_li = 0.0
+            if profile_buffer[3, l, i] != 0.0:
+                gamma_lifetime_li = profile_buffer[2, l, i] / profile_buffer[3, l, i]
+            # Voigt y-parameter: gamma_L / (sigma_D * sqrt(2)).
+            y_il = (gamma_pressure[l] + gamma_lifetime_li) * inv_sigma_sqrt2_il
             # Integral of Re[w(x,y)] dx = sqrt(pi), so the normalised Voigt is Re[w(z)] / (sigma * sqrt(2*pi)).
             norm = inv_sigma_sqrt2_il * inv_sqrt_pi
 
-            for j in range(j_start, j_end):
-                wn_j = wn_grid[j]
-                x_ij = (wn_j - energy_i) * inv_sigma_sqrt2_il
+            for j in range(j_starts[i], j_ends[i]):
+                x_ij = (wn_grid[j] - energy_i) * inv_sigma_sqrt2_il
                 voigt_val = _voigt_humlicek_w(x_ij, y_il) * norm
 
                 out_abs[l, j] += abs_li * voigt_val
                 out_emi[l, j] += emi_li * voigt_val
-
     return out_abs, out_emi
 
 
@@ -1708,42 +1986,27 @@ def _broaden_continuum_superline_buffer(
     sqrtln2 = np.sqrt(np.log(2.0))
     inv_sqrt_pi = 1 / np.sqrt(np.pi)
 
-    doppler_prefactor = np.empty((n_layers,), dtype=np.float64)
-
     inv_mass = 1 / species_mass
     doppler_coef = const_sqrt_2_NA_kB_log2_on_c * math.sqrt(inv_mass)
-    temp_max = temperatures[0]
+
+    # Parallelised over layers, not grid points: the Doppler+box cutoff window varies per
+    # (l, i) and adjacent grid points' windows overlap, so a thread-per-grid-point scheme
+    # would race on out_abs writes from different threads. Each thread here owns an
+    # exclusive output row (out_abs[l, :]).
     for l in numba.prange(n_layers):
         temp_l = temperatures[l]
-        doppler_prefactor[l] = doppler_coef * math.sqrt(temp_l)
-        if temp_l > temp_max:
-            temp_max = temp_l
+        doppler_prefactor_l = doppler_coef * math.sqrt(temp_l)
 
-    # Precompute occupation mask: True if any layer has nonzero coefficients.
-    occupied = np.zeros(n_grid, dtype=numba.boolean)
-    for i in numba.prange(n_grid):
-        for l in range(n_layers):
-            # Loop and l/i index ordering could maybe be changed.
-            if profile_buffer[0, l, i] != 0.0:
-                occupied[i] = True
-                break
-
-    # As in other implementations, "i" tracks transitions.
-    for i in numba.prange(n_grid):
-        # Super-line centre is the bin centre.
-        if not occupied[i]:
-            continue
-        energy_i = wn_grid[i]
-
-        for l in range(n_layers):
+        for i in range(n_grid):
             abs_li = profile_buffer[0, l, i]
             # Skip empty bins.
             if abs_li == 0.0:
                 continue
+            # Super-line centre is the bin centre.
+            energy_i = wn_grid[i]
 
             weighted_broad = profile_buffer[1, l, i]
             alpha_box_li = weighted_broad / abs_li
-            doppler_prefactor_l = doppler_prefactor[l]
             alpha_doppler_li = doppler_prefactor_l * energy_i
             alpha_total_li = alpha_box_li + alpha_doppler_li
             cutoff_li = cutoff_fwhm_multiple * alpha_total_li
@@ -1782,13 +2045,22 @@ def _broaden_superline_band_buffer(
         broad_n: npt.NDArray[np.float64],
         broad_gamma: npt.NDArray[np.float64],
         species_mass: float,
-        t_ref=296.0,
-        pressure_ref=1.0,
+        t_ref: float = 296.0,
+        pressure_ref: float = 1.0,
+        n_workers: int = _DEFAULT_NUM_THREADS,
 ) -> npt.NDArray[np.float64]:
     """
+    Broadens per-band super-lines with a Voigt profile combining Doppler, pressure and lifetime broadening.
+
+    The Doppler width depends on the (layer, bin), the pressure width on the layer, and the lifetime width is the
+    intensity-weighted mean lifetime HWHM of the lines binned into each (band, layer, bin): channel 3 / channel 0 of
+    profile_buffer. The Voigt profile is evaluated exactly for every occupied (band, layer, bin).
+
     Parameters
     ----------
-    profile_buffer : ndarray, shape (3, n_bands, n_layers, n_trans)
+    profile_buffer : ndarray, shape (4, n_bands, n_layers, n_grid)
+        Accumulated super-line absorption, stimulated emission and spontaneous emission coefficients, plus the
+        absorption-weighted lifetime HWHM, from :func:`_accumulate_superline_band_batch`.
     wn_grid : ndarray, shape (n_grid,)
     temperatures : ndarray, shape (n_layers,)
     pressures : ndarray, shape (n_layers,)
@@ -1796,8 +2068,10 @@ def _broaden_superline_band_buffer(
     broad_gamma : ndarray, shape (n_broadeners, n_layers)
         Note: layers on axis-1, matching broadening_params[0].
     species_mass : float
-    # n_bands_used : int
-    #     How many entries in axis-0 of the buffers actually contain data.
+    t_ref : float
+    pressure_ref : float
+    n_workers : int
+        Number of parallel workers the (band, layer) pairs are dealt between; normally numba's thread count.
 
     Returns
     -------
@@ -1805,88 +2079,106 @@ def _broaden_superline_band_buffer(
     """
     n_layers = temperatures.shape[0]
     n_grid = wn_grid.shape[0]
-    n_broad = broad_n.shape[0]
     n_bands = profile_buffer.shape[1]
     cutoff = 25.0
 
-    buffer_out = np.zeros_like(profile_buffer, dtype=np.float64)
+    buffer_out = np.zeros((3, n_bands, n_layers, n_grid), dtype=np.float64)
 
-    sqrt2 = np.sqrt(2.0)
-    sqrt2_NA_kB_on_c = sqrt2 * const_sqrt_NA_kB_on_c
     inv_sqrt_pi = 1 / np.sqrt(np.pi)
 
-    inv_sigma_sqrt2 = np.empty((n_grid, n_layers), dtype=np.float64)
-    # gamma_total = np.empty((n_layers, n_grid), dtype=np.float64)
-    gamma_total = np.empty((n_layers,), dtype=np.float64)
-    # Voigt y-parameter: gamma_L / (sigma_D * sqrt(2)).
-    # sigma here is the Gaussian sigma (standard deviation), so
-    # sigma_D * sqrt(2) = sigma * sqrt(2).
-    y_voigt = np.empty((n_grid, n_layers), dtype=np.float64)
-    # gamma_lifetime = 1.0 / (const_4_pi_c * lifetimes)  # (n_trans,)
+    # Per-layer broadening terms: 1 / (sigma_D * sqrt(2)) = inv_doppler[l] / energy, and the pressure HWHM.
+    inv_doppler, gamma_pressure = _layer_broadening_terms(
+        temperatures=temperatures, pressures=pressures, broad_n=broad_n, broad_gamma=broad_gamma,
+        species_mass=species_mass, t_ref=t_ref, pressure_ref=pressure_ref,
+    )
 
-    for l in numba.prange(n_layers):
-        temp_l = temperatures[l]
-        pres_l = pressures[l]
-        inv_sigma_sqrt2_l = 1 / (wn_grid * sqrt2_NA_kB_on_c * np.sqrt(temp_l / species_mass))
-        inv_sigma_sqrt2[:, l] = inv_sigma_sqrt2_l
+    j_starts, j_ends = _profile_windows(wn_grid=wn_grid, cutoff=cutoff)
 
-        gamma_pressure_l = 0.0
-        for b in range(n_broad):
-            gamma_pressure_l += broad_gamma[b, l] * pres_l * (t_ref / temp_l) ** broad_n[b] / pressure_ref
-        # gamma_total[l] = gamma_lifetime + gamma_pressure_l
-        gamma_total[l] = gamma_pressure_l
-        y_voigt[:, l] = gamma_total[l] * inv_sigma_sqrt2_l
+    # Each (band, layer) pair writes only its own output row buffer_out[:, band, l, :], so pairs can run in parallel
+    # without two threads ever writing the same output point. Pairs differ enormously in cost (a band may occupy a few
+    # bins or the whole grid), and a prange over the pairs would give each thread an equal-length contiguous block of
+    # them, leaving the thread that gets the busiest bands with several times the average work. Instead, the pairs are
+    # sorted by estimated cost and dealt round-robin to n_workers workers, heaviest first (worker w takes sorted pairs
+    # w, w + n_workers, w + 2 * n_workers, ...), which keeps every worker's total within a few percent of the mean.
+    order, cost = _band_layer_work_order(profile_buffer=profile_buffer, j_starts=j_starts, j_ends=j_ends)
+    n_pairs = order.shape[0]
 
-    # Bin edges for natural linewidth from accumulated A_fi.
-    # gamma_lifetime[band, bin] = A_fi_sum / (4 * pi * c) — approximation for super-line.
-    # Only needed for occupied bins so we compute inline below.
+    for w in numba.prange(n_workers):
+        for k in range(w, n_pairs, n_workers):
+            bl = order[k]
+            if cost[bl] == 0:
+                # Sorted by decreasing cost, so every remaining pair for this worker is empty too.
+                break
+            band = bl // n_layers
+            l = bl % n_layers
+            inv_doppler_l = inv_doppler[l]
+            gamma_pressure_l = gamma_pressure[l]
+            abs_out = buffer_out[0, band, l]
+            ste_out = buffer_out[1, band, l]
+            spe_out = buffer_out[2, band, l]
 
-    # Precompute occupation mask: True if any layer has nonzero coefficients.
-    occupied = np.zeros((n_bands, n_grid), dtype=numba.boolean)
-    for band in numba.prange(n_bands):
-        for i in range(n_grid):
-            for l in range(n_layers):
-                # Loop and l/i index ordering could maybe be changed.
-                if profile_buffer[0, band, l, i] != 0.0 or profile_buffer[1, band, l, i] != 0.0 or profile_buffer[
-                    2, band, l, i] != 0.0:
-                    occupied[band, i] = True
-                    break
-
-    # Parallelise over bands — each band is fully independent.
-    for band in numba.prange(n_bands):
-        # As in other implementations, "i" tracks transitions.
-        for i in range(n_grid):
             # Super-line centre is the bin centre.
-            if not occupied[band, i]:
-                continue
-            energy_i = wn_grid[i]
-            transition_min = energy_i - cutoff
-            transition_max = energy_i + cutoff
-            j_start = max(0, _binary_search_left(wn_grid, transition_min))
-            j_end = min(n_grid, _binary_search_right(wn_grid, transition_max) + 1)
-
-            for l in range(n_layers):
-                abs_li = profile_buffer[0, band, l, i]
-                ste_li = profile_buffer[1, band, l, i]
-                spe_li = profile_buffer[2, band, l, i]
+            for i in range(n_grid):
+                abs_bli = profile_buffer[0, band, l, i]
+                ste_bli = profile_buffer[1, band, l, i]
+                spe_bli = profile_buffer[2, band, l, i]
                 # Skip empty bins.
-                if abs_li == 0.0 and ste_li == 0.0 and spe_li == 0.0:
+                if abs_bli == 0.0 and ste_bli == 0.0 and spe_bli == 0.0:
                     continue
-                inv_sigma_sqrt2_il = inv_sigma_sqrt2[i, l]
-                y_il = y_voigt[i, l]
+                energy_i = wn_grid[i]
+                inv_sigma_sqrt2_il = inv_doppler_l / energy_i
                 # Integral of Re[w(x,y)] dx = sqrt(pi), so the normalised Voigt is Re[w(z)] / (sigma * sqrt(2*pi)).
                 norm = inv_sigma_sqrt2_il * inv_sqrt_pi
+                gamma_lifetime_bli = 0.0
+                if abs_bli != 0.0:
+                    gamma_lifetime_bli = profile_buffer[3, band, l, i] / abs_bli
+                # Voigt y-parameter: gamma_L / (sigma_D * sqrt(2)).
+                y_bli = (gamma_pressure_l + gamma_lifetime_bli) * inv_sigma_sqrt2_il
 
-                for j in range(j_start, j_end):
-                    wn_j = wn_grid[j]
-                    x_ij = (wn_j - energy_i) * inv_sigma_sqrt2_il
-                    voigt_val = _voigt_humlicek_w(x_ij, y_il) * norm
-
-                    buffer_out[0, band, l, j] += abs_li * voigt_val
-                    buffer_out[1, band, l, j] += ste_li * voigt_val
-                    buffer_out[2, band, l, j] += spe_li * voigt_val
+                for j in range(j_starts[i], j_ends[i]):
+                    x_ij = (wn_grid[j] - energy_i) * inv_sigma_sqrt2_il
+                    voigt_val = _voigt_humlicek_w(x_ij, y_bli) * norm
+                    abs_out[j] += abs_bli * voigt_val
+                    ste_out[j] += ste_bli * voigt_val
+                    spe_out[j] += spe_bli * voigt_val
 
     return buffer_out
+
+
+def broaden_superline_band_buffer(
+        *,
+        profile_buffer: npt.NDArray[np.float64],
+        wn_grid: npt.NDArray[np.float64],
+        temperatures: npt.NDArray[np.float64],
+        pressures: npt.NDArray[np.float64],
+        broad_n: npt.NDArray[np.float64],
+        broad_gamma: npt.NDArray[np.float64],
+        species_mass: float,
+        t_ref: float = 296.0,
+        pressure_ref: float = 1.0,
+) -> npt.NDArray[np.float64]:
+    """CPU entry point for :func:`_broaden_superline_band_buffer`, dealing work between _DEFAULT_NUM_THREADS workers.
+    The GPU equivalent is :meth:`profiles_gpu.DeviceProfileBuffer.broaden_superlines`."""
+    return _broaden_superline_band_buffer(
+        profile_buffer=profile_buffer, wn_grid=wn_grid, temperatures=temperatures, pressures=pressures,
+        broad_n=broad_n, broad_gamma=broad_gamma, species_mass=species_mass, t_ref=t_ref, pressure_ref=pressure_ref,
+        n_workers=_DEFAULT_NUM_THREADS,
+    )
+
+
+@numba.njit(cache=True, error_model="numpy", inline="always")
+def _continuum_superline_window(
+        wn_grid: npt.NDArray[np.float64], energy_i: float, alpha_total: float,
+) -> t.Tuple[int, int]:
+    """Grid window [j_start, j_end) of a continuum super-line: 5 Gaussian HWHM either side, clamped to 25-5000 cm^-1."""
+    cutoff = 5.0 * alpha_total
+    if cutoff < 25.0:
+        cutoff = 25.0
+    elif cutoff > 5000.0:
+        cutoff = 5000.0
+    j_start = max(0, _binary_search_left(wn_grid, energy_i - cutoff))
+    j_end = min(wn_grid.shape[0], _binary_search_right(wn_grid, energy_i + cutoff) + 1)
+    return j_start, j_end
 
 
 @numba.njit(parallel=True, cache=True, error_model="numpy")
@@ -1895,6 +2187,7 @@ def _broaden_continuum_superline_band_buffer(
         wn_grid: npt.NDArray[np.float64],
         temperatures: npt.NDArray[np.float64],
         species_mass: float,
+        n_workers: int = _DEFAULT_NUM_THREADS,
 ) -> npt.NDArray[np.float64]:
     """
     Parameters
@@ -1911,97 +2204,230 @@ def _broaden_continuum_superline_band_buffer(
     n_layers = temperatures.shape[0]
     n_grid = wn_grid.shape[0]
     n_bands = profile_buffer.shape[1]
-    min_cutoff = 25.0
-    max_cutoff = 5000.0
-    cutoff_fwhm_multiple = 5.0
 
-    buffer_out = np.zeros_like((1, n_bands, n_layers, n_grid), dtype=np.float64)
+    buffer_out = np.zeros((1, n_bands, n_layers, n_grid), dtype=np.float64)
 
     sqrtln2 = np.sqrt(np.log(2.0))
     inv_sqrt_pi = 1 / np.sqrt(np.pi)
 
-    doppler_prefactor = np.empty((n_layers,), dtype=np.float64)
+    doppler_coef = const_sqrt_2_NA_kB_log2_on_c * math.sqrt(1 / species_mass)
+    doppler_prefactor = np.empty(n_layers, dtype=np.float64)
+    for l in range(n_layers):
+        doppler_prefactor[l] = doppler_coef * math.sqrt(temperatures[l])
 
-    inv_mass = 1 / species_mass
-    doppler_coef = const_sqrt_2_NA_kB_log2_on_c * math.sqrt(inv_mass)
-    temp_max = temperatures[0]
-    for l in numba.prange(n_layers):
-        temp_l = temperatures[l]
-        doppler_prefactor[l] = doppler_coef * math.sqrt(temp_l)
-        if temp_l > temp_max:
-            temp_max = temp_l
-
-    # Precompute occupation mask: True if any layer has nonzero coefficients.
-    occupied = np.zeros((n_bands, n_grid), dtype=numba.boolean)
-    for band in numba.prange(n_bands):
+    # Each (band, layer) pair owns its output row, so pairs run in parallel without write conflicts. Window widths vary
+    # by orders of magnitude between bands (the box width sets them), so each pair's cost is its summed window length;
+    # pairs are then dealt round-robin to n_workers workers, heaviest first.
+    n_pairs = n_bands * n_layers
+    cost = np.zeros(n_pairs, dtype=np.int64)
+    for bl in numba.prange(n_pairs):
+        band = bl // n_layers
+        l = bl % n_layers
+        c = 0
         for i in range(n_grid):
-            for l in range(n_layers):
-                # Loop and l/i index ordering could maybe be changed.
-                if profile_buffer[0, band, l, i] != 0.0:
-                    occupied[band, i] = True
-                    break
-
-    # Parallelise over bands — each band is fully independent.
-    for band in numba.prange(n_bands):
-        # As in other implementations, "i" tracks transitions.
-        for i in range(n_grid):
-            # Super-line centre is the bin centre.
-            if not occupied[band, i]:
+            abs_li = profile_buffer[0, band, l, i]
+            if abs_li == 0.0:
                 continue
-            energy_i = wn_grid[i]
+            alpha_total_li = profile_buffer[1, band, l, i] / abs_li + doppler_prefactor[l] * wn_grid[i]
+            j_start, j_end = _continuum_superline_window(
+                wn_grid=wn_grid, energy_i=wn_grid[i], alpha_total=alpha_total_li,
+            )
+            c += max(j_end - j_start, 0)
+        cost[bl] = c
+    order = np.argsort(-cost, kind="mergesort")
 
-            for l in range(n_layers):
+    for w in numba.prange(n_workers):
+        for k in range(w, n_pairs, n_workers):
+            bl = order[k]
+            if cost[bl] == 0:
+                # Sorted by decreasing cost, so every remaining pair for this worker is empty too.
+                break
+            band = bl // n_layers
+            l = bl % n_layers
+            out_bl = buffer_out[0, band, l]
+            doppler_prefactor_l = doppler_prefactor[l]
+            # Super-line centre is the bin centre.
+            for i in range(n_grid):
                 abs_li = profile_buffer[0, band, l, i]
                 # Skip empty bins.
                 if abs_li == 0.0:
                     continue
+                energy_i = wn_grid[i]
+                # Intensity-weighted mean box width plus the Doppler width.
+                alpha_box_li = profile_buffer[1, band, l, i] / abs_li
+                alpha_total_li = alpha_box_li + doppler_prefactor_l * energy_i
+                j_start, j_end = _continuum_superline_window(
+                    wn_grid=wn_grid, energy_i=energy_i, alpha_total=alpha_total_li,
+                )
+                if j_start >= j_end:
+                    continue
+                sqrtln2_on_alpha_li = sqrtln2 / alpha_total_li
+                norm = sqrtln2_on_alpha_li * inv_sqrt_pi
+                for j in range(j_start, j_end):
+                    arg = sqrtln2_on_alpha_li * (wn_grid[j] - energy_i)
+                    out_bl[j] += abs_li * norm * math.exp(-(arg * arg))
 
-                weighted_broad = profile_buffer[1, band, l, i]
-                alpha_box_li = weighted_broad / abs_li
-                doppler_prefactor_l = doppler_prefactor[l]
-                alpha_doppler_li = doppler_prefactor_l * energy_i
-                alpha_total_li = alpha_box_li + alpha_doppler_li
-                cutoff_li = cutoff_fwhm_multiple * alpha_total_li
-                if cutoff_li < min_cutoff:
-                    cutoff_li = min_cutoff
-                elif cutoff_li > max_cutoff:
-                    cutoff_li = max_cutoff
+    return buffer_out
 
-                transition_min = energy_i - cutoff_li
-                transition_max = energy_i + cutoff_li
+
+# ------------------------------------- ALL LAYER, SAMPLED VOIGT CALCULATIONS -------------------------------------
+@numba.njit(parallel=True, nogil=True, cache=True, error_model="numpy")
+def _band_profile_sampled_voigt(
+        profile_buffer: npt.NDArray[np.float64],
+        wn_grid: npt.NDArray[np.float64],
+        id_f: npt.NDArray[np.int32],
+        id_i: npt.NDArray[np.int32],
+        group_bands: npt.NDArray[np.int32],
+        group_starts: npt.NDArray[np.int32],
+        group_ends: npt.NDArray[np.int32],
+        n_lookup: npt.NDArray[np.float64],
+        g_lookup: npt.NDArray[np.float64],
+        inv_g_lookup: npt.NDArray[np.float64],
+        gamma_lifetime_lookup: npt.NDArray[np.float64],
+        a_fi: npt.NDArray[np.float64],
+        energy_fi: npt.NDArray[np.float64],
+        temperatures: npt.NDArray[np.float64],
+        pressures: npt.NDArray[np.float64],
+        broad_n: npt.NDArray[np.float64],
+        broad_gamma: npt.NDArray[np.float64],
+        species_mass: float,
+        t_ref: float = 296.0,
+        pressure_ref: float = 1.0,
+        n_workers: int = _DEFAULT_NUM_THREADS,
+) -> None:
+    """
+    Sampled multi-layer Voigt cross-section using the Humlíček 4-region approximation for the Faddeeva function.
+
+    Evaluates the Voigt profile at each wn_grid point directly rather than integrating over bins. This is faster per
+    grid point than the binned version (no quadrature loop) but less accurate for coarse grids where the bin width is
+    comparable to the line width - in that regime the binned version is preferred. For high-resolution grids (resolving
+    power, R >> line width / grid spacing) the two should converge.
+
+    Can be used for wn_grid input with variable or fixed grid spacing, as profiles are compute at grid points and are
+    agnostic of distance to adjacent points (no integral limits).
+
+    The Lorentzian HWHM is the pressure HWHM plus the lifetime HWHM of both the upper and lower states.
+
+    Parameters
+    ----------
+    profile_buffer : ndarray, shape (3, n_bands, n_layers, n_grid)
+    wn_grid : ndarray, shape (n_grid,)
+    id_f : ndarray, shape (n_trans,)
+    id_i : ndarray, shape (n_trans,)
+    group_bands : ndarray, shape (n_bands_in_batch,)
+        Global band index of each band in the batch, from :func:`_group_by_band`.
+    group_starts : ndarray, shape (n_bands_in_batch,)
+    group_ends : ndarray, shape (n_bands_in_batch,)
+        Each band's transitions are [group_starts[b], group_ends[b]) in the transition arrays.
+    n_lookup : ndarray, shape (n_states + 1, n_layers)
+        Lookup table for n_frac, avoiding extremely memory intensive joins.
+    g_lookup : ndarray, shape (n_states + 1, )
+        Lookup table for g, avoiding extremely memory intensive joins.
+    inv_g_lookup : ndarray, shape (n_states + 1, )
+    gamma_lifetime_lookup : ndarray, shape (n_states + 1, )
+        Per-state lifetime HWHM contributions [cm^-1], from :func:`gamma_lifetime_lookup_from_tau`.
+    a_fi : ndarray, shape (n_trans,)
+    energy_fi : ndarray, shape (n_trans,)
+    temperatures : ndarray, shape (n_layers,)
+    pressures : ndarray, shape (n_layers,)
+    broad_n : ndarray, shape (n_broadeners,)
+    broad_gamma : ndarray, shape (n_broadeners, n_layers)
+        Note: layers on axis-1, matching broadening_params[0].
+    species_mass : float
+
+    """
+    n_layers = temperatures.shape[0]
+    n_grid = wn_grid.shape[0]
+    n_bands_in_batch = group_starts.shape[0]
+
+    cutoff = 25.0
+    inv_sqrt_pi = 1 / np.sqrt(np.pi)
+
+    # Per-layer broadening terms: 1 / (sigma_D * sqrt(2)) = inv_doppler[l] / energy_fi, and the pressure HWHM. The
+    # per-transition terms are separable from these, so no (n_layers, n_trans) arrays are needed.
+    inv_doppler, gamma_pressure = _layer_broadening_terms(
+        temperatures=temperatures, pressures=pressures, broad_n=broad_n, broad_gamma=broad_gamma,
+        species_mass=species_mass, t_ref=t_ref, pressure_ref=pressure_ref,
+    )
+
+    # Each (band, layer) pair owns its output row, so pairs run in parallel without write conflicts. The pairs are
+    # sorted by cost (lines in the band) and dealt round-robin to n_workers workers, heaviest first: a band holding most
+    # of the lines is then spread over many threads, instead of all its layers landing in one thread's contiguous block
+    # of a prange over pairs.
+    n_pairs = n_bands_in_batch * n_layers
+    cost = np.empty(n_pairs, dtype=np.int64)
+    for bl in range(n_pairs):
+        b_local = bl // n_layers
+        cost[bl] = group_ends[b_local] - group_starts[b_local]
+    order = np.argsort(-cost, kind="mergesort")
+
+    for w in numba.prange(n_workers):
+        for k in range(w, n_pairs, n_workers):
+            bl = order[k]
+            b_local = bl // n_layers
+            l = bl % n_layers
+
+            b_global = group_bands[b_local]
+            gs = group_starts[b_local]
+            ge = group_ends[b_local]
+
+            abs_bl = profile_buffer[0, b_global, l]
+            ste_bl = profile_buffer[1, b_global, l]
+            spe_bl = profile_buffer[2, b_global, l]
+            inv_doppler_l = inv_doppler[l]
+            gamma_pressure_l = gamma_pressure[l]
+
+            for t in range(gs, ge):
+                energy_fi_t = energy_fi[t]
+                transition_min = energy_fi_t - cutoff
+                transition_max = energy_fi_t + cutoff
                 j_start = max(0, _binary_search_left(wn_grid, transition_min))
                 j_end = min(n_grid, _binary_search_right(wn_grid, transition_max) + 1)
 
                 if j_start >= j_end:
                     continue
 
-                sqrtln2_on_alpha_li = sqrtln2 / alpha_total_li
-                norm = sqrtln2_on_alpha_li * inv_sqrt_pi
+                id_f_t = id_f[t]
+                id_i_t = id_i[t]
+                a_fi_t = a_fi[t]
+                # Layer-independent coefficient prefactors.
+                ste_prefactor_t = a_fi_t / (const_8_pi_c * energy_fi_t * energy_fi_t)
+                abs_prefactor_t = ste_prefactor_t * g_lookup[id_f_t] * inv_g_lookup[id_i_t]
+                spe_prefactor_t = a_fi_t * energy_fi_t * const_h_c_on_4_pi
+
+                gamma_total_tl = gamma_lifetime_lookup[id_f_t] + gamma_lifetime_lookup[id_i_t] + gamma_pressure_l
+                inv_sigma_sqrt2_tl = inv_doppler_l / energy_fi_t
+                # Voigt y-parameter: gamma_L / (sigma_D * sqrt(2)).
+                y_tl = gamma_total_tl * inv_sigma_sqrt2_tl
+
+                n_f_tl = n_lookup[id_f_t, l]
+                abs_tl = n_lookup[id_i_t, l] * abs_prefactor_t
+                ste_tl = n_f_tl * ste_prefactor_t
+                spe_tl = n_f_tl * spe_prefactor_t
+
+                # Integral of Re[w(x,y)] dx = sqrt(pi), so the normalised Voigt is Re[w(z)] / (sigma * sqrt(2*pi)).
+                norm = inv_sigma_sqrt2_tl * inv_sqrt_pi
 
                 for j in range(j_start, j_end):
-                    wn_j = wn_grid[j]
-                    arg = sqrtln2_on_alpha_li * (wn_j - energy_i)
-                    gauss_val = norm * math.exp(-(arg * arg))
+                    # x = (nu - nu0) / (sigma * sqrt(2))
+                    x_tj = (wn_grid[j] - energy_fi_t) * inv_sigma_sqrt2_tl
+                    voigt_val = _voigt_humlicek_w(x_tj, y_tl) * norm
 
-                    buffer_out[0, band, l, j] += abs_li * gauss_val
+                    abs_bl[j] += abs_tl * voigt_val
+                    ste_bl[j] += ste_tl * voigt_val
+                    spe_bl[j] += spe_tl * voigt_val
 
-    return buffer_out
 
-
-# ------------------------------------- ALL LAYER, SAMPLED VOIGT CALCULATIONS -------------------------------------
-@numba.njit(parallel=True, cache=True, error_model="numpy")
-def _band_profile_sampled_voigt(
+@numba.njit(parallel=True, nogil=True, cache=True, error_model="numpy")
+def _abs_emi_sampled_voigt(
         profile_buffer: npt.NDArray[np.float64],
         wn_grid: npt.NDArray[np.float64],
         id_f: npt.NDArray[np.int32],
         id_i: npt.NDArray[np.int32],
-        id_agg_f: npt.NDArray[np.int32],
-        id_agg_i: npt.NDArray[np.int32],
-        band_indices: npt.NDArray[np.int32],
         n_lookup: npt.NDArray[np.float64],
         g_lookup: npt.NDArray[np.float64],
         inv_g_lookup: npt.NDArray[np.float64],
-        tau_lookup: npt.NDArray[np.float64],
+        gamma_lifetime_lookup: npt.NDArray[np.float64],
         a_fi: npt.NDArray[np.float64],
         energy_fi: npt.NDArray[np.float64],
         temperatures: npt.NDArray[np.float64],
@@ -2025,20 +2451,18 @@ def _band_profile_sampled_voigt(
 
     Parameters
     ----------
-    profile_buffer : ndarray, shape (3, n_bands, n_layers, n_trans)
+    profile_buffer : ndarray, shape (2, n_layers, n_grid)
     wn_grid : ndarray, shape (n_grid,)
     id_f : ndarray, shape (n_trans,)
     id_i : ndarray, shape (n_trans,)
-    id_agg_f : ndarray, shape (n_trans,)
-    id_agg_i : ndarray, shape (n_trans,)
-    band_indices : ndarray, shape (n_trans,)
     n_lookup : ndarray, shape (n_states + 1, n_layers)
         Lookup table for n_frac, avoiding extremely memory intensive joins.
     g_lookup : ndarray, shape (n_states + 1, )
         Lookup table for g, avoiding extremely memory intensive joins.
     inv_g_lookup : ndarray, shape (n_states + 1, )
-    tau_lookup : ndarray, shape (n_states + 1, )
-        Lookup table for tau (lifetimes), avoiding extremely memory intensive joins.
+    gamma_lifetime_lookup : ndarray, shape (n_states + 1, )
+        Per-state lifetime HWHM contributions [cm^-1], from :func:`gamma_lifetime_lookup_from_tau`. The Lorentzian
+        HWHM is the pressure HWHM plus the lifetime HWHM of both the upper and lower states.
     a_fi : ndarray, shape (n_trans,)
     energy_fi : ndarray, shape (n_trans,)
     temperatures : ndarray, shape (n_layers,)
@@ -2047,341 +2471,20 @@ def _band_profile_sampled_voigt(
     broad_gamma : ndarray, shape (n_broadeners, n_layers)
         Note: layers on axis-1, matching broadening_params[0].
     species_mass : float
-
     """
     n_layers = temperatures.shape[0]
     n_grid = wn_grid.shape[0]
     n_trans = energy_fi.shape[0]
-    n_broad = broad_n.shape[0]
-    n_states = n_lookup.shape[0]
 
-    band_group_indices, group_starts, group_ends = _find_groups_from_ids(
-        id_agg_f=id_agg_f,
-        id_agg_i=id_agg_i,
-        band_indices=band_indices,
+    cutoff = 25.0
+    inv_sqrt_pi = 1 / np.sqrt(np.pi)
+
+    # Per-layer broadening terms: 1 / (sigma_D * sqrt(2)) = inv_doppler[l] / energy_fi, and the pressure HWHM; the
+    # per-transition lifetime HWHM is added inside the layer loop, so no (n_layers, n_trans) arrays are needed.
+    inv_doppler, gamma_pressure = _layer_broadening_terms(
+        temperatures=temperatures, pressures=pressures, broad_n=broad_n, broad_gamma=broad_gamma,
+        species_mass=species_mass, t_ref=t_ref, pressure_ref=pressure_ref,
     )
-    n_bands_in_batch = group_starts.shape[0]
-
-    cutoff = 25.0
-    sqrt2 = np.sqrt(2.0)
-    sqrt2_NA_kB_on_c = sqrt2 * const_sqrt_NA_kB_on_c
-    inv_sqrt_pi = 1 / np.sqrt(np.pi)
-
-    # Per-layer per-transition: sigma_D, gamma_total, and profile coefficients
-    inv_sigma_sqrt2 = np.empty((n_layers, n_trans), dtype=np.float64)  # Doppler sigma (std dev)
-    gamma_total_lookup = np.empty((n_layers, n_states), dtype=np.float64)
-
-    # gamma_lifetime = 1.0 / (const_4_pi_c * lifetimes)  # (n_trans,)
-    gamma_lifetime_lookup = 1.0 / (const_4_pi_c * tau_lookup)
-
-    for l in numba.prange(n_layers):
-        temp_l = temperatures[l]
-        pres_l = pressures[l]
-        inv_sigma_sqrt2[l] = 1 / (energy_fi * sqrt2_NA_kB_on_c * np.sqrt(temp_l / species_mass))
-
-        gamma_pressure_l = 0.0
-        for b in range(n_broad):
-            gamma_pressure_l += broad_gamma[b, l] * pres_l * (t_ref / temp_l) ** broad_n[b] / pressure_ref
-        gamma_total_lookup[l] = gamma_lifetime_lookup + gamma_pressure_l
-
-    # Voigt y-parameter: gamma_L / (sigma_D * sqrt(2)).
-    # sigma here is the Gaussian sigma (standard deviation), so
-    # sigma_D * sqrt(2) = sigma * sqrt(2).
-    # y_voigt = gamma_total * inv_sigma_sqrt2  # (n_layers, n_trans)
-
-    abs_ste_prefactor = a_fi / (const_8_pi_c * energy_fi * energy_fi)
-    spe_prefactor = a_fi * energy_fi * const_h_c_on_4_pi
-
-    # for t in numba.prange(n_trans):
-    #     thread_id = numba.get_thread_id()
-    for bl in numba.prange(n_bands_in_batch * n_layers):
-        b_local = bl // n_layers
-        l = bl % n_layers
-
-        b_global = band_group_indices[b_local]
-        gs = group_starts[b_local]
-        ge = group_ends[b_local]
-
-        abs_bl = profile_buffer[0, b_global, l]
-        ste_bl = profile_buffer[1, b_global, l]
-        spe_bl = profile_buffer[2, b_global, l]
-
-        for t in range(gs, ge):
-            energy_fi_t = energy_fi[t]
-            transition_min = energy_fi_t - cutoff
-            transition_max = energy_fi_t + cutoff
-            j_start = max(0, _binary_search_left(wn_grid, transition_min))
-            j_end = min(n_grid, _binary_search_right(wn_grid, transition_max) + 1)
-
-            if j_start >= j_end:
-                continue
-
-            id_f_t = id_f[t]
-            id_i_t = id_i[t]
-            g_f_t = g_lookup[id_f_t]
-            inv_g_i_t = inv_g_lookup[id_i_t]
-            g_f_on_g_i_t = g_f_t * inv_g_i_t
-            # Layer-independent coeficient prefactors.
-            abs_ste_prefactor_t = abs_ste_prefactor[t]
-            abs_prefactor_t = g_f_on_g_i_t * abs_ste_prefactor_t
-            ste_prefactor_t = abs_ste_prefactor_t
-            spe_prefactor_t = spe_prefactor[t]
-
-            # for l in range(n_layers):
-            gamma_total_tl = gamma_total_lookup[l, id_f_t]
-            inv_sigma_sqrt2_tl = inv_sigma_sqrt2[l, t]
-            y_tl = gamma_total_tl * inv_sigma_sqrt2_tl
-            # y_tl = y_voigt[l, t]
-
-            n_f_tl = n_lookup[id_f_t, l]
-            n_i_tl = n_lookup[id_i_t, l]
-            abs_tl = n_i_tl * abs_prefactor_t
-            ste_tl = n_f_tl * ste_prefactor_t
-            spe_tl = n_f_tl * spe_prefactor_t
-
-            # Integral of Re[w(x,y)] dx = sqrt(pi), so the normalised Voigt is Re[w(z)] / (sigma * sqrt(2*pi)).
-            norm = inv_sigma_sqrt2_tl * inv_sqrt_pi
-
-            for j in range(j_start, j_end):
-                # x = (nu - nu0) / (sigma * sqrt(2))
-                wn_j = wn_grid[j]
-                x_tj = (wn_j - energy_fi_t) * inv_sigma_sqrt2_tl
-                voigt_val = _voigt_humlicek_w(x_tj, y_tl) * norm
-
-                abs_bl[j] += abs_tl * voigt_val
-                ste_bl[j] += ste_tl * voigt_val
-                spe_bl[j] += spe_tl * voigt_val
-
-
-@numba.njit(parallel=True, cache=True, error_model="numpy")
-def _abs_emi_sampled_voigt_threadlocal(
-        profile_buffer: npt.NDArray[np.float64],
-        wn_grid: npt.NDArray[np.float64],
-        id_f: npt.NDArray[np.float64],
-        id_i: npt.NDArray[np.float64],
-        n_lookup: npt.NDArray[np.float64],
-        g_lookup: npt.NDArray[np.float64],
-        inv_g_lookup: npt.NDArray[np.float64],
-        tau_lookup: npt.NDArray[np.float64],
-        a_fi: npt.NDArray[np.float64],
-        energy_fi: npt.NDArray[np.float64],
-        temperatures: npt.NDArray[np.float64],
-        pressures: npt.NDArray[np.float64],
-        broad_n: npt.NDArray[np.float64],
-        broad_gamma: npt.NDArray[np.float64],
-        species_mass: float,
-        t_ref: float = 296.0,
-        pressure_ref: float = 1.0,
-        numba_num_threads: int = _DEFAULT_NUM_THREADS,
-) -> None:
-    """
-    Uses thread-local buffers for accumulation while still parallelising over n_trans. More memory intensive but faster
-    when n_trans is much larger. Should be used for larger diatomics like TiO which might be better off with
-    super-lines. For small line lists like CO, OH this is slower due to the final accumualtion step.
-
-
-    Sampled multi-layer Voigt cross-section using the Humlíček 4-region approximation for the Faddeeva function.
-
-    Evaluates the Voigt profile at each wn_grid point directly rather than integrating over bins. This is faster per
-    grid point than the binned version (no quadrature loop) but less accurate for coarse grids where the bin width is
-    comparable to the line width - in that regime the binned version is preferred. For high-resolution grids (resolving
-    power, R >> line width / grid spacing) the two should converge.
-
-    Can be used for wn_grid input with variable or fixed grid spacing, as profiles are compute at grid points and are
-    agnostic of distance to adjacent points (no integral limits).
-
-    Parameters
-    ----------
-    profile_buffer : ndarray, shape (2, n_layers, n_grid)
-    wn_grid : ndarray, shape (n_grid,)
-    id_f : ndarray, shape (n_trans,)
-    id_i : ndarray, shape (n_trans,)
-    n_lookup : ndarray, shape (n_states + 1, n_layers)
-        Lookup table for n_frac, avoiding extremely memory intensive joins.
-    g_lookup : ndarray, shape (n_states + 1, )
-        Lookup table for g, avoiding extremely memory intensive joins.
-    inv_g_lookup : ndarray, shape (n_states + 1, )
-    tau_lookup : ndarray, shape (n_states + 1, )
-        Lookup table for tau (lifetimes), avoiding extremely memory intensive joins.
-    a_fi : ndarray, shape (n_trans,)
-    energy_fi : ndarray, shape (n_trans,)
-    temperatures : ndarray, shape (n_layers,)
-    pressures : ndarray, shape (n_layers,)
-    broad_n : ndarray, shape (n_broadeners,)
-    broad_gamma : ndarray, shape (n_broadeners, n_layers)
-        Note: layers on axis-1, matching broadening_params[0].
-    species_mass : float
-    """
-    n_layers = temperatures.shape[0]
-    n_grid = wn_grid.shape[0]
-    n_trans = energy_fi.shape[0]
-    n_broad = broad_n.shape[0]
-    n_states = n_lookup.shape[0]
-
-    cutoff = 25.0
-    sqrt2 = np.sqrt(2.0)
-    sqrt2_NA_kB_on_c = sqrt2 * const_sqrt_NA_kB_on_c
-    inv_sqrt_pi = 1 / np.sqrt(np.pi)
-
-    # Per-layer per-transition: sigma_D, gamma_total, and profile coefficients
-    inv_sigma_sqrt2 = np.empty((n_layers, n_trans), dtype=np.float64)  # Doppler sigma (std dev)
-    gamma_total_lookup = np.empty((n_layers, n_states), dtype=np.float64)
-
-    # gamma_lifetime = 1.0 / (const_4_pi_c * lifetimes)  # (n_trans,)
-    gamma_lifetime_lookup = 1.0 / (const_4_pi_c * tau_lookup)
-
-    for l in numba.prange(n_layers):
-        temp_l = temperatures[l]
-        pres_l = pressures[l]
-        inv_sigma_sqrt2[l] = 1 / (energy_fi * sqrt2_NA_kB_on_c * np.sqrt(temp_l / species_mass))
-
-        gamma_pressure_l = 0.0
-        for b in range(n_broad):
-            gamma_pressure_l += broad_gamma[b, l] * pres_l * (t_ref / temp_l) ** broad_n[b] / pressure_ref
-        # gamma_total[l] = gamma_lifetime + gamma_pressure_l
-        gamma_total_lookup[l] = gamma_lifetime_lookup + gamma_pressure_l
-
-    # Voigt y-parameter: gamma_L / (sigma_D * sqrt(2)).
-    # y_voigt = gamma_total * inv_sigma_sqrt2  # (n_layers, n_trans)
-
-    abs_buffer = np.zeros((numba_num_threads, n_layers, n_grid), dtype=np.float64)
-    emi_buffer = np.zeros((numba_num_threads, n_layers, n_grid), dtype=np.float64)
-
-    abs_prefactor = a_fi / (const_8_pi_c * energy_fi * energy_fi)
-    emi_prefactor = a_fi * energy_fi * const_h_c_on_4_pi
-
-    for t in numba.prange(n_trans):
-        thread_id = numba.get_thread_id()
-
-        energy_fi_t = energy_fi[t]
-        transition_min = energy_fi_t - cutoff
-        transition_max = energy_fi_t + cutoff
-        j_start = max(0, _binary_search_left(wn_grid, transition_min))
-        j_end = min(n_grid, _binary_search_right(wn_grid, transition_max) + 1)
-
-        if j_start >= j_end:
-            continue
-
-        id_f_t = id_f[t]
-        id_i_t = id_i[t]
-        g_f_t = g_lookup[id_f_t]
-        inv_g_i_t = inv_g_lookup[id_i_t]
-        g_f_on_g_i_t = g_f_t * inv_g_i_t
-        # Layer-independent coeficient prefactors.
-        abs_prefactor_t = abs_prefactor[t]
-        emi_prefactor_t = emi_prefactor[t]
-
-        for l in range(n_layers):
-            gamma_total_tl = gamma_total_lookup[l, id_f_t]
-            inv_sigma_sqrt2_tl = inv_sigma_sqrt2[l, t]
-            y_tl = gamma_total_tl * inv_sigma_sqrt2_tl
-            # y_tl = y_voigt[l, t]
-
-            n_f_l = n_lookup[id_f_t, l]
-            n_i_l = n_lookup[id_i_t, l]
-            abs_tl = abs_prefactor_t * ((n_i_l * g_f_on_g_i_t) - n_f_l)
-            emi_tl = emi_prefactor_t * n_f_l
-
-            abs_l = abs_buffer[thread_id, l]
-            emi_l = emi_buffer[thread_id, l]
-
-            # Integral of Re[w(x,y)] dx = sqrt(pi), so the normalised Voigt is Re[w(z)] / (sigma * sqrt(2*pi)).
-            norm = inv_sigma_sqrt2_tl * inv_sqrt_pi
-
-            for j in range(j_start, j_end):
-                # x = (nu - nu0) / (sigma * sqrt(2))
-                wn_j = wn_grid[j]
-                x_tj = (wn_j - energy_fi_t) * inv_sigma_sqrt2_tl
-                voigt_val = _voigt_humlicek_w(x_tj, y_tl) * norm
-
-                abs_l[j] += abs_tl * voigt_val
-                emi_l[j] += emi_tl * voigt_val
-    # Accumulate into profile_buffer.
-    for l in numba.prange(n_layers):
-        for k in range(n_grid):
-            for t in range(numba_num_threads):
-                profile_buffer[0, l, k] += abs_buffer[t, l, k]
-                profile_buffer[1, l, k] += emi_buffer[t, l, k]
-
-
-@numba.njit(parallel=True, cache=True, error_model="numpy")
-def _abs_emi_sampled_voigt(
-        profile_buffer: npt.NDArray[np.float64],
-        wn_grid: npt.NDArray[np.float64],
-        id_f: npt.NDArray[np.float64],
-        id_i: npt.NDArray[np.float64],
-        n_lookup: npt.NDArray[np.float64],
-        g_lookup: npt.NDArray[np.float64],
-        inv_g_lookup: npt.NDArray[np.float64],
-        tau_lookup: npt.NDArray[np.float64],
-        a_fi: npt.NDArray[np.float64],
-        energy_fi: npt.NDArray[np.float64],
-        temperatures: npt.NDArray[np.float64],
-        pressures: npt.NDArray[np.float64],
-        broad_n: npt.NDArray[np.float64],
-        broad_gamma: npt.NDArray[np.float64],
-        species_mass: float,
-        t_ref: float = 296.0,
-        pressure_ref: float = 1.0,
-) -> None:
-    """
-    Sampled multi-layer Voigt cross-section using the Humlíček 4-region approximation for the Faddeeva function.
-
-    Evaluates the Voigt profile at each wn_grid point directly rather than integrating over bins. This is faster per
-    grid point than the binned version (no quadrature loop) but less accurate for coarse grids where the bin width is
-    comparable to the line width - in that regime the binned version is preferred. For high-resolution grids (resolving
-    power, R >> line width / grid spacing) the two should converge.
-
-    Can be used for wn_grid input with variable or fixed grid spacing, as profiles are compute at grid points and are
-    agnostic of distance to adjacent points (no integral limits).
-
-    Parameters
-    ----------
-    profile_buffer : ndarray, shape (2, n_layers, n_grid)
-    wn_grid : ndarray, shape (n_grid,)
-    id_f : ndarray, shape (n_trans,)
-    id_i : ndarray, shape (n_trans,)
-    n_lookup : ndarray, shape (n_states + 1, n_layers)
-        Lookup table for n_frac, avoiding extremely memory intensive joins.
-    g_lookup : ndarray, shape (n_states + 1, )
-        Lookup table for g, avoiding extremely memory intensive joins.
-    inv_g_lookup : ndarray, shape (n_states + 1, )
-    tau_lookup : ndarray, shape (n_states + 1, )
-        Lookup table for tau (lifetimes), avoiding extremely memory intensive joins.
-    a_fi : ndarray, shape (n_trans,)
-    energy_fi : ndarray, shape (n_trans,)
-    temperatures : ndarray, shape (n_layers,)
-    pressures : ndarray, shape (n_layers,)
-    broad_n : ndarray, shape (n_broadeners,)
-    broad_gamma : ndarray, shape (n_broadeners, n_layers)
-        Note: layers on axis-1, matching broadening_params[0].
-    species_mass : float
-    """
-    n_layers = temperatures.shape[0]
-    n_grid = wn_grid.shape[0]
-    n_trans = energy_fi.shape[0]
-    n_broad = broad_n.shape[0]
-    n_states = n_lookup.shape[0]
-
-    cutoff = 25.0
-    sqrt2 = np.sqrt(2.0)
-    sqrt2_NA_kB_on_c = sqrt2 * const_sqrt_NA_kB_on_c
-    inv_sqrt_pi = 1 / np.sqrt(np.pi)
-
-    inv_sigma_sqrt2 = np.empty((n_layers, n_trans), dtype=np.float64)  # Doppler sigma (std dev)
-    gamma_total_lookup = np.empty((n_layers, n_states), dtype=np.float64)
-
-    gamma_lifetime_lookup = 1.0 / (const_4_pi_c * tau_lookup)
-
-    for l in numba.prange(n_layers):
-        temp_l = temperatures[l]
-        pres_l = pressures[l]
-        inv_sigma_sqrt2[l] = 1 / (energy_fi * sqrt2_NA_kB_on_c * np.sqrt(temp_l / species_mass))
-
-        gamma_pressure_l = 0.0
-        for b in range(n_broad):
-            gamma_pressure_l += broad_gamma[b, l] * pres_l * (t_ref / temp_l) ** broad_n[b] / pressure_ref
-        gamma_total_lookup[l] = gamma_lifetime_lookup + gamma_pressure_l
 
     abs_prefactor = np.empty(n_trans, dtype=np.float64)
     emi_prefactor = np.empty(n_trans, dtype=np.float64)
@@ -2396,9 +2499,6 @@ def _abs_emi_sampled_voigt(
         emi_prefactor[t] = a_fi_t * energy_fi_t * const_h_c_on_4_pi
 
     for l in numba.prange(n_layers):
-        temp_l = temperatures[l]
-        inv_sqrt_temp_on_m = 1.0 / np.sqrt(temp_l / species_mass)
-
         abs_l = profile_buffer[0, l]
         emi_l = profile_buffer[1, l]
 
@@ -2418,8 +2518,8 @@ def _abs_emi_sampled_voigt(
             abs_prefactor_t = abs_prefactor[t]
             emi_prefactor_t = emi_prefactor[t]
 
-            gamma_total_tl = gamma_total_lookup[l, id_f_t]
-            inv_sigma_sqrt2_tl = inv_sqrt_temp_on_m / (energy_fi_t * sqrt2_NA_kB_on_c)
+            gamma_total_tl = gamma_lifetime_lookup[id_f_t] + gamma_lifetime_lookup[id_i_t] + gamma_pressure[l]
+            inv_sigma_sqrt2_tl = inv_doppler[l] / energy_fi_t
             y_tl = gamma_total_tl * inv_sigma_sqrt2_tl
             # Integral of Re[w(x,y)] dx = sqrt(pi), so the normalised Voigt is Re[w(z)] / (sigma * sqrt(2*pi)).
             norm = inv_sigma_sqrt2_tl * inv_sqrt_pi
@@ -2440,15 +2540,15 @@ def _abs_emi_sampled_voigt(
 
 
 # ------------------------------------- ALL LAYER, SAMPLED GAUSSIAN CALCULATIONS -------------------------------------
-@numba.njit(parallel=True, cache=True, error_model="numpy")
+@numba.njit(parallel=True, nogil=True, cache=True, error_model="numpy")
 def _continuum_band_profile_sampled_gauss_layered(
         profile_buffer: npt.NDArray[np.float64],
         wn_grid: npt.NDArray[np.float64],
-        id_f: npt.NDArray[np.float32],
-        id_i: npt.NDArray[np.float32],
-        id_agg_f: npt.NDArray[np.int32],
-        id_agg_i: npt.NDArray[np.int32],
-        band_indices: npt.NDArray[np.int32],
+        id_f: npt.NDArray[np.int32],
+        id_i: npt.NDArray[np.int32],
+        group_bands: npt.NDArray[np.int32],
+        group_starts: npt.NDArray[np.int32],
+        group_ends: npt.NDArray[np.int32],
         n_lookup: npt.NDArray[np.float64],
         g_lookup: npt.NDArray[np.float64],
         inv_g_lookup: npt.NDArray[np.float64],
@@ -2459,6 +2559,7 @@ def _continuum_band_profile_sampled_gauss_layered(
         species_mass: float,
         reduced_mass: float,
         box_length: float,
+        n_workers: int = _DEFAULT_NUM_THREADS,
 ) -> npt.NDArray[np.float64]:
     """
     Sampled multi-layer Gaussian continuum cross-section.
@@ -2477,9 +2578,11 @@ def _continuum_band_profile_sampled_gauss_layered(
     wn_grid : ndarray, shape (n_grid,)
     id_f : ndarray, shape (n_trans,)
     id_i : ndarray, shape (n_trans,)
-    id_agg_f : ndarray, shape (n_trans,)
-    id_agg_i : ndarray, shape (n_trans,)
-    band_indices : ndarray, shape (n_trans,)
+    group_bands : ndarray, shape (n_bands_in_batch,)
+        Global band index of each band in the batch, from :func:`_group_by_band`.
+    group_starts : ndarray, shape (n_bands_in_batch,)
+    group_ends : ndarray, shape (n_bands_in_batch,)
+        Each band's transitions are [group_starts[b], group_ends[b]) in the transition arrays.
     n_lookup : ndarray, shape (n_states + 1, n_layers)
         Lookup table for n_frac, avoiding extremely memory intensive joins.
     g_lookup : ndarray, shape (n_states + 1, )
@@ -2497,12 +2600,6 @@ def _continuum_band_profile_sampled_gauss_layered(
     n_layers = temperatures.shape[0]
     n_grid = wn_grid.shape[0]
     n_states = n_lookup.shape[0]
-
-    band_group_indices, group_starts, group_ends = _find_groups_from_ids(
-        id_agg_f=id_agg_f,
-        id_agg_i=id_agg_i,
-        band_indices=band_indices,
-    )
     n_bands_in_batch = group_starts.shape[0]
 
     sqrtln2 = np.sqrt(np.log(2.0))
@@ -2528,68 +2625,81 @@ def _continuum_band_profile_sampled_gauss_layered(
     # alpha_doppler_max per transition (layer-independent bound).
     abs_prefactor = a_fi / (const_8_pi_c * energy_fi * energy_fi)
 
-    for bl in numba.prange(n_bands_in_batch * n_layers):
+    # Each (band, layer) pair owns its output row, so pairs run in parallel without write conflicts. The pairs are
+    # sorted by cost (lines in the band) and dealt round-robin to n_workers workers, heaviest first: a band holding most
+    # of the lines is then spread over many threads, instead of all its layers landing in one thread's contiguous block
+    # of a prange over pairs.
+    n_pairs = n_bands_in_batch * n_layers
+    cost = np.empty(n_pairs, dtype=np.int64)
+    for bl in range(n_pairs):
         b_local = bl // n_layers
-        l = bl % n_layers
+        cost[bl] = group_ends[b_local] - group_starts[b_local]
+    order = np.argsort(-cost, kind="mergesort")
 
-        b_global = band_group_indices[b_local]
-        gs = group_starts[b_local]
-        ge = group_ends[b_local]
+    for w in numba.prange(n_workers):
+        for k in range(w, n_pairs, n_workers):
+            bl = order[k]
+            b_local = bl // n_layers
+            l = bl % n_layers
 
-        abs_bl = profile_buffer[0, b_global, l]
-        doppler_prefactor_l = doppler_prefactor[l]
+            b_global = group_bands[b_local]
+            gs = group_starts[b_local]
+            ge = group_ends[b_local]
 
-        for t in range(gs, ge):
-            energy_fi_t = energy_fi[t]
-            id_f_t = id_f[t]
-            # Broadening.
-            alpha_box_t = alpha_box_lookup[id_f_t]
-            alpha_doppler_tl = energy_fi_t * doppler_prefactor_l
-            alpha_total_tl = alpha_box_t + alpha_doppler_tl
-            cutoff_tl = cutoff_fwhm_multiple * alpha_total_tl
-            if cutoff_tl < min_cutoff:
-                cutoff_tl = min_cutoff
-            elif cutoff_tl > max_cutoff:
-                cutoff_tl = max_cutoff
+            abs_bl = profile_buffer[0, b_global, l]
+            doppler_prefactor_l = doppler_prefactor[l]
 
-            transition_min = energy_fi_t - cutoff_tl
-            transition_max = energy_fi_t + cutoff_tl
+            for t in range(gs, ge):
+                energy_fi_t = energy_fi[t]
+                id_f_t = id_f[t]
+                # Broadening.
+                alpha_box_t = alpha_box_lookup[id_f_t]
+                alpha_doppler_tl = energy_fi_t * doppler_prefactor_l
+                alpha_total_tl = alpha_box_t + alpha_doppler_tl
+                cutoff_tl = cutoff_fwhm_multiple * alpha_total_tl
+                if cutoff_tl < min_cutoff:
+                    cutoff_tl = min_cutoff
+                elif cutoff_tl > max_cutoff:
+                    cutoff_tl = max_cutoff
 
-            j_start = max(0, _binary_search_left(wn_grid, transition_min))
-            j_end = min(n_grid, _binary_search_right(wn_grid, transition_max) + 1)
+                transition_min = energy_fi_t - cutoff_tl
+                transition_max = energy_fi_t + cutoff_tl
 
-            if j_start >= j_end:
-                continue
+                j_start = max(0, _binary_search_left(wn_grid, transition_min))
+                j_end = min(n_grid, _binary_search_right(wn_grid, transition_max) + 1)
 
-            id_i_t = id_i[t]
-            g_f_t = g_lookup[id_f_t]
-            inv_g_i_t = inv_g_lookup[id_i_t]
-            g_f_on_g_i_t = g_f_t * inv_g_i_t
-            # Layer-independent coeficient prefactors.
-            abs_prefactor_t = abs_prefactor[t]
-            n_i_tl = n_lookup[id_i_t, l]
-            abs_tl = abs_prefactor_t * (n_i_tl * g_f_on_g_i_t)
+                if j_start >= j_end:
+                    continue
 
-            sqrtln2_on_alpha_tl = sqrtln2 / alpha_total_tl
-            # Normalised Gaussian: G(nu) = (sqrt(ln2) / (alpha * sqrt(pi))) * exp(-ln2 * ((nu - nu0) / alpha)^2)
-            # Rewritten with sqrtln2_on_alpha precomputed:
-            #   exponent arg  = sqrtln2_on_alpha * (nu - nu0)
-            #   prefactor     = sqrtln2_on_alpha / sqrt(pi)
-            norm = sqrtln2_on_alpha_tl * inv_sqrt_pi
+                id_i_t = id_i[t]
+                g_f_t = g_lookup[id_f_t]
+                inv_g_i_t = inv_g_lookup[id_i_t]
+                g_f_on_g_i_t = g_f_t * inv_g_i_t
+                # Layer-independent coeficient prefactors.
+                abs_prefactor_t = abs_prefactor[t]
+                n_i_tl = n_lookup[id_i_t, l]
+                abs_tl = abs_prefactor_t * (n_i_tl * g_f_on_g_i_t)
 
-            for j in range(j_start, j_end):
-                arg = sqrtln2_on_alpha_tl * (wn_grid[j] - energy_fi_t)
-                gauss_val = norm * math.exp(-(arg * arg))
+                sqrtln2_on_alpha_tl = sqrtln2 / alpha_total_tl
+                # Normalised Gaussian: G(nu) = (sqrt(ln2) / (alpha * sqrt(pi))) * exp(-ln2 * ((nu - nu0) / alpha)^2)
+                # Rewritten with sqrtln2_on_alpha precomputed:
+                #   exponent arg  = sqrtln2_on_alpha * (nu - nu0)
+                #   prefactor     = sqrtln2_on_alpha / sqrt(pi)
+                norm = sqrtln2_on_alpha_tl * inv_sqrt_pi
 
-                abs_bl[j] += abs_tl * gauss_val
+                for j in range(j_start, j_end):
+                    arg = sqrtln2_on_alpha_tl * (wn_grid[j] - energy_fi_t)
+                    gauss_val = norm * math.exp(-(arg * arg))
+
+                    abs_bl[j] += abs_tl * gauss_val
 
 
-@numba.njit(parallel=True, cache=True, error_model="numpy")
+@numba.njit(parallel=True, nogil=True, cache=True, error_model="numpy")
 def _continuum_sampled_gauss(
         profile_buffer: npt.NDArray[np.float64],
         wn_grid: npt.NDArray[np.float64],
-        id_f: npt.NDArray[np.float64],
-        id_i: npt.NDArray[np.float64],
+        id_f: npt.NDArray[np.int32],
+        id_i: npt.NDArray[np.int32],
         n_lookup: npt.NDArray[np.float64],
         g_lookup: npt.NDArray[np.float64],
         inv_g_lookup: npt.NDArray[np.float64],
