@@ -1,13 +1,15 @@
-"""Quantities shared by both geometries: the effective source function and layer optical depths from the
-opacity (with maser shielding), the Planck function and the angular quadrature."""
+r"""
+Quantities shared by both geometries: the source function and layer optical depths the solvers use (with maser
+shielding), the Planck function and the angular quadrature (:doc:`/theory/radiative_transfer`).
+"""
 import typing as t
 
 import numpy as np
 import numba
 from numpy import typing as npt
-from astropy import units as u, constants as ac
+from astropy import units as u
 
-from ..constants import ac_2_h_on_c_sq, ac_h_on_kB
+from ..constants import ac_2_h_on_c_sq, ac_h_on_kB, const_c_cgs
 
 
 # Maser shielding: a negative (masing) opacity chi is replaced by MASER_SHIELD_FACTOR * |chi| (see
@@ -25,7 +27,15 @@ def _shield_chi_value(chi: float) -> float:
 
 @numba.njit(cache=True)
 def shield_masing_chi(chi: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
-    """Copy of a (C-contiguous) ``chi`` with its negative (masing) entries shielded (:func:`_shield_chi_value`)."""
+    r"""
+    Copy of a (C-contiguous) opacity ``chi`` with its negative (masing) entries shielded,
+
+    .. math::
+
+        \tilde\chi = \begin{cases} \chi & \chi \ge 0, \\ f \, |\chi| & \chi < 0, \end{cases}
+
+    with :math:`f` = ``MASER_SHIELD_FACTOR`` (0.1).
+    """
     out = np.empty_like(chi)
     src, dst = chi.reshape(-1), out.reshape(-1)
     for i in range(src.shape[0]):
@@ -115,20 +125,32 @@ def effective_source_tau_mu(
         density_profile: u.Quantity,
         dz_profile: u.Quantity,
 ) -> t.Tuple[u.Quantity, npt.NDArray[np.float64], u.Quantity, npt.NDArray[np.float64]]:
-    """
-    Compute an effective Source function and optical depth, tau, for use in calculation of Bezier interpolants. These
-    are computed based on an effective opacity calculated using Eq. (39) from https://doi.org/10.48550/arXiv.2508.12873.
+    r"""
+    The source function and optical depths the Bézier solvers use, from the total opacity :math:`\chi` (per molecule),
+    emissivity :math:`\eta` and source function :math:`S` of each layer, with masing shielded. The effective opacity
+    started from Eq. 39 of the TIRAMISU paper (Bowesman et al. 2026, ApJ 997, 203, doi:10.3847/1538-4357/ae27a1); the
+    treatment has been revised since (below), so this is what the code now computes, not that equation:
 
-    Negative (masing/population-inversion) entries in ``global_chi_matrix`` are shielded by mapping ``chi`` to
-    ``MASER_SHIELD_FACTOR * abs(chi)``, the standard treatment used in published coupled statistical-equilibrium
-    + ALI maser codes (e.g. Nesterenok 2016, MNRAS 455, 3978). This keeps the shielded value directly proportional
-    to the element's own magnitude - never collapsing toward zero regardless of how extreme the masing - unlike
-    row-relative min/max-based remaps tried earlier, which made stronger masing map to a *smaller* effective_chi
-    and could blow up anything dividing by it (e.g. :func:`NLTEProcessor.build_y_matrix`'s Lambda*-operator
-    terms). It does not attempt to preserve the shape of the negative-opacity distribution; saturation (the real
-    physical mechanism bounding maser gain) is left to the statistical equilibrium equations, not this shielding.
-    NLTE species' opacities are already shielded individually (:func:`shield_masing_chi`) before they are summed, so
-    with them ``global_chi_matrix`` has no negative entries and this only guards other inputs.
+    .. math::
+
+        \tilde\chi = \begin{cases} \chi & \chi \ge 0, \\ f \, |\chi| & \chi < 0, \end{cases} \qquad
+        \tilde S = \begin{cases} S & S \ge 0, \\ \eta / (c \, \tilde\chi) & S < 0, \end{cases} \qquad
+        \Delta\tau_l = \tilde\chi_l \, n_l \, \Delta z_l, \qquad
+        \tau_l = \tfrac12 \Delta\tau_l + \sum_{k=l+1}^{N-1} \Delta\tau_k,
+
+    with :math:`f` = ``MASER_SHIELD_FACTOR``, :math:`n_l` the number density and :math:`\Delta z_l` the thickness of
+    layer :math:`l` (counted from the bottom), and :math:`\tilde S = 0` where :math:`\tilde\chi = 0`. :math:`\tau_l` is
+    the optical depth from the top to the centre of layer :math:`l`.
+
+    Shielding maps a negative (masing, population-inverted) :math:`\chi` to a fixed fraction of its own magnitude, the
+    standard treatment in coupled statistical-equilibrium and ALI maser codes (e.g. Nesterenok 2016, MNRAS 455, 3978).
+    The shielded value stays proportional to :math:`|\chi|`, so it never collapses towards zero however strong the
+    masing, unlike the row-relative min/max remaps tried earlier, which made stronger masing map to a smaller
+    :math:`\tilde\chi` and could blow up anything dividing by it (e.g. the :math:`\Lambda^*` terms of
+    :meth:`tiramisu.nlte.NLTEProcessor.build_y_matrix`). It does not preserve the shape of the negative opacity;
+    saturation, the physical bound on maser gain, is left to the statistical equilibrium. NLTE species' opacities are
+    already shielded individually (:func:`shield_masing_chi`) before they are summed, so with them :math:`\chi` has no
+    negative entries and this only guards other inputs.
 
     Parameters
     ----------
@@ -159,7 +181,7 @@ def effective_source_tau_mu(
     chi_unit = u.cm ** 2
     eta_unit = u.erg * u.cm / (u.s * u.sr)
 
-    c_cgs = ac.c.cgs.value
+    c_cgs = const_c_cgs
     # Unit.to() (unlike Quantity.to()) already returns the bare conversion factor, not a Quantity.
     eta_to_source_func_scale = (
             eta_unit / (u.cm / u.s * chi_unit)
@@ -183,16 +205,34 @@ def effective_source_tau_mu(
 
 
 def blackbody(spectral_grid: u.Quantity, temperature: u.Quantity) -> u.Quantity:
+    r"""
+    The Planck function per unit frequency,
+
+    .. math::
+
+        B_\nu(T) = \frac{2 h \nu^3}{c^2} \, \frac{1}{e^{h\nu / k_B T} - 1},
+
+    on ``spectral_grid`` (any spectral unit) for each temperature in ``temperature``, shape (n_temperatures,
+    n_spectral) [W / (m^2 Hz sr)].
+    """
     freq_grid = spectral_grid.to(u.Hz, equivalencies=u.spectral())
     temperature = np.atleast_1d(temperature)[:, None]
     return (ac_2_h_on_c_sq * freq_grid ** 3) / (np.exp(ac_h_on_kB * freq_grid / temperature) - 1) / u.sr
 
 
 def mu_quadrature(n_mu: int = 50) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-    """
-    Direction cosines and weights for every angular integral over one hemisphere: Gauss-Legendre nodes on (0, 1) with
-    weights summing to 1, so that J = 1/2 sum_i w_i (I_i^+ + I_i^-). Shared by the radiative-transfer solvers and
-    :func:`incident_intensity`, whose per-direction boundary must be built on the same nodes.
+    r"""
+    Direction cosines :math:`\mu_i` and weights :math:`w_i` for every angular integral over one hemisphere: the
+    ``n_mu``-point Gauss-Legendre nodes :math:`x_i` and weights :math:`W_i` on :math:`[-1, 1]` mapped to
+    :math:`(0, 1)`,
+
+    .. math::
+
+        \mu_i = \tfrac12 (x_i + 1), \qquad w_i = \tfrac12 W_i, \qquad \sum_i w_i = 1, \qquad
+        J = \frac12 \sum_i w_i \left( I^+_i + I^-_i \right).
+
+    Shared by the radiative-transfer solvers and :func:`tiramisu.rt.incident.incident_intensity`, whose per-direction
+    boundary must be built on the same nodes.
     """
     mu_values, mu_weights = np.polynomial.legendre.leggauss(n_mu)
     return (mu_values + 1) * 0.5, mu_weights / 2

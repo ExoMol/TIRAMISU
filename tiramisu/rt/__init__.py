@@ -12,5 +12,6 @@ __all__ = [
     "IncidentIntensity", "SphericalRays", "bezier_delta_tau_and_control_points", "blackbody", "effective_source_tau_mu",
     "emergent_flux", "emergent_flux_spherical", "four_pi_j_hemispheres", "four_pi_j_spherical", "incident_intensity",
     "incident_srf", "mu_quadrature", "shield_masing_chi", "spherical_rays", "update_inward_layer",
-    "update_inward_layer_spherical", "update_layer_coefficients", "update_outward_layer", "update_outward_layer_spherical",
+    "update_inward_layer_spherical", "update_layer_coefficients", "update_outward_layer",
+    "update_outward_layer_spherical",
 ]

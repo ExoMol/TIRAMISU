@@ -19,7 +19,8 @@ help:
 %: Makefile
 	@$(SPHINXBUILD) -M $@ "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
 
+# The API pages (source/api/) are generated from the docstrings on every build; rebuild starts from scratch.
 .PHONY: rebuild
 rebuild:
-	sphinx-apidoc -o source/ tiramisu/ --force
+	rm -rf source/api "$(BUILDDIR)"
 	$(MAKE) html

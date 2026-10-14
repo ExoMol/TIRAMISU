@@ -1,5 +1,14 @@
-"""Spherical-shell radiative transfer (the p-z method): rays through concentric shells, their Gauss-Seidel
-layer updates, the formal solution of 4 pi J and the emergent flux normalised to the planet radius."""
+r"""
+Spherical-shell radiative transfer (the impact-parameter or p-z method): straight rays through concentric shells, their
+Gauss-Seidel layer updates with the exact :math:`\Lambda^*`, the formal solution of :math:`4\pi J` and the emergent flux
+normalised to the planet radius (notes/spherical_2d_radiative_transfer.tex, Sec. 3; notes/lambda_star.tex,
+Sec. 5.5; :doc:`/theory/radiative_transfer`).
+
+The recurrences are the plane-parallel ones (:mod:`tiramisu.rt.plane_parallel`) with each step's optical path taken
+along the ray, :math:`\delta^+_l \to \Delta\tau_{l+1}(p)` and :math:`\delta^-_l \to \Delta\tau_l(p)`
+(:func:`~tiramisu.rt.bezier.ray_dtau`). Layers :math:`l = 0, \dots, N-1` are counted from the bottom, :math:`+` is
+inward and :math:`-` outward, and ray :math:`j` has impact parameter :math:`p_j`.
+"""
 import typing as t
 
 import numpy as np
@@ -27,31 +36,45 @@ class SphericalRays(t.NamedTuple):
 
 
 def spherical_rays(interface_radii: u.Quantity, n_core: int = 12, tangent_stride: int = 1) -> SphericalRays:
-    """
+    r"""
     Build the rays for :func:`update_inward_layer_spherical`/:func:`update_outward_layer_spherical`.
 
-    Each ray is a straight line at impact parameter ``p`` from the planet's centre. At a layer centre of radius
-    ``r >= p`` it makes an angle with the local vertical of cosine ``mu = sqrt(1 - p^2 / r^2)``, so one ray serves every
-    layer it crosses, at a different angle in each: this is what makes the geometry spherical rather than
-    plane-parallel, where every layer sees the same directions. The rays are
+    Each ray is a straight line at impact parameter :math:`p` from the planet's centre. At radius :math:`r \ge p` its
+    direction cosine to the local vertical and its path coordinate from the point of closest approach are
 
-    * the central ray ``p = 0`` and ``n_core`` "core" rays, whose directions at the bottom layer centre are the
-      :func:`mu_quadrature` nodes. They reach the bottom of the atmosphere, where the planet below sets their
-      outward intensity.
-    * one ray tangent to every ``tangent_stride``-th layer centre counting down from the top, ``p = r_t``. It enters
-      from the top, reaches layer ``t`` travelling horizontally (``mu = 0``) and leaves outwards along the same line.
-      These carry the directions near the local horizon, including, high up, those that pass through the limb instead
-      of hitting the planet.
+    .. math::
 
-    The optical depth between two neighbouring layer centres along a ray is the ray's path through the upper half of
-    the lower layer and the lower half of the upper layer, each weighted by that layer's opacity per unit length
-    (``dtau / dz``, constant within a layer as in the radial optical depth and :func:`tiramisu.eclipse.slant_tau`).
-    Written as ``seg_a[l] * dtau[l - 1] + seg_b[l] * dtau[l]``; in the plane-parallel limit
-    ``seg_a = seg_b = 1 / (2 mu)``.
+        \mu(r; p) = \sqrt{1 - \frac{p^2}{r^2}}, \qquad z(r; p) = \sqrt{r^2 - p^2},
 
-    Mean intensities use trapezoidal weights in ``mu`` over the rays reaching each layer, from the central ray
-    (``mu = 1``) down to the most horizontal one; where that is not the layer's own tangent ray (``tangent_stride >
-    1``), its weight also covers the remaining interval down to ``mu = 0``.
+    so one ray serves every layer it crosses, at a different angle in each: this is what makes the geometry spherical
+    rather than plane-parallel, where every layer sees the same directions. The rays are
+
+    * the central ray :math:`p = 0` and ``n_core`` core rays :math:`p_j = r_0 \sqrt{1 - \mu_j^2}`, :math:`\mu_j` the
+      :func:`~tiramisu.rt.source.mu_quadrature` nodes, so that these are their directions at the bottom layer centre.
+      They reach the bottom of the atmosphere, where the planet below sets their outward intensity.
+    * one ray tangent to every ``tangent_stride``-th layer centre counting down from the top, :math:`p = r_t`. It
+      enters from the top, reaches layer :math:`t` travelling horizontally (:math:`\mu = 0`) and leaves outwards along
+      the same line. These carry the directions near the local horizon, including, high up, those that pass through
+      the limb instead of hitting the planet.
+
+    The optical path between the centres of layers :math:`l - 1` and :math:`l` along a ray is its path through the upper
+    half of layer :math:`l - 1` and the lower half of layer :math:`l`, each at that layer's extinction per unit length
+    (:math:`\Delta\tau/\Delta z`, constant within a layer as in the radial optical depth and
+    :func:`tiramisu.eclipse.slant_tau`):
+
+    .. math::
+
+        \Delta\tau_l(p) = a_l(p) \, \Delta\tau_{l-1} + b_l(p) \, \Delta\tau_l, \qquad
+        a_l = \frac{Z_l - z_{l-1}}{\Delta z_{l-1}}, \quad b_l = \frac{z_l - Z_l}{\Delta z_l},
+
+    with :math:`z_l = z(r_l; p)`, :math:`Z_l = z(R_l; p)` at the interface below centre :math:`l`, and :math:`\Delta z`
+    the layer thicknesses. :math:`Z - z = (R - r)(R + r)/(Z + z)` avoids cancellation near tangency. In the
+    plane-parallel limit :math:`a_l = b_l = 1/(2\mu)`.
+
+    Mean intensities use trapezoidal weights :math:`w_{l,j}` in :math:`\mu` over the rays reaching each layer, from the
+    central ray (:math:`\mu = 1`) down to the most horizontal one, summing to 1 at every layer; where the most
+    horizontal is not the layer's own tangent ray (``tangent_stride > 1``), its weight also covers the remaining
+    interval down to :math:`\mu = 0`.
 
     Parameters
     ----------
@@ -147,11 +170,27 @@ def update_inward_layer_spherical(
         source_function_matrix: npt.NDArray[np.float64],
         with_lambda: bool = True,
 ) -> None:
-    """
-    :func:`update_inward_layer` along spherical rays (:func:`spherical_rays`): the same Bezier short-characteristics
-    step from centre ``layer_idx + 1`` to ``layer_idx``, with the ray's own optical depth and control points in place
-    of the plane-parallel ``delta_tau / mu``. ``i_in_matrix`` has shape (n_layers, n_rays, n_grid) and
-    ``lambda_in_layer`` (n_rays, n_grid); rays that do not reach ``layer_idx`` are left untouched (zero).
+    r"""
+    One layer of a Gauss-Seidel inward pass along spherical rays (:func:`spherical_rays`): for every ray :math:`j` that
+    reaches layer :math:`l` = ``layer_idx``,
+
+    .. math::
+
+        I^+_{l,j} = I^+_{l+1,j} \, e^{-\delta_j} + \alpha(\delta_j) \, S_l + \beta(\delta_j) \, S_{l+1}
+        + \gamma(\delta_j) \, C^+_{l,j}, \qquad \delta_j = \Delta\tau_{l+1}(p_j),
+
+    the step of :func:`tiramisu.rt.plane_parallel.update_inward_layer` with the ray's own optical path and control
+    point (:func:`~tiramisu.rt.bezier.ray_control_point_inward`, computed here since it depends on the ray), and its
+    exact :math:`\Lambda^*` contribution,
+
+    .. math::
+
+        \frac{\partial I^+_{l,j}}{\partial S_l} = \alpha(\delta_j) + \gamma(\delta_j)
+        \frac{\partial C^+_{l,j}}{\partial S_l} + e^{-\delta_j} \, \gamma\big(\Delta\tau_{l+2}(p_j)\big)
+        \frac{\partial C^+_{l+1,j}}{\partial S_l}.
+
+    ``i_in_matrix`` has shape (n_layers, n_rays, n_grid) and ``lambda_in_layer`` (n_rays, n_grid); rays that do not
+    reach layer :math:`l` are left untouched (zero).
     """
     n_rays, n_grid = i_in_matrix.shape[1], i_in_matrix.shape[2]
     for k in numba.prange(n_grid):
@@ -183,21 +222,44 @@ def update_outward_layer_spherical(
         source_function_matrix: npt.NDArray[np.float64],
         with_lambda: bool = True,
 ) -> None:
-    """
-    :func:`update_outward_layer` along spherical rays: the Bezier step from centre ``layer_idx - 1`` (``i_out_below``)
-    to ``layer_idx`` (``i_out_layer``, ``lambda_out_layer``; all (n_rays, n_grid)). A ray tangent to ``layer_idx``
-    turns there: its outward intensity is the inward step arriving at the tangent point, recomputed from the current
-    source function and ``i_in_matrix``. Rays hitting the BOA (``tangent_layer < 0``) are skipped at ``layer_idx == 0``,
-    where the caller sets their boundary intensity.
+    r"""
+    One layer of a Gauss-Seidel outward pass along spherical rays: for every ray :math:`j` reaching layer :math:`l` =
+    ``layer_idx``, the Bézier step from :math:`l - 1` (``i_out_below``) to :math:`l` (``i_out_layer``; both and
+    ``lambda_out_layer`` of shape (n_rays, n_grid)),
 
-    ``lambda_out_layer`` is the exact dI_out / dS[layer_idx] per ray (notes/lambda_star.tex, Sec. 5). A tangent ray
-    crosses the layer on its way in as well, so S[layer_idx] also reaches the outward crossing through the inward steps
-    near the inward crossing, attenuated by the optical path down to the turning point and back. This needs
-    ``lambda_in_layer``, this layer's inward Lambda* from :func:`update_inward_layer_spherical` with the same source
-    function (zero at the top layer), and ``sigma_below``, each ray's optical path from its turning point up to
-    ``layer_idx - 1``; the path up to ``layer_idx`` is written to ``sigma_layer``, which the caller swaps with
-    ``sigma_below`` along with ``i_out_below``/``i_out_layer``, and must be kept up to date in every call; without
-    ``with_lambda`` (Lambda* not used), ``lambda_in_layer`` may hold anything and ``lambda_out_layer`` is left alone.
+    .. math::
+
+        I^-_{l,j} = I^-_{l-1,j} \, e^{-\delta_j} + \alpha(\delta_j) \, S_l + \beta(\delta_j) \, S_{l-1}
+        + \gamma(\delta_j) \, C^-_{l,j}, \qquad \delta_j = \Delta\tau_l(p_j).
+
+    A ray tangent to layer :math:`t = l` turns there and leaves along the same line, :math:`I^-_{t,j} = I^+_{t,j}`,
+    the inward step arriving at the turning point recomputed from the current source function and ``i_in_matrix``.
+    Core rays (``tangent_layer < 0``) are skipped at :math:`l = 0`, where the caller sets their boundary intensity.
+
+    ``lambda_out_layer`` is the exact :math:`\partial I^-_{l,j}/\partial S_l` (notes/lambda_star.tex, Secs. 5.4-5.6).
+    On a core ray it is the mirror image of :func:`update_inward_layer_spherical`. A ray tangent to a layer
+    :math:`t < l` also crosses layer :math:`l` on its way in, so :math:`S_l` reaches the outward crossing through the
+    inward segments around the inward crossing too, attenuated down to the turning point and back:
+
+    .. math::
+
+        \frac{\partial I^-_{l,j}}{\partial S_l} = \alpha(\delta_j) + \gamma(\delta_j)
+        \frac{\partial C^-_{l,j}}{\partial S_l} + e^{-\delta_j} \, \gamma\big(\Delta\tau_{l-1}(p_j)\big)
+        \frac{\partial C^-_{l-1,j}}{\partial S_l}
+        + e^{-\sigma_j(l-1) - \sigma_j(l)} \left( e^{-\delta_j} \frac{\partial I^+_{l,j}}{\partial S_l}
+        + \frac{\partial q^+_{l-1,j}}{\partial S_l} \right)
+        + e^{-\sigma_j(l-2) - \sigma_j(l)} \frac{\partial q^+_{l-2,j}}{\partial S_l},
+
+    with :math:`\sigma_j(m)` the ray's optical path from its turning point up to layer :math:`m`, :math:`q^+_{m,j} =
+    \alpha S_m + \beta S_{m+1} + \gamma C^+_{m,j}` what the inward segment arriving at :math:`m` adds to the beam, and
+    the terms in :math:`l - 1` and :math:`l - 2` present only where those layers are on the ray's outward leg.
+
+    This needs ``lambda_in_layer``, this layer's :math:`\partial I^+_{l,j}/\partial S_l` from
+    :func:`update_inward_layer_spherical` with the same source function (zero at the top layer), and ``sigma_below``,
+    :math:`\sigma_j(l-1)`; :math:`\sigma_j(l)` is written to ``sigma_layer``, which the caller swaps with
+    ``sigma_below`` along with ``i_out_below``/``i_out_layer`` and must keep up to date in every call. Without
+    ``with_lambda`` (:math:`\Lambda^*` not used), ``lambda_in_layer`` may hold anything and ``lambda_out_layer`` is left
+    alone.
     """
     n_layers = source_function_matrix.shape[0]
     n_rays, n_grid = i_out_layer.shape
@@ -272,10 +334,17 @@ def four_pi_j_spherical(
         incident_radiation_field: t.Optional[u.Quantity] = None,
         bottom_intensity: t.Optional[u.Quantity] = None,
 ) -> t.Tuple[u.Quantity, u.Quantity]:
-    """
-    Outward and inward hemispheres' contributions to 4*pi*J at each layer centre, for a fixed source function, along
-    spherical rays (one inward then one outward Bezier sweep, as in the NLTE Gauss-Seidel iteration without population
-    updates). The spherical counterpart of :func:`four_pi_j_hemispheres`, whose values are at interfaces instead.
+    r"""
+    Outward and inward hemispheres' contributions to :math:`4\pi J` at each layer centre for a fixed source function:
+    one inward then one outward Bézier sweep along the spherical rays (as in the NLTE Gauss-Seidel iteration, without
+    population updates), then
+
+    .. math::
+
+        (4\pi J)^\pm_l = 2\pi \sum_j w_{l,j} \, I^\pm_{l,j},
+
+    with the rays' trapezoidal weights :math:`w_{l,j}` (:func:`spherical_rays`). The spherical counterpart of
+    :func:`tiramisu.rt.plane_parallel.four_pi_j_hemispheres`, whose values are at interfaces instead.
 
     Parameters
     ----------
@@ -325,19 +394,31 @@ def emergent_flux_spherical(
         planet_radius: u.Quantity,
         n_core: int = 50,
 ) -> u.Quantity:
-    """
-    Emergent flux of a spherically symmetric atmosphere, normalised to ``planet_radius`` (R_p) so that it replaces
-    :func:`emergent_flux`: the flux received at distance d is (R_p / d)^2 times the returned value.
+    r"""
+    Emergent flux of a spherically symmetric atmosphere, normalised to ``planet_radius`` :math:`R_p` so that it
+    replaces :func:`tiramisu.rt.plane_parallel.emergent_flux`: the flux received at distance :math:`d` is
+    :math:`(R_p/d)^2` times the returned value. The disk seen by the observer is integrated over impact parameter
+    :math:`p`,
 
-    The disk seen by the observer is integrated over impact parameter p, F = (1 / R_p^2) int_0^R_top I(p) 2 pi p dp,
-    with ``I(p)`` the intensity leaving along the line of sight at ``p``. With R_0 the bottom radius
-    (``interface_radii[0]``), rays with ``p < R_0`` (Gauss-Legendre in ``p^2``) start at the planet (``I = S_0``, as in
-    :func:`emergent_flux`); rays with ``p > R_0``, one per shell at its ``p^2`` midpoint (the impact parameters of
-    :func:`tiramisu.eclipse.compute_transmission`), cross the far side of the limb from empty space and then the near
-    side, so the extended atmosphere's limb emission is included. Along each
-    ray, every shell is crossed with its opacity per unit length (``dtau / dz``) and constant source function, the
-    constant-S scheme of :func:`emergent_flux`. With ``R_p = R_0`` and ``R_0 -> infinity`` this reduces to
-    :func:`emergent_flux`.
+    .. math::
+
+        F = \frac{1}{R_p^2} \int_0^{R_N} I(p) \, 2\pi p \, \mathrm{d}p
+          = \frac{\pi}{R_p^2} \int_0^{R_N^2} I(p) \, \mathrm{d}(p^2),
+
+    with :math:`I(p)` the intensity leaving along the line of sight at :math:`p` and :math:`R_N` the top radius. With
+    :math:`R_0` the bottom radius (``interface_radii[0]``), rays with :math:`p < R_0` (Gauss-Legendre nodes in
+    :math:`p^2`) start at the planet with :math:`I = S_0`; rays with :math:`p > R_0`, one per shell at its :math:`p^2`
+    midpoint (the impact parameters of :func:`tiramisu.eclipse.compute_transmission`), cross the far side of the limb
+    from empty space and then the near side, so the extended atmosphere's limb emission is included. Along each ray
+    every shell is crossed with the constant-:math:`S` step
+
+    .. math::
+
+        I \leftarrow I \, e^{-\Delta\tau_l \ell_l(p)/\Delta z_l} + S_l \left( 1 - e^{-\Delta\tau_l \ell_l(p)/\Delta z_l}
+        \right), \qquad \ell_l(p) = \sqrt{R_{l+1}^2 - p^2} - \sqrt{\max(R_l^2, p^2) - p^2},
+
+    :math:`\ell_l(p)` being the ray's path through shell :math:`l` on one side. With :math:`R_p = R_0` and
+    :math:`R_0 \to \infty` this reduces to :func:`tiramisu.rt.plane_parallel.emergent_flux`.
 
     Returns
     -------

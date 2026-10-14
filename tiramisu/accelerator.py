@@ -430,9 +430,10 @@ class LayerAccelerator:
         satisfy their own rate equations, whatever damping or extrapolation produced them.
 
         Convergence is obtained if:
-            - The most recent maximum population change is less than the convergence threshold.
-            - The 4 most recent maximum population changes show minimal fluctuations about their mean, with the mean
-             being less than twice the convergence threshold.
+
+        - The most recent maximum population change is less than the convergence threshold.
+        - The 4 most recent maximum population changes show minimal fluctuations about their mean, with the mean
+          being less than twice the convergence threshold.
 
         The latter criterion is allowed for cases where populations oscillate between two solutions. This likely occurs
         due to the coupling between species oscillating population s back and forth in a manner than cannot be damped

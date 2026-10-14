@@ -1,6 +1,6 @@
 """
 GPU (numba.cuda) implementation of the band-profile construction in
-:meth:`~nlte.NLTEProcessor.compute_rates_profiles`: super-line accumulation and broadening, and direct (per-line)
+:meth:`~tiramisu.nlte.NLTEProcessor.compute_rates_profiles`: super-line accumulation and broadening, and direct (per-line)
 sampled Voigt profiles.
 
 :class:`DeviceProfileBuffer` keeps the band profile buffer and the per-state lookup tables on the device for the whole
@@ -14,6 +14,7 @@ compute_rates_profiles or the band-less buffer of profiles.abs_emi_xsec. :func:`
 paths use to choose the GPU (see config._GPU_LINE_LAYER_SAVING_S).
 
 Kernel design:
+
 - Super-line accumulation is a histogram: many transitions land in the same (band, layer, bin) cell. Adding each line
   with an atomic is slower than the CPU (the atomics serialise), so the batch is first counting-sorted by cell key and
   cut into segments of at most _SEGMENT_MAX_LINES lines of one key; a thread per (segment, layer) sums its segment's

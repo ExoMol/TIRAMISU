@@ -15,6 +15,18 @@ dependencies = [
     "polars>=1.37.1",
     "phoenix4all>=0.0.4",
     "dask>=2026.1.1",
+    "pyarrow>=19",
+]
+
+[project.optional-dependencies]
+# Documentation build (also what ReadTheDocs installs). It needs no TBB: source/conf.py selects numba's workqueue
+# threading layer, since building the docs runs no parallel kernels.
+docs = [
+    "sphinx>=8",
+    "furo",
+    "myst-parser",
+    "sphinx-copybutton",
+    "sphinx-autodoc-typehints",
 ]
 
 [dependency-groups]
@@ -23,5 +35,5 @@ dev = [
     "ipython>8.26.0"
 ]
 
-[tool.setuptools]
-packages = ["tiramisu"]
+[tool.setuptools.packages.find]
+include = ["tiramisu*"]

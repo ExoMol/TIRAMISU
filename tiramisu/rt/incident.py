@@ -14,9 +14,15 @@ from ..profiles.lineshape import rebin_spectrum
 def incident_srf(
         star_temperature: float, star_logg: float, star_feh: float, wn_grid: u.Quantity, star_alpha: float = 0.0
 ) -> u.Quantity:
-    """
-    Returns the disk-averaged specific intensity of the stellar surface (no limb darkening), I = F_s / pi, binned onto
-    wn_grid.
+    r"""
+    The disk-averaged specific intensity of the stellar surface (no limb darkening), binned onto ``wn_grid``:
+
+    .. math::
+
+        I_\star = \frac{F_s}{\pi},
+
+    with :math:`F_s` the surface flux of the PHOENIX (BT-Settl, AGSS) model for the given effective temperature, surface
+    gravity, metallicity and alpha enhancement.
 
     Specific intensity is conserved along a ray in vacuum, so this is also the intensity arriving at the planet from
     within the stellar disk: it is a property of the star alone, independent of the orbital distance. The distance
@@ -138,42 +144,57 @@ def incident_intensity(
         orbital_radius: u.Quantity,
         location: t.Union[str, float] = "dayside",
 ) -> IncidentIntensity:
-    """
+    r"""
     The star's irradiation of the top of the atmosphere, as the ``incident_radiation_field`` of
     :class:`tiramisu.xsec.XSecCollection` and :meth:`tiramisu.eclipse.ExoplanetEmission.compute_emission`. The solvers
     evaluate it on their own directions (plane-parallel ``mu`` nodes or spherical rays), so the same object serves
     either geometry; calling it, ``field(mu_values=..., mu_weights=...)``, gives the downward specific intensity on each
     direction of that grid.
 
-    **What it represents.** The solvers are 1D and azimuthally symmetric: each ``mu`` node stands for the whole ring
-    of directions at that zenith cosine, seen from one point at the top of the column. The star is a disk of uniform
-    specific intensity ``star_intensity`` (:func:`incident_srf`) and angular radius theta = arcsin(R_star / a), so
-    the boundary value on a node is ``star_intensity`` times the fraction of that ring the disk covers
-    (:func:`_stellar_ring_coverage`); the part of the disk below the horizon is hidden by the planet.
+    **What it represents.** The solvers are 1D and azimuthally symmetric: each node :math:`\mu_i` stands for the whole
+    ring of directions at that zenith cosine, seen from one point at the top of the column. The star is a disk of
+    uniform specific intensity :math:`I_\star` (``star_intensity``, :func:`incident_srf`) and angular radius
+    :math:`\theta = \arcsin(R_\star / a)`, with :math:`a` the orbital distance. With the disk centre at stellar zenith
+    cosine :math:`\mu_0 = \cos\psi_0`, a direction at zenith angle :math:`\psi` and azimuth :math:`\phi` (from the
+    star's) is inside the disk when :math:`\cos\psi \cos\psi_0 + \sin\psi \sin\psi_0 \cos\phi \ge \cos\theta`, so the
+    covered fraction of the ring and the boundary value on the node are
+
+    .. math::
+
+        c(\mu; \mu_0) = \frac{1}{\pi} \arccos\left[ \operatorname{clip}\left( \frac{\cos\theta - \mu \mu_0}
+        {\sqrt{(1 - \mu^2)(1 - \mu_0^2)}}, -1, 1 \right) \right], \qquad I^+_{\mathrm{inc},i} = c(\mu_i; \mu_0) \,
+        I_\star .
+
+    The part of the disk below the horizon is hidden by the planet.
 
     **Why the distance enters here.** Specific intensity does not fall off with distance; the stellar radiation
-    reaching the planet does, because the disk covers less of the sky. That dilution is exactly the covered fraction
-    of the rings, so there is no separate (R_star / a)^2 factor: the mean intensity it produces at the top,
-    J = 1/2 sum_i w_i I_i, equals star_intensity * Omega_visible / (4 pi), which falls as (R_star / a)^2 through
-    theta.
+    reaching the planet does, because the disk covers less of the sky. That dilution is exactly the covered fraction of
+    the rings, so there is no separate :math:`(R_\star / a)^2` factor: the mean intensity it produces at the top is
+
+    .. math::
+
+        J = \frac12 \sum_i w_i \, I^+_{\mathrm{inc},i} = I_\star \, \frac{\Omega_{\mathrm{visible}}}{4\pi},
+
+    which falls as :math:`(R_\star / a)^2` through :math:`\theta`.
 
     **Locations.** The column stands for one of:
 
-    * ``"dayside"``: the area-average over the dayside. Area on a sphere is uniform in the stellar zenith cosine mu0,
-      so this is the ring coverage averaged over mu0 in (0, 1). For a small disk it is isotropic, with
-      I = (1 - cos theta) * star_intensity on every direction (J = Omega star_intensity / (4 pi), downward flux F_a / 2
-      with F_a = pi sin^2(theta) star_intensity the flux at the planet), the usual dayside redistribution f = 1/2.
-    * ``"planet_average"``: the same over the whole sphere, mu0 in (-1, 1); half the dayside value (f = 1/4). Every
-      disk direction is above the horizon on exactly one of any two antipodal points, so J is exactly
-      Omega star_intensity / (8 pi).
-    * a float mu0 in [-1, 1]: a single location with the disk centre at stellar zenith cosine mu0 (1 substellar, 0
-      terminator, < -sin(theta) no star). The attenuation below the top is plane-parallel, e^(-tau / mu), which
-      overestimates the path of grazing starlight: in a spherical atmosphere it is capped near
-      sqrt(pi R_p / (2 H)), so results for small mu0 (roughly below sqrt(2 H / R_p)) should not be trusted.
+    * ``"dayside"``: the area-average over the dayside. Area on a sphere is uniform in :math:`\mu_0`, so this is the
+      ring coverage averaged over :math:`\mu_0 \in (0, 1)`. For a small disk it is isotropic,
+      :math:`I^+_{\mathrm{inc}} = (1 - \cos\theta) \, I_\star` on every direction (:math:`J = \Omega I_\star / 4\pi`,
+      downward flux :math:`F_a / 2` with :math:`F_a = \pi \sin^2\theta \, I_\star` the flux at the planet), the usual
+      dayside redistribution :math:`f = 1/2`.
+    * ``"planet_average"``: the same over the whole sphere, :math:`\mu_0 \in (-1, 1)`; half the dayside value
+      (:math:`f = 1/4`). Every disk direction is above the horizon on exactly one of any two antipodal points, so
+      :math:`J = \Omega I_\star / 8\pi` exactly.
+    * a float :math:`\mu_0 \in [-1, 1]`: a single location (1 substellar, 0 terminator, below :math:`-\sin\theta` no
+      star). The attenuation below the top is plane-parallel, :math:`e^{-\tau/\mu}`, which overestimates the path of
+      grazing starlight: in a spherical atmosphere it is capped near :math:`\sqrt{\pi R_p / 2H}` (:math:`H` the scale
+      height), so results for small :math:`\mu_0` (roughly below :math:`\sqrt{2H / R_p}`) should not be trusted.
 
-    **Quadrature.** A narrow disk can fall between ``mu`` nodes, so the node values are rescaled so that
-    sum_i w_i I_i reproduces the exact J (the ring coverage integrated finely over mu). If no node lies inside the
-    disk (a distant star seen at one location), the whole J is put on the node closest to the disk centre.
+    **Quadrature.** A narrow disk can fall between nodes, so the node values are rescaled to give the exact :math:`J`,
+    that of the ring coverage integrated finely over :math:`\mu`. If no node lies inside the disk (a distant star seen
+    at one location), the whole of :math:`J` is put on the node closest to the disk centre.
 
     Parameters
     ----------

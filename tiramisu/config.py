@@ -91,7 +91,9 @@ output_dir = (pathlib.Path(os.getcwd()) / "./outputs").resolve()
 # (tests/perf/prefetch_nogil_bench.py, tests/outputs/layer_compare/). Set before set_num_threads, which starts the
 # threads.
 numba.config.THREADING_LAYER = os.environ.get("NUMBA_THREADING_LAYER", "tbb")
-numba.set_num_threads(_DEFAULT_NUM_THREADS)
+# At most the machine's thread count, so the package also imports on smaller machines (e.g. documentation builders).
+# Kernels still split their work over _DEFAULT_NUM_THREADS workers, so the results do not depend on it.
+numba.set_num_threads(min(_DEFAULT_NUM_THREADS, numba.config.NUMBA_NUM_THREADS))
 
 
 def setup_logging_main(logfile: str = "nlte.log", verbose: int = 0):

@@ -1,6 +1,22 @@
-"""Bezier short-characteristics terms and the control points along one ray, with their derivatives with
-respect to the source function for the exact Lambda* (notes/lambda_star.tex). A plane-parallel column is
-the vertical ray of this machinery; spherical rays cross the shells."""
+r"""
+Bézier short characteristics along one ray: the step terms, the optical path between layer centres and the control
+points, with the control points' derivatives with respect to the source function for the exact :math:`\Lambda^*`
+(notes/spherical_2d_radiative_transfer.tex, Sec. 2; notes/lambda_star.tex, Sec. 5; :doc:`/theory/radiative_transfer`).
+
+Layers :math:`l = 0, \dots, N-1` are counted from the bottom and :math:`S_l` is the source function at the centre of
+layer :math:`l`. A segment of a ray from a departure point :math:`d` to an arrival point :math:`a`, an optical path
+:math:`\delta` apart, advances the intensity by
+
+.. math::
+
+    I_a = I_d \, e^{-\delta} + \alpha(\delta) \, S_a + \beta(\delta) \, S_d + \gamma(\delta) \, C,
+
+with :math:`C` the segment's control point. A ray is given by its segment weights ``seg_a`` and ``seg_b``
+(:func:`ray_dtau`): spherical rays come from :func:`tiramisu.rt.spherical.spherical_rays`, and a plane-parallel column
+is the vertical ray :math:`a_l = 0`, :math:`b_l = 1` with the vertical steps :math:`\tau_{l-1} - \tau_l` in place of
+``dtau``. A ``tangent`` layer :math:`t \ge 0` marks a ray that turns there; core and plane-parallel rays have :math:`t =
+-1`.
+"""
 import typing as t
 
 import numpy as np
@@ -10,9 +26,20 @@ from numpy import typing as npt
 
 @numba.njit(cache=True, error_model="numpy", inline="always")
 def bezier_terms(dt: float) -> t.Tuple[float, float, float, float]:
-    """
-    Bezier short-characteristics terms for one layer boundary along one ray: exp(-dt), alpha, beta, gamma, where
-    dt = delta_tau / mu. Taylor expansion (Horner form) below dt = 0.14, exact formulas above.
+    r"""
+    The Bézier terms :math:`e^{-\delta}`, :math:`\alpha(\delta)`, :math:`\beta(\delta)` and :math:`\gamma(\delta)` of
+    one segment of optical path :math:`\delta` (``dt``; :math:`\Delta\tau/\mu` in plane-parallel geometry), de la Cruz
+    Rodríguez & Piskunov (2013, doi:10.1088/0004-637X/764/1/33):
+
+    .. math::
+
+        \alpha(\delta) = \frac{2 + \delta^2 - 2\delta - 2e^{-\delta}}{\delta^2}, \qquad
+        \beta(\delta) = \frac{2 - (2 + 2\delta + \delta^2) \, e^{-\delta}}{\delta^2}, \qquad
+        \gamma(\delta) = \frac{2\delta - 4 + (2\delta + 4) \, e^{-\delta}}{\delta^2}.
+
+    They multiply the arrival point's :math:`S_a`, the departure point's :math:`S_d` and the control point. Below
+    :math:`\delta = 0.14` the closed forms lose precision to cancellation and their Taylor series (Horner form) are used
+    instead; at :math:`\delta = 0` all three are zero.
     """
     if dt == 0.0:
         # alpha, beta, gamma tend to 0 as dt -> 0.
@@ -37,7 +64,18 @@ def ray_dtau(
         dtau: npt.NDArray[np.float64], seg_a: npt.NDArray[np.float64], seg_b: npt.NDArray[np.float64],
         point: int, ray: int, k: int,
 ) -> float:
-    """Optical depth along ``ray`` between the layer centres ``point - 1`` and ``point``."""
+    r"""
+    Optical path along ``ray`` (impact parameter :math:`p`) between the centres of layers :math:`l - 1` and :math:`l`
+    (:math:`l` = ``point``), from the layers' optical thicknesses :math:`\Delta\tau` (``dtau[:, k]``):
+
+    .. math::
+
+        \Delta\tau_l(p) = a_l(p) \, \Delta\tau_{l-1} + b_l(p) \, \Delta\tau_l,
+
+    with :math:`a_l` = ``seg_a[l, ray]`` and :math:`b_l` = ``seg_b[l, ray]`` the ray's paths through the upper half of
+    layer :math:`l - 1` and the lower half of layer :math:`l` over those layers' thicknesses
+    (:func:`tiramisu.rt.spherical.spherical_rays`).
+    """
     return seg_a[point, ray] * dtau[point - 1, k] + seg_b[point, ray] * dtau[point, k]
 
 
@@ -48,9 +86,11 @@ def _ray_source_derivative(
         point: int, ray: int, k: int, inward: bool, seed: int,
 ) -> t.Tuple[float, float, float]:
     """
-    Source-function derivative at ``point`` along ``ray``, as in :func:`_compute_control_points_outward` (``inward``
-    False) and :func:`_compute_control_points_inward` (True), with the ray's own optical depths. Zero at the ray's ends
-    and at its tangent point, where the ray is symmetric about its closest approach.
+    Source-function derivative at ``point`` along ``ray``, as in ``plane_parallel._compute_control_points_outward``
+    (``inward`` False) and ``_compute_control_points_inward`` (True), with the ray's own optical depths: the monotone
+    harmonic mean of :func:`ray_control_point_inward`, always as dS/dtau with tau increasing inwards (``inward`` only
+    chooses which neighbour is upwind in zeta), so outward control points enter it with the opposite sign. Zero at the
+    ray's ends and at its tangent point, where the ray is symmetric about its closest approach.
 
     Also returns its derivatives with respect to ``source_function_matrix[seed, k]`` for S[seed] increasing and
     decreasing (forward-mode, through the same branches), for the exact Lambda*. They differ only at a kink of the
@@ -137,10 +177,60 @@ def ray_control_point_inward(
         seg_a: npt.NDArray[np.float64], seg_b: npt.NDArray[np.float64], tangent: int,
         layer_idx: int, ray: int, k: int, seed: int = -1,
 ) -> t.Tuple[float, float]:
-    """
-    Inward control point of the segment from centre ``layer_idx + 1`` to ``layer_idx`` (see
-    :func:`_compute_control_points_inward`), and its derivative with respect to ``source_function_matrix[seed, k]``:
-    the mean of the one-sided ones, which differ only at a kink (a tie of S, a clip or the clamp).
+    r"""
+    Control point :math:`C^+_l` of the inward segment from layer centre :math:`l + 1` (departure :math:`d`) to :math:`l`
+    (arrival :math:`a`, :math:`l` = ``layer_idx``) along ``ray``, at wavenumber index ``k``, and its derivative
+    :math:`\partial C^+_l / \partial S_x` with respect to the source function of layer :math:`x` = ``seed`` (0 for
+    ``seed = -1``, the value alone).
+
+    With :math:`\delta = \Delta\tau_{l+1}(p)` the segment's optical path (:func:`ray_dtau`),
+
+    .. math::
+
+        C = \tfrac12 \left( C_a + C_d \right), \qquad C_a = S_a - \frac{\delta}{2} S'_a, \qquad
+        C_d = S_d + \frac{\delta}{2} S'_d,
+
+    each of :math:`C_a` and :math:`C_d` clipped to :math:`[\min(S_a, S_d), \max(S_a, S_d)]`. :math:`S' =
+    \mathrm{d}S/\mathrm{d}t` is taken along the direction of propagation; at a point :math:`c` with upwind neighbour
+    :math:`u` and downwind neighbour :math:`d` (here a point of the ray, not the segment's departure point), separated
+    from them by the ray's optical paths :math:`\delta_u` and :math:`\delta_d`, it is the monotone harmonic mean
+
+    .. math::
+
+        S'_c = \begin{cases}
+            \dfrac{s_u \, s_d}{\zeta s_u + (1 - \zeta) s_d} & s_u s_d > 0, \\[6pt]
+            0 & \text{otherwise,}
+        \end{cases}
+        \qquad s_u = \frac{S_c - S_u}{\delta_u}, \quad s_d = \frac{S_d - S_c}{\delta_d}, \quad
+        \zeta = \frac13 \left( 1 + \frac{\delta_u}{\delta_u + \delta_d} \right),
+
+    and :math:`S' = 0` at the ray's end points and at its tangent point. The first segment below the top
+    (:math:`l = N - 2`) uses :math:`C = C_d`, and :math:`C < 0` is set to zero where the next segment down has positive
+    optical path.
+
+    The derivative is taken in forward mode through the same branches:
+
+    .. math::
+
+        \frac{\partial C_a}{\partial S_x} = [a = x] - \frac{\delta}{2} \frac{\partial S'_a}{\partial S_x}, \qquad
+        \frac{\partial C_d}{\partial S_x} = [d = x] + \frac{\delta}{2} \frac{\partial S'_d}{\partial S_x}
+
+    where unclipped (a clipped value has the derivative of the end point it equals, 1 or 0), with
+
+    .. math::
+
+        \frac{\partial S'_c}{\partial S_u} = -\frac{(1 - \zeta) s_d^2}{Z^2 \delta_u}, \qquad
+        \frac{\partial S'_c}{\partial S_c} = \frac{(1 - \zeta) s_d^2}{Z^2 \delta_u} - \frac{\zeta s_u^2}{Z^2 \delta_d},
+        \qquad \frac{\partial S'_c}{\partial S_d} = \frac{\zeta s_u^2}{Z^2 \delta_d}, \qquad
+        Z = \zeta s_u + (1 - \zeta) s_d,
+
+    where :math:`s_u s_d > 0` and zero otherwise. At a kink (a tie of :math:`S`, a clip or the non-negativity clamp)
+    the one-sided derivatives differ; their mean is returned, as a central difference would give.
+
+    Returns
+    -------
+    control, d_control : float
+        :math:`C^+_l` and :math:`\partial C^+_l / \partial S_x`.
     """
     n_layers = source_function_matrix.shape[0]
     dtau_seg = ray_dtau(dtau, seg_a, seg_b, layer_idx + 1, ray, k)
@@ -178,8 +268,8 @@ def _inward_clamp_dtau(
         dtau: npt.NDArray[np.float64], seg_a: npt.NDArray[np.float64], seg_b: npt.NDArray[np.float64], tangent: int,
         layer_idx: int, ray: int, k: int, dtau_seg: float,
 ) -> float:
-    """The step the inward non-negativity clamp tests, as in the plane-parallel kernel: the ray's next segment
-    (mirrored at a tangent point)."""
+    """The optical path the inward non-negativity clamp tests, as in the plane-parallel kernel: the ray's next segment
+    down (mirrored at a tangent point; none below the bottom layer)."""
     if layer_idx == tangent:
         return dtau_seg
     if layer_idx > 0:
@@ -193,8 +283,21 @@ def ray_control_point_outward(
         seg_a: npt.NDArray[np.float64], seg_b: npt.NDArray[np.float64], tangent: int,
         layer_idx: int, ray: int, k: int, seed: int = -1,
 ) -> t.Tuple[float, float]:
-    """Outward control point of the segment from centre ``layer_idx - 1`` to ``layer_idx`` (see
-    :func:`_compute_control_points_outward`), and its derivative; see :func:`ray_control_point_inward`."""
+    r"""
+    Control point :math:`C^-_l` of the outward segment from layer centre :math:`l - 1` (departure :math:`d`) to
+    :math:`l` (arrival :math:`a`, :math:`l` = ``layer_idx``) along ``ray``, and its derivative
+    :math:`\partial C^-_l / \partial S_x` with respect to the source function of layer :math:`x` = ``seed``.
+
+    The formulas are those of :func:`ray_control_point_inward` with :math:`\delta = \Delta\tau_l(p)` and :math:`S'`
+    along the outward direction. The first segment above the bottom of a core ray (:math:`l = 1`, ``tangent < 0``)
+    uses :math:`C = C_d`; a tangent ray's first outward segment starts at its turning point, where :math:`S' = 0`. The
+    non-negativity clamp tests this segment's own optical path.
+
+    Returns
+    -------
+    control, d_control : float
+        :math:`C^-_l` and :math:`\partial C^-_l / \partial S_x`.
+    """
     dtau_seg = ray_dtau(dtau, seg_a, seg_b, layer_idx, ray, k)
     s_lo, s_here = source_function_matrix[layer_idx - 1, k], source_function_matrix[layer_idx, k]
     ds_lo, ds_here = (1.0 if seed == layer_idx - 1 else 0.0), (1.0 if seed == layer_idx else 0.0)
