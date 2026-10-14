@@ -8,6 +8,8 @@ Subpackages
    :maxdepth: 4
 
    tiramisu.colchem
+   tiramisu.profiles
+   tiramisu.rt
 
 Submodules
 ----------
@@ -44,6 +46,14 @@ tiramisu.config module
    :show-inheritance:
    :undoc-members:
 
+tiramisu.constants module
+-------------------------
+
+.. automodule:: tiramisu.constants
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
 tiramisu.eclipse module
 -----------------------
 
@@ -64,22 +74,6 @@ tiramisu.numerics module
 ------------------------
 
 .. automodule:: tiramisu.numerics
-   :members:
-   :show-inheritance:
-   :undoc-members:
-
-tiramisu.profiles module
-------------------------
-
-.. automodule:: tiramisu.profiles
-   :members:
-   :show-inheritance:
-   :undoc-members:
-
-tiramisu.profiles\_gpu module
------------------------------
-
-.. automodule:: tiramisu.profiles_gpu
    :members:
    :show-inheritance:
    :undoc-members:

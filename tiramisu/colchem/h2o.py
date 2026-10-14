@@ -69,8 +69,8 @@ downward in total energy. A pair with :math:`u` below :math:`l` (vibrationally d
 :math:`u \to l` rate from detailed balance.
 
 - ``_H2O_H2_ORTHO_RATES`` and ``_H2O_H2_PARA_RATES`` hold the result at 11 temperatures (5 significant figures;
-  ``tests/check_h2o_rates.py`` compares them with the CDS files). They are interpolated log-linearly in :math:`T`
-  (``base._interp_rate``) and held at the end values outside 200-5000 K.
+  ``tests/colchem/check_h2o_rates.py`` compares them with the CDS files). They are interpolated log-linearly in
+  :math:`T` (``base._interp_rate``) and held at the end values outside 200-5000 K.
 - Final levels are as computed. A stretch fundamental relaxes 80% to (020) and 10% each to (010) and (000) at every
   tabulated temperature. Its (001) :math:`\to` (100) exchange is 44 times faster than its relaxation at 200 K and 3
   times faster at 5000 K.
@@ -240,7 +240,7 @@ Every level :math:`(v_1 v_2 v_3)` above the five base levels with harmonic energ
   to be fast compared with relaxation, and a rate growing with the quanta would reach the cap first and, since the
   cap scales all of a level's channels together, slow the relaxation.
 - POKAZATEL labels :math:`(v_1 v_2 v_3)` only up to 20,112 :math:`\mathrm{cm^{-1}}` (134 levels, all covered;
-  ``tests/check_h2o_rates.py``). Unlabelled states cannot be aggregated by quanta, so keys above that find no
+  ``tests/colchem/check_h2o_rates.py``). Unlabelled states cannot be aggregated by quanta, so keys above that find no
   aggregate and are skipped. The 50,000 :math:`\mathrm{cm^{-1}}` limit is there for a fuller labelling.
 - Uncertain by a factor ~10 above polyad :math:`2 v_1 + v_2 + 2 v_3 = 5` (no data).
 - Cost: about 32,000 rates per layer, about 4 s per run in ``_build_col_chem_cache``.

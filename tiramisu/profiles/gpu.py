@@ -6,8 +6,8 @@ sampled Voigt profiles.
 :class:`DeviceProfileBuffer` keeps the band profile buffer and the per-state lookup tables on the device for the whole
 transition-batch loop, so each batch only uploads its own transition arrays. At the end the buffer is either broadened
 on the device (:meth:`DeviceProfileBuffer.broaden_superlines`) or copied back to the host once
-(:meth:`DeviceProfileBuffer.to_host`). This module is imported lazily (from nlte.py and profiles.py), so CPU-only runs
-have no import cost or CUDA-toolkit dependency.
+(:meth:`DeviceProfileBuffer.to_host`). This module is imported lazily (from nlte.py and profiles/cross_sections.py),
+so CPU-only runs have no import cost or CUDA-toolkit dependency.
 
 :func:`accumulate_superlines` adds a transition batch to a device super-line buffer of either path: the band buffer of
 compute_rates_profiles or the band-less buffer of profiles.abs_emi_xsec. :func:`gpu_pays_off` is the cost model both
@@ -41,13 +41,10 @@ from numba.cuda.cudadrv.devicearray import DeviceNDArray
 from numpy import typing as npt
 from pyarrow import parquet as pq
 
-from . import config
-from .config import _GPU_THREADS_PER_BLOCK, _LOG_VERBOSE_2, _PARQUET_BATCH_SIZE
-from .profiles import (
-    const_8_pi_c,
-    const_h_c_on_4_pi,
-    _profile_windows,
-)
+from .. import config
+from ..config import _GPU_THREADS_PER_BLOCK, _LOG_VERBOSE_2, _PARQUET_BATCH_SIZE
+from ..constants import const_8_pi_c, const_h_c_on_4_pi
+from .lineshape import profile_windows
 
 log = logging.getLogger(__name__)
 
@@ -72,7 +69,7 @@ def _cexp_gpu(u: complex) -> complex:
 
 @cuda.jit(device=True, inline=True, cache=True)
 def _voigt_humlicek_w_gpu(x: float, y: float) -> float:
-    """Device-side port of profiles._voigt_humlicek_w — see that function's docstring."""
+    """Device-side port of lineshape.voigt_humlicek_w — see that function's docstring."""
     t_ = y - 1j * x
     s = abs(x) + y
 
@@ -145,7 +142,7 @@ def _key_count_kernel(
         counts: npt.NDArray[np.int32],
 ) -> None:
     """Cell key of each transition (band * n_grid + super-line bin, or the bin alone if band_indices is empty, as
-    profiles._super_line_bins) and the number of transitions per key."""
+    superline._super_line_bins) and the number of transitions per key."""
     max_idx = bin_edges.shape[0] - 2
     with_bands = band_indices.shape[0] > 0
     for t in range(cuda.grid(1), energy_fi.shape[0], cuda.gridsize(1)):
@@ -218,7 +215,7 @@ def _accumulate_segments_band_kernel(
         s_gamma: npt.NDArray[np.float64],
 ) -> None:
     """Band buffer (4, n_bands, n_layers, n_grid): absorption, stimulated and spontaneous emission, and the
-    absorption-weighted lifetime HWHM, as profiles._accumulate_superline_band_batch. The only segment of a key adds to
+    absorption-weighted lifetime HWHM, as superline.accumulate_superline_band_batch. The only segment of a key adds to
     the buffer; a segment of a multi-segment key writes its partial row (seg_partial), for _reduce_partials_kernel."""
     n_layers, n_grid = n_frac_lookup.shape[1], profile_buffer.shape[3]
     for flat in range(cuda.grid(1), seg_start.shape[0] * n_layers, cuda.gridsize(1)):
@@ -264,7 +261,7 @@ def _accumulate_segments_xsec_kernel(
         s_gamma: npt.NDArray[np.float64],
 ) -> None:
     """Band-less buffer (4, n_layers, n_grid): net absorption, spontaneous emission, sum(abs * gamma_lifetime) and
-    sum(abs), as profiles._accumulate_superline_batch; segments and partials as _accumulate_segments_band_kernel."""
+    sum(abs), as superline.accumulate_superline_batch; segments and partials as _accumulate_segments_band_kernel."""
     n_layers = n_lookup.shape[1]
     for flat in range(cuda.grid(1), seg_start.shape[0] * n_layers, cuda.gridsize(1)):
         s = flat // n_layers
@@ -390,8 +387,8 @@ def accumulate_superlines(
     Parameters
     ----------
     profile_buffer : device array, shape (4, n_bands, n_layers, n_grid) or (4, n_layers, n_grid)
-        Band buffer (profiles._accumulate_superline_band_batch channels), with band_indices; or band-less buffer
-        (profiles._accumulate_superline_batch channels), without.
+        Band buffer (superline.accumulate_superline_band_batch channels), with band_indices; or band-less buffer
+        (superline.accumulate_superline_batch channels), without.
     lookups : dict
         Device arrays "bin_edges", "n_frac" (populations, state-major), "g", "inv_g" and "gamma_lifetime", from
         :func:`to_device`.
@@ -551,7 +548,7 @@ def _band_layer_cost_kernel(
         j_ends: npt.NDArray[np.int32],
         cost: npt.NDArray[np.int64],
 ) -> None:
-    """GPU counterpart of profiles._band_layer_work_order's cost estimate: Voigt evaluations per (band, layer)."""
+    """GPU counterpart of bands.band_layer_work_order's cost estimate: Voigt evaluations per (band, layer)."""
     n_bands, n_layers, n_grid = profile_buffer.shape[1], profile_buffer.shape[2], profile_buffer.shape[3]
     for bl in range(cuda.grid(1), n_bands * n_layers, cuda.gridsize(1)):
         band = bl // n_layers
@@ -576,7 +573,7 @@ def _broaden_superline_band_buffer_kernel(
         order: npt.NDArray[np.int32],
         n_pairs: int,
 ) -> None:
-    """One thread per (band, layer) output row, taking pairs order[k]; see profiles._broaden_superline_band_buffer."""
+    """One thread per (band, layer) output row, taking pairs order[k]; see superline._broaden_superline_band_buffer."""
     n_layers, n_grid = profile_buffer.shape[2], profile_buffer.shape[3]
     inv_sqrt_pi = 1.0 / math.sqrt(math.pi)
     for k in range(cuda.grid(1), n_pairs, cuda.gridsize(1)):
@@ -613,7 +610,7 @@ def _free_device_bytes() -> int:
     return int(free)
 
 
-def _device_zeros(shape: tuple[int, ...]) -> DeviceNDArray:
+def device_zeros(shape: tuple[int, ...]) -> DeviceNDArray:
     d = cuda.device_array(shape, dtype=np.float64)
     cuda.driver.device_memset(d, 0, d.nbytes)
     return d
@@ -645,7 +642,7 @@ class DeviceProfileBuffer:
     n_frac_lookup : ndarray, shape (n_states + 1, n_layers)
     g_lookup, inv_g_lookup, gamma_lifetime_lookup : ndarray, shape (n_states + 1,)
     inv_doppler, gamma_pressure : ndarray, shape (n_layers,)
-        From :func:`profiles._layer_broadening_terms`.
+        From :func:`lineshape.layer_broadening_terms`.
     """
 
     def __init__(
@@ -697,16 +694,16 @@ class DeviceProfileBuffer:
             return False
         shape = (self.n_channels, new_capacity, self.n_layers, self.n_grid)
         if self.buffer is None:
-            self.buffer = _device_zeros(shape)
+            self.buffer = device_zeros(shape)
         elif old_bytes + new_bytes <= free:
-            new = _device_zeros(shape)
+            new = device_zeros(shape)
             for c in range(self.n_channels):
                 new[c, :self.capacity].copy_to_device(self.buffer[c])
             self.buffer = new
         else:
             host = self.to_host(self.capacity)
             self.free_buffer()
-            self.buffer = _device_zeros(shape)
+            self.buffer = device_zeros(shape)
             for c in range(self.n_channels):
                 self.buffer[c, :host.shape[1]].copy_to_device(host[c])
         self.capacity = new_capacity
@@ -720,7 +717,7 @@ class DeviceProfileBuffer:
             a_fi: npt.NDArray[np.float64],
             energy_fi: npt.NDArray[np.float64],
     ) -> None:
-        """Add one batch of transitions to the super-line buffer (see profiles._accumulate_superline_band_batch)."""
+        """Add one batch of transitions to the super-line buffer (see superline.accumulate_superline_band_batch)."""
         accumulate_superlines(profile_buffer=self.buffer, lookups=self._d, id_f=id_f, id_i=id_i, a_fi=a_fi,
                               energy_fi=energy_fi, band_indices=band_indices)
 
@@ -734,7 +731,7 @@ class DeviceProfileBuffer:
             a_fi: npt.NDArray[np.float64],
             energy_fi: npt.NDArray[np.float64],
     ) -> None:
-        """Add one batch of transitions as direct sampled Voigt profiles (see profiles._band_profile_sampled_voigt)."""
+        """Add one batch of transitions as direct sampled Voigt profiles (see sampled.band_profile_sampled_voigt)."""
         d_batch = [cuda.to_device(a) for a in (id_f, id_i, group_bands, group_starts, group_ends, a_fi, energy_fi)]
         d = self._d
         blocks, threads = _launch_dims(group_bands.shape[0] * self.n_layers)
@@ -753,12 +750,12 @@ class DeviceProfileBuffer:
     def broaden_superlines(self, n_bands: int) -> npt.NDArray[np.float64]:
         """
         Broaden the first n_bands super-line bands on the device and return the result on the host, shape
-        (3, n_bands, n_layers, n_grid) (see profiles._broaden_superline_band_buffer). The output is produced in band
+        (3, n_bands, n_layers, n_grid) (see superline._broaden_superline_band_buffer). The output is produced in band
         chunks sized to the free device memory.
         """
         t0 = time.perf_counter()
         n_layers, n_grid = self.n_layers, self.n_grid
-        j_starts, j_ends = _profile_windows(wn_grid=self.wn_grid, cutoff=25.0)
+        j_starts, j_ends = profile_windows(wn_grid=self.wn_grid, cutoff=25.0)
         d_js, d_je = cuda.to_device(j_starts), cuda.to_device(j_ends)
         d_view = self.buffer[:, :n_bands]
         d_cost = cuda.device_array(n_bands * n_layers, dtype=np.int64)
@@ -773,7 +770,7 @@ class DeviceProfileBuffer:
         for b0 in range(0, n_bands, chunk):
             b1 = min(n_bands, b0 + chunk)
             sel = order[(band_of >= b0) & (band_of < b1) & (cost[order] > 0)] - b0 * n_layers
-            d_out = _device_zeros((3, b1 - b0, n_layers, n_grid))
+            d_out = device_zeros((3, b1 - b0, n_layers, n_grid))
             if sel.size:
                 blocks, threads = _launch_dims(sel.size)
                 _broaden_superline_band_buffer_kernel[blocks, threads](

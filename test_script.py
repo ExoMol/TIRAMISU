@@ -11,8 +11,8 @@ from tiramisu import xsec
 from tiramisu.chemistry import ChemicalProfile
 from tiramisu.eclipse import ExoplanetEmission
 from tiramisu.config import output_dir, setup_logging_main
-from tiramisu.nlte import cdf_opacity_sampling, incident_srf
-from tiramisu.xsec import create_r_wn_grid
+from tiramisu.xsec import cdf_opacity_sampling, create_r_wn_grid
+from tiramisu.rt import incident_srf, incident_intensity
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -124,13 +124,16 @@ if __name__ == "__main__":
     #     orbital_radius=orbital_radius,
     #     planet_radius=planet_radius
     # )
-    incident_radiation_field = incident_srf(
-        star_temperature=star_temperature.value,
-        star_logg=star_logg,
-        star_feh=star_feh,
-        wn_grid=spectral_grid,
+    incident_radiation_field = incident_intensity(
+        star_intensity=incident_srf(
+            star_temperature=star_temperature.value,
+            star_logg=star_logg,
+            star_feh=star_feh,
+            wn_grid=spectral_grid,
+        ),
         star_radius=star_radius,
         orbital_radius=orbital_radius,
+        location="dayside",
     )
 
     chemistry_profile = ChemicalProfile.from_species_definition(
@@ -165,9 +168,9 @@ if __name__ == "__main__":
         toa_pressure=1e-6 << u.bar,
         nlayers=n_layers,
         chemistry_profile=chemistry_profile,
-        ngauss=4,
         central_pressure=central_pressure,
         pressure_levels=pressure_levels,
+        geometry="plane_parallel",  # or "spherical": rays through the shells
     )
     n_lte_layers = 40
     xsecs = xsec.XSecCollection(
@@ -196,13 +199,13 @@ if __name__ == "__main__":
         trans_files=Path(r"/mnt/c/PhD/OH/ExoMol/16O-1H__MYTHOS.trunc.trans"),
         agg_col_nums=[9, 10],
         broadening_params=broadening_params,  # (gamma, n) for H, He
-        lte_grid_file=Path(r"/mnt/c/PhD/OH/Opacities/16O-1H__MYTHOS_cont.R15000_0.125-100000mu.xsec.TauREx.h5"),
+        lte_grid_file=Path(r"/mnt/c/PhD/OH/opacity/16O-1H__MYTHOS_cont.R15000_0.125-100000mu.xsec.TauREx.h5"),
         cont_states_file=Path(r"/mnt/c/PhD/OH/ExoMol/XABC11_Unbound_States_Trans/16O-1H__MYTHOS.states.cont"),
         cont_trans_files=Path(r"/mnt/c/PhD/OH/ExoMol/XABC11_Unbound_States_Trans/16O-1H__MYTHOS.trans.cont"),
         cont_box_length=6.5E-8,
         cont_broad_col_num=10,
         dissociation_products=("O", "H"),
-        approximate_t_ex=True,
+        do_initial_step=True,
         debug=True,
     )
     xsecs.add_replace_xsec_data(nlte_xsec)
@@ -214,7 +217,7 @@ if __name__ == "__main__":
     #     wn_grid=spectral_grid, star_temperature=star_temperature, orbital_radius=orbital_radius, planet_radius=planet_radius
     # )
     # This now contains the loop!
-    spectral_grid, i_up, i_down, dtau, opacities = emission.compute_emission(
+    spectral_grid, flux_up, dtau, opacities = emission.compute_emission(
         xsecs,
         spectral_grid=spectral_grid,
         output_intensity=True,

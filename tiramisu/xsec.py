@@ -4,15 +4,18 @@ import abc
 import pathlib
 import typing as t
 
+import numba
 import numpy.typing as npt
 import numpy as np
+from scipy.integrate import cumulative_simpson
 
 import astropy.units as u
 import astropy.constants as ac
 
 from .accelerator import MultiSpeciesAccelerator
 from .chemistry import SpeciesFormula, SpeciesIdentType, ChemicalProfile
-from .nlte import (
+from .nlte import NLTEProcessor
+from .rt import (
     blackbody,
     effective_source_tau_mu,
     bezier_delta_tau_and_control_points,
@@ -25,15 +28,12 @@ from .nlte import (
     spherical_rays,
     update_inward_layer_spherical,
     update_outward_layer_spherical,
-    NLTEProcessor,
 )
+from .constants import const_2_pi_h_c_sq_on_sigma_sba, const_h_c_on_kB, source_func_unit
 from .config import _VMR_THRESHOLD, _LOG_FLOAT_FMT, _LOG_ARRAY_FMT, _LOG_VERBOSE_2
-from .numerics import linear_loglinear_interp_2d
+from .numerics import linear_loglinear_interp_2d, loglinear_normalise_1d_nonnegative
 
 log = logging.getLogger(__name__)
-
-# Units
-source_func_unit = u.J / (u.sr * u.m ** 2)
 
 
 def _bracket(
@@ -320,7 +320,7 @@ class ExomolNLTEXsec(ExomolHDF5Xsec):
     def configure_layers(self, n_layers: int, n_lte_layers: int = 0) -> None:
         """
         Configures the number of atmospheric layers, and the number fixed to LTE. Instantiates relevant properties on
-        the :class:`tiramisu.xsec.NLTEProcessor` instance that depend on the number of layers to iterate over.
+        the :class:`tiramisu.nlte.NLTEProcessor` instance that depend on the number of layers to iterate over.
 
         Called when added to a :class:`tiramisu.xsec.XSecCollection` instance.
 
@@ -512,9 +512,10 @@ class XSecCollection(dict):
             debug: bool = False,
     ) -> None:
         """
-        ``incident_radiation_field`` is the stellar irradiation from :func:`tiramisu.nlte.incident_intensity`, which is
-        evaluated on the solver's own directions in either geometry. An array of the downward specific intensity on
-        the plane-parallel grid (:func:`tiramisu.nlte.mu_quadrature`) is also accepted, for plane-parallel runs.
+        ``incident_radiation_field`` is the stellar irradiation from :func:`tiramisu.rt.incident.incident_intensity`,
+        which is evaluated on the solver's own directions in either geometry. An array of the downward specific
+        intensity on the plane-parallel grid (:func:`tiramisu.rt.source.mu_quadrature`) is also accepted, for
+        plane-parallel runs.
         """
         self.n_layers = n_layers
         self.n_lte_layers = n_lte_layers
@@ -564,7 +565,7 @@ class XSecCollection(dict):
     ) -> t.Dict[SpeciesFormula, u.Quantity]:
         """
         Opacities per species, with any NLTE species' populations solved first. The radiative transfer for the NLTE
-        solution is plane-parallel, or through spherical shells (:func:`tiramisu.nlte.spherical_rays`) when
+        solution is plane-parallel, or through spherical shells (:func:`tiramisu.rt.spherical.spherical_rays`) when
         ``interface_radii`` (layer interface radii, bottom first) is given.
         """
         active_species = self.active_absorbers(chem_profile.species)
@@ -685,7 +686,7 @@ class XSecCollection(dict):
         elif rays is not None and incident is not None and incident.ndim == 2 and incident.shape[0] != n_angular_points:
             raise ValueError(
                 "Spherical geometry evaluates the incident field on its own rays: pass the result of "
-                "tiramisu.nlte.incident_intensity() rather than an array."
+                "tiramisu.rt.incident.incident_intensity() rather than an array."
             )
 
         if any_initial_step:
@@ -1059,3 +1060,85 @@ def create_r_wn_grid(low: float, high: float, resolving_power: float) -> u.Quant
     resolving_f = np.log((resolving_power + 1) / resolving_power)
     n_points = round((np.log(high) - np.log(low)) / resolving_f) + 1
     return np.exp(np.arange(n_points) * resolving_f + np.log(low)) << u.k
+
+
+@numba.njit(cache=True, error_model="numpy")
+def calc_ev_grid(wn_grid: npt.NDArray[np.float64], temperature: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    return (const_2_pi_h_c_sq_on_sigma_sba * wn_grid ** 3) / (
+            temperature ** 4 * (np.exp(const_h_c_on_kB * wn_grid / temperature) - 1)
+    )
+
+
+@numba.njit(cache=True, error_model="numpy", inline="always")
+def _sample_indices(
+        ev_cdf: npt.NDArray[np.float64],
+        temp_wn_grid: npt.NDArray[np.float64],
+        num_points: int,
+        max_step: float
+):
+    """
+    Finds the indices in the energy density cumulative distribution function (CDF) such that the energy density is uniform.
+    This is done by determining a uniform step size through the CDF based on the number of steps and ensuring the
+    difference in the cumulative CDF between each point does not exceed this step size. An additional constraint is
+    imposed such that the step size on the wavenumber grid also cannot exceed a maximum value. As such the number of
+    points requested by the function is the lower bound on theh number of points returned.
+
+    Parameters
+    ----------
+    ev_cdf: ndarray
+        Energy density cumulative distribution function.
+    temp_wn_grid: ndarray
+        Temporary high-resolution wavenumber grid (with linear spacing).
+    num_points: int
+        Lower bound on the number of indices to return to sample the CDF.
+    max_step: float
+        Maximum step size along the wavenumber grid between each successive index.
+
+    Returns
+    -------
+        Integer indices corresponding to the uniform sampling points in the CDF.
+
+    """
+    num_cdf_points = len(ev_cdf)
+    sample_idxs = [0]
+    current_idx = 0
+    step_size = 1.0 / num_points
+
+    while current_idx < num_cdf_points - 1:
+        next_step = ev_cdf[current_idx] + step_size
+        next_step_idx = np.searchsorted(ev_cdf, next_step) - 1
+        next_step_idx = min(max(next_step_idx, current_idx + 1), num_cdf_points - 1)
+
+        current_wn_val = temp_wn_grid[current_idx]
+        next_wn_val = temp_wn_grid[next_step_idx]
+
+        if max_step > 0.0 and (next_wn_val - current_wn_val) > max_step:
+            seek_wn_val = current_wn_val + max_step
+            seek_idx = np.searchsorted(temp_wn_grid, seek_wn_val) - 1
+            current_idx = min(seek_idx, num_cdf_points - 1)
+        elif next_step_idx >= num_cdf_points - 1:
+            current_idx = num_cdf_points - 1
+        else:
+            current_idx = next_step_idx
+        sample_idxs.append(current_idx)
+    return np.array(sample_idxs, dtype=np.int32)
+
+
+def cdf_opacity_sampling(
+        wn_start: float,
+        wn_end: float,
+        temperature_profile: npt.NDArray[np.float64],
+        num_points: int,
+        max_step: float,
+        num_cdf_points: int = 1000000,
+) -> u.Quantity:
+    temp_wn_grid = np.linspace(wn_start, wn_end, num_cdf_points, dtype=np.float64)
+    ev_grid = calc_ev_grid(wn_grid=temp_wn_grid, temperature=np.atleast_1d(temperature_profile)[:, None]).sum(axis=0)
+    temp_dx = np.diff(temp_wn_grid)
+    ev_norm = loglinear_normalise_1d_nonnegative(y_data=ev_grid, dx=temp_dx)
+
+    ev_cdf = cumulative_simpson(ev_norm, x=temp_wn_grid, initial=0)
+
+    sample_idxs = _sample_indices(ev_cdf, temp_wn_grid, num_points, max_step)
+
+    return temp_wn_grid[sample_idxs] / u.cm

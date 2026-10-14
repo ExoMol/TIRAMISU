@@ -12,7 +12,7 @@ the gas-kinetic cap and what is left out. Update it whenever this module changes
   rotational states of that vibrational level.
 - :math:`E_X(v)`, :math:`E_A(v')`: level energies [:math:`\mathrm{cm^{-1}}`], the lowest MYTHOS state of each level
   (``_OH_X_ENERGIES``, ``_OH_A_ENERGIES``; from ``16O-1H__MYTHOS.noB4.vfix.states``, :math:`v` relabelled by
-  ``tests/fix_states_v_labels.py``). They set which product levels are open and the energy gaps of the gap laws.
+  ``tests/tools/fix_states_v_labels.py``). They set which product levels are open and the energy gaps of the gap laws.
 - :math:`\Delta E`: the energy gap of a single-quantum step, :math:`E(v) - E(v - 1)`.
 - :math:`M`: the collider, with number density :math:`n_M`; :math:`T`: layer temperature [K]; :math:`k_B`: Boltzmann
   constant.
@@ -249,6 +249,8 @@ ceiling only near dissociation (X) and for the high A levels.
   set extended to X :math:`v` = 16 and A :math:`v'` = 10 (all bound levels).
 - 2026-10-12: moved from ``colchem.py`` to ``colchem/oh.py``.
 - 2026-10-14: H + O3 formation includes GRANADA's :math:`v = 10` (2%), previously dropped.
+- 2026-10-14: the OH + H prior's :math:`k_B / h c` from ``tiramisu.constants`` (astropy) in place of the literal
+  0.6950348 cm\ :sup:`-1` K\ :sup:`-1` (7e-10 higher).
 
 .. rubric:: References
 
@@ -292,6 +294,7 @@ import typing as t
 import numpy as np
 import numpy.typing as npt
 
+from ..constants import const_h_c_on_kB
 from .base import RateTransition, _gas_kinetic_rate
 
 
@@ -300,7 +303,7 @@ from .base import RateTransition, _gas_kinetic_rate
 # --------------------------------------------------------------------------------------------------------------
 
 # Level energies [cm^-1]: the lowest MYTHOS state of each (electronic state, v) in 16O-1H__MYTHOS.noB4.vfix.states
-# (v relabelled by tests/fix_states_v_labels.py). Index = v. X runs to v = 16, just below dissociation.
+# (v relabelled by tests/tools/fix_states_v_labels.py). Index = v. X runs to v = 16, just below dissociation.
 _OH_X_ENERGIES = np.array([
     0.0, 3568.47, 6971.35, 10210.54, 13287.16, 16201.31, 18951.86, 21536.20, 23949.82, 26185.79, 28234.07, 30080.59,
     31706.40, 33086.40, 34194.94, 34993.54, 35443.98,
@@ -354,7 +357,7 @@ def _oh_h_prior(v: int, layer_temp: float) -> npt.NDArray[np.float64]:
     Statistical (phase-space prior) distribution of OH(X, v) + H relaxation over v'' < v: atom-diatom break-up of a
     long-lived H2O complex, P(v'') ~ (E_v - E_v'' + 2 k T)^(3/2), with 2 k T the mean collision energy.
     """
-    p = (_OH_X_ENERGIES[v] - _OH_X_ENERGIES[:v] + 2 * 0.6950348 * layer_temp) ** 1.5
+    p = (_OH_X_ENERGIES[v] - _OH_X_ENERGIES[:v] + 2 * layer_temp / const_h_c_on_kB) ** 1.5
     return p / p.sum()
 
 

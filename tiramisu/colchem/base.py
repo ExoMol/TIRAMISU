@@ -3,6 +3,12 @@ Shared pieces of the collisional/chemical rate database: the rate record, per-sp
 interpolation of tabulated rates, and the gas-kinetic ceiling used to cap estimated rates. The conventions here hold
 for every species module; update this docstring whenever they change (see ``colchem.py``).
 
+.. rubric:: Physical constants
+
+Physical constants come from ``tiramisu.constants`` (``astropy.constants``, CODATA 2018), never literals: the
+Boltzmann constant and atomic mass unit here, and :math:`h c / k_B` and the atmosphere in the species modules
+(since 2026-10-14).
+
 .. rubric:: How rates enter the statistical equilibrium
 
 A ``RateTransition`` holds one rate coefficient :math:`k` [:math:`\mathrm{cm^3\,s^{-1}}`] from level ``upper_key``
@@ -52,6 +58,8 @@ from dataclasses import dataclass
 import numba
 import numpy as np
 import numpy.typing as npt
+
+from ..constants import const_amu, const_k_B
 
 
 @dataclass
@@ -172,10 +180,10 @@ def _gas_kinetic_rate(
     molecule of mass ``target_mass`` [amu] (default OH).
     """
     mass = _COLLIDER_MASS[collider]
-    mu = target_mass * mass / (target_mass + mass) * 1.66053906660e-24
+    mu = target_mass * mass / (target_mass + mass) * const_amu
     if cross_section is None:
         cross_section = _COLLIDER_CROSS_SECTION.get(collider, 30.0)
-    return cross_section * 1e-16 * np.sqrt(8 * 1.380649e-16 * temperature / (np.pi * mu))
+    return cross_section * 1e-16 * np.sqrt(8 * const_k_B * temperature / (np.pi * mu))
 
 
 _COLLIDER_MASS = {"H": 1.008, "H2": 2.016, "He": 4.0026, "H2O": 18.015}

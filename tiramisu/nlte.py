@@ -1,4 +1,3 @@
-import dataclasses
 import logging
 import pathlib
 import pickle
@@ -11,71 +10,30 @@ import polars as pl
 import numba
 from numpy import typing as npt
 
-from phoenix4all import get_spectrum
-
 from astropy import units as u, constants as ac
 
-from scipy.integrate import cumulative_simpson
 from scipy.optimize import least_squares
 
 from .chemistry import SpeciesFormula, ChemicalProfile
 from .colchem import CollisionalRatesDatabase, RateTransition
+from .constants import ac_h_c_on_kB, einstein_a_unit, einstein_b_unit
 from .config import output_dir, _LOG_FLOAT_FMT, _LOG_ARRAY_FMT, _LOG_VERBOSE_1, _LOG_VERBOSE_2, \
     _LOG_VERBOSE_3, _VMR_THRESHOLD, _DEFAULT_NUM_THREADS
 from .numerics import (loglinear_normalise_1d_nonnegative,
                        loglinear_normalise_quantity_1d_nonnegative, loglinear_integral_quantity_1d,
                        loglinear_integral_quantity_1d_nonnegative, loglinear_integral_quantity_2d_nonnegative,
                        loglinear_integral_1d, loglinear_integral_1d_nonnegative)
-from .profiles import (ProfileStore, ContinuumProfileStore, abs_emi_xsec, continuum_xsec,
-                       _accumulate_superline_band_batch, broaden_superline_band_buffer, _layer_broadening_terms,
-                       _band_rate_sums, _accumulate_continuum_superline_band_batch,
-                       _broaden_continuum_superline_band_buffer, _iter_trans_batches, _read_ahead,
-                       _band_profile_sampled_voigt, _continuum_band_profile_sampled_gauss_layered, _assign_band_indices,
-                       _group_by_band, gamma_lifetime_lookup_from_tau, _bin_edges, rebin_spectrum)
+from .profiles import ProfileStore, ContinuumProfileStore, abs_emi_xsec, continuum_xsec
+from .profiles.bands import assign_band_indices, band_rate_sums, group_by_band
+from .profiles.lineshape import grid_bin_edges, layer_broadening_terms, gamma_lifetime_lookup_from_tau
+from .profiles.read import iter_trans_batches, read_ahead
+from .profiles.sampled import band_profile_sampled_voigt, continuum_band_profile_sampled_gauss_layered
+from .profiles.superline import (accumulate_superline_band_batch, accumulate_continuum_superline_band_batch,
+                                 broaden_superline_band_buffer, broaden_continuum_superline_band_buffer)
+from .rt import blackbody, shield_masing_chi
 from . import config
 
 log = logging.getLogger(__name__)
-
-# Maser shielding: a negative (masing) opacity chi is replaced by MASER_SHIELD_FACTOR * |chi| (see
-# _effective_chi_source_dtau_core). NLTE species are shielded individually (shield_masing_chi) before their opacity
-# enters the global chi, so masing in one species cannot cancel the others' opacity toward zero, where S = eta / chi
-# blows up.
-MASER_SHIELD_FACTOR = 0.1
-
-
-@numba.njit(cache=True, inline="always")
-def _shield_chi_value(chi: float) -> float:
-    """The one place the shielding is defined: ``MASER_SHIELD_FACTOR * |chi|`` for a negative (masing) chi."""
-    return -MASER_SHIELD_FACTOR * chi if chi < 0.0 else chi
-
-
-@numba.njit(cache=True)
-def shield_masing_chi(chi: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
-    """Copy of a (C-contiguous) ``chi`` with its negative (masing) entries shielded (:func:`_shield_chi_value`)."""
-    out = np.empty_like(chi)
-    src, dst = chi.reshape(-1), out.reshape(-1)
-    for i in range(src.shape[0]):
-        dst[i] = _shield_chi_value(src[i])
-    return out
-
-# Units:
-einstein_a_unit = 1 / u.s
-# B = A c^2 / (2 h nu^3) is per unit mean intensity J [J / (m^2 sr)] (per Hz), so B J is a rate: the steradian is part
-# of B, not cancelled by multiplying J by 4 pi sr (B 4 pi J would be 4 pi too large).
-einstein_b_unit = (u.m ** 2 * u.sr) / (u.J * u.s)
-
-# Constants with units:
-
-ac_h_c_on_kB = ac.h * ac.c.cgs / ac.k_B
-
-ac_2_h_on_c_sq = 2 * ac.h / ac.c ** 2
-ac_h_on_kB = ac.h / ac.k_B
-
-# Dimensionless version for numba
-const_h_c_on_kB = ac_h_c_on_kB.value
-const_2_pi_h_c_sq_on_sigma_sba = (
-    (2 * np.pi * ac.h * ac.c.cgs ** 2 / ac.sigma_sb).to_value(u.K ** 4 * u.cm ** 4, equivalencies=u.spectral())
-)
 
 
 # TODO: For NANs in state lifetimes; treat as inf? They imply inf but often they exist because of transition energy
@@ -142,7 +100,7 @@ def _update_band_registry(
 
     """
     n_bands_prev = band_keys.shape[0]
-    band_indices, n_bands_used = _assign_band_indices(
+    band_indices, n_bands_used = assign_band_indices(
         id_f=id_f, id_i=id_i, id_agg_lookup=id_agg_lookup, band_lookup=band_lookup, id_agg_offset=id_agg_offset,
         n_bands_used=n_bands_prev,
     )
@@ -172,13 +130,14 @@ def _grow_band_buffer(profile_buffer: npt.NDArray[np.float64], n_bands: int) -> 
 
 # -------------------------------------------------- Y matrix kernels --------------------------------------------------
 # Photon-counting weights. A band's radiative rate is B_band * int(phi J dnu): the band sum B_band = sum_lines f B
-# (profiles._band_rate_sums) times J averaged over the band with each line weighted by its share f B of that sum. The
-# stored profiles are cross-sections (energy removed from, or added to, the beam): a line's integrated cross-section is
-# (h nu / 4 pi) B, so a normalised cross-section profile weights each line by f B nu, not f B. Rates count transitions
-# (absorbed power / h nu), so every profile normalised as a rate weight here (absorption, stimulated and spontaneous
-# emission, continuum) is first divided by the wavenumber. Within one line nu hardly changes; across an aggregate band
-# it does (without the division, radiation-only balance at J = B_nu(T) missed LTE by 0.2-2.7% for OH bands, more for
-# wide overtone and continuum bands). Opacity and emissivity (chi, eta) keep the cross-sections themselves.
+# (profiles.bands.band_rate_sums) times J averaged over the band with each line weighted by its share f B of that sum.
+# The stored profiles are cross-sections (energy removed from, or added to, the beam): a line's integrated cross-section
+# is (h nu / 4 pi) B, so a normalised cross-section profile weights each line by f B nu, not f B. Rates count
+# transitions (absorbed power / h nu), so every profile normalised as a rate weight here (absorption, stimulated and
+# spontaneous emission, continuum) is first divided by the wavenumber. Within one line nu hardly changes; across an
+# aggregate band it does (without the division, radiation-only balance at J = B_nu(T) missed LTE by 0.2-2.7% for OH
+# bands, more for wide overtone and continuum bands). Opacity and emissivity (chi, eta) keep the cross-sections
+# themselves.
 
 @numba.njit(cache=True, error_model="numpy")
 def _build_y_matrix_core(
@@ -218,7 +177,7 @@ def _build_y_matrix_core(
     id_agg_i : ndarray, shape (n_agg,)
     rates_grid_arr : ndarray, shape (n_agg, three)
         Each row contains the triple (A_fi, B_fi, B_if) for this layer: population-weighted rates per molecule in the
-        source aggregate (see :func:`tiramisu.profiles._band_rate_sums`).
+        source aggregate (see :func:`tiramisu.profiles.bands.band_rate_sums`).
     id_agg_cutoff : int
     n_lookup : ndarray, shape (n_agg,)
     chem_scale_factor : float
@@ -408,7 +367,7 @@ def _build_y_matrix_cont(
     id_agg_i : ndarray, shape (n_agg,)
     rates_grid_arr : ndarray, shape (n_agg, three)
         Each row contains the triple (A_fi, B_fi, B_if) for this layer: population-weighted rates per molecule in the
-        source aggregate (see :func:`tiramisu.profiles._band_rate_sums`).
+        source aggregate (see :func:`tiramisu.profiles.bands.band_rate_sums`).
     id_agg_cutoff : int
     n_lookup : ndarray, shape (n_agg,)
     chem_scale_factor : float
@@ -522,1222 +481,6 @@ def _build_y_matrix_cont(
 
 # -------------------------------------------- Bezier Coefficients & Setup --------------------------------------------
 
-@numba.njit(parallel=True, cache=True, error_model="numpy")
-def _effective_chi_source_dtau_core(
-        global_chi: npt.NDArray[np.float64],
-        global_source_func: npt.NDArray[np.float64],
-        global_eta: npt.NDArray[np.float64],
-        density: npt.NDArray[np.float64],
-        dz: npt.NDArray[np.float64],
-        c_cgs: float,
-        eta_to_source_func_scale: float,
-) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-    """
-    Fused, allocation-light core for :func:`effective_source_tau_mu`.
-
-    Numpy's version of this (row max, boolean masks for negative entries, ``exp``, masked division) allocates
-    several full ``(n_layers, n_grid)`` temporaries (the ``.copy()``, the ``nonzero`` index arrays, two boolean
-    masks) on every call; this does the same row-local derivation in one pass per layer with no intermediates,
-    which matters here since it's called once per NLTE layer per iteration on the same full-size arrays.
-
-    All arguments are plain arrays/floats in a consistent cgs-like unit system (chi in cm^2, eta in
-    erg*cm/(s*sr), density in 1/cm^3, dz in cm) - unit handling/conversion happens once in the
-    :func:`effective_source_tau_mu` wrapper, not per element here.
-
-    Returns
-    -------
-    effective_chi, effective_source_func, dtau : ndarray, shape (n_layers, n_grid)
-        Shielded (always non-negative) effective opacity, the correspondingly corrected source function, and the
-        per-layer optical depth increment computed from ``effective_chi``.
-    """
-    n_layers, n_grid = global_chi.shape
-    effective_chi = np.empty((n_layers, n_grid), dtype=np.float64)
-    effective_source_func = np.empty((n_layers, n_grid), dtype=np.float64)
-    dtau = np.empty((n_layers, n_grid), dtype=np.float64)
-
-    # Maser shielding: a negative (masing) chi is replaced by MASER_SHIELD_FACTOR * abs(chi) - a fixed fraction of that
-    # element's own magnitude, not the row max/min. This is the standard treatment used in published coupled
-    # SE+ALI maser codes (e.g. Nesterenok 2016, MNRAS 455, 3978, CH3OH masers). Unlike the row-relative
-    # min/max-based remaps tried earlier (which made stronger masing map to a *smaller* effective_chi, so it
-    # could collapse toward 0 and blow up anything dividing by it - e.g. psi_approx_eta/V-matrix terms in
-    # build_y_matrix), this keeps effective_chi directly proportional to abs(chi), so it can never collapse
-    # regardless of how extreme or how deep the accumulated masing is. It does not try to preserve the relative
-    # shape of the masing profile - saturation (the real physical mechanism bounding maser gain) is left to the
-    # statistical equilibrium equations, not to this shielding.
-
-    for i in numba.prange(n_layers):
-        for j in range(n_grid):
-            chi_val = _shield_chi_value(global_chi[i, j])
-            effective_chi[i, j] = chi_val
-
-            sf_val = global_source_func[i, j]
-            if sf_val < 0.0:
-                if chi_val == 0.0:
-                    sf_val = 0.0
-                else:
-                    sf_val = global_eta[i, j] / (c_cgs * chi_val) * eta_to_source_func_scale
-            effective_source_func[i, j] = sf_val
-
-            dtau[i, j] = chi_val * density[i] * dz[i]
-
-    return effective_chi, effective_source_func, dtau
-
-
-@numba.njit(parallel=True, cache=True, error_model="numpy")
-def _layer_centre_tau(dtau: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
-    """Optical depth from the TOA to each layer's centre, where its source function and populations live: the sum of
-    dtau from the top down to the layer, minus half its own (summed in the order of a cumulative sum from the top)."""
-    n_layers, n_grid = dtau.shape
-    tau = np.empty_like(dtau)
-    for k in numba.prange(n_grid):
-        above = 0.0
-        for i in range(n_layers - 1, -1, -1):
-            above += dtau[i, k]
-            tau[i, k] = above - 0.5 * dtau[i, k]
-    return tau
-
-
-def effective_source_tau_mu(
-        global_source_func_matrix: u.Quantity,
-        global_chi_matrix: u.Quantity,
-        global_eta_matrix: u.Quantity,
-        density_profile: u.Quantity,
-        dz_profile: u.Quantity,
-) -> t.Tuple[u.Quantity, npt.NDArray[np.float64], u.Quantity, npt.NDArray[np.float64]]:
-    """
-    Compute an effective Source function and optical depth, tau, for use in calculation of Bezier interpolants. These
-    are computed based on an effective opacity calculated using Eq. (39) from https://doi.org/10.48550/arXiv.2508.12873.
-
-    Negative (masing/population-inversion) entries in ``global_chi_matrix`` are shielded by mapping ``chi`` to
-    ``MASER_SHIELD_FACTOR * abs(chi)``, the standard treatment used in published coupled statistical-equilibrium
-    + ALI maser codes (e.g. Nesterenok 2016, MNRAS 455, 3978). This keeps the shielded value directly proportional
-    to the element's own magnitude - never collapsing toward zero regardless of how extreme the masing - unlike
-    row-relative min/max-based remaps tried earlier, which made stronger masing map to a *smaller* effective_chi
-    and could blow up anything dividing by it (e.g. :func:`NLTEProcessor.build_y_matrix`'s Lambda*-operator
-    terms). It does not attempt to preserve the shape of the negative-opacity distribution; saturation (the real
-    physical mechanism bounding maser gain) is left to the statistical equilibrium equations, not this shielding.
-    NLTE species' opacities are already shielded individually (:func:`shield_masing_chi`) before they are summed, so
-    with them ``global_chi_matrix`` has no negative entries and this only guards other inputs.
-
-    Parameters
-    ----------
-    global_source_func_matrix
-    global_chi_matrix
-    global_eta_matrix
-    density_profile
-    dz_profile
-
-    Returns
-    -------
-    effective_source_func_matrix : Quantity
-    tau : ndarray, shape (n_layers, n_grid)
-        Optical depth from the TOA to each layer centre, with no angle axis. This used to be broadcast over mu here
-        (``tau_mu``, ``(n_layers, n_angles, n_grid)``) before being returned, materialising an array ~50x larger than
-        ``tau`` itself for no reason: :func:`bezier_delta_tau_and_control_points`/:func:`update_layer_coefficients` (the
-        only consumers) only ever use ``tau_mu[i, j, k]`` as ``tau[i, k] / mu_values[j]`` at a point they're already
-        visiting in a loop, so the division now happens there instead of via a standalone broadcast. Callers must pass
-        ``mu_values`` to those functions directly.
-    effective_chi : Quantity, shape (n_layers, n_grid)
-        The shielded (always non-negative) effective opacity used to compute ``tau``. Callers should reuse this -
-        rather than re-deriving something from the raw ``global_chi_matrix`` - anywhere else in the iteration that
-        needs a numerically safe stand-in for opacity near masing (population-inversion, negative-opacity) regions,
-        e.g. :func:`NLTEProcessor.build_y_matrix`'s Lambda*-operator terms.
-    dtau : ndarray, shape (n_layers, n_grid)
-        Optical thickness of each layer from ``effective_chi``, the input of the spherical-ray kernels.
-    """
-    chi_unit = u.cm ** 2
-    eta_unit = u.erg * u.cm / (u.s * u.sr)
-
-    c_cgs = ac.c.cgs.value
-    # Unit.to() (unlike Quantity.to()) already returns the bare conversion factor, not a Quantity.
-    eta_to_source_func_scale = (
-            eta_unit / (u.cm / u.s * chi_unit)
-    ).to(global_source_func_matrix.unit, equivalencies=u.spectral())
-
-    effective_chi_val, effective_source_func_val, dtau = _effective_chi_source_dtau_core(
-        global_chi=global_chi_matrix.to_value(chi_unit),
-        global_source_func=global_source_func_matrix.value,
-        global_eta=global_eta_matrix.to_value(eta_unit),
-        density=density_profile.to_value(1 / u.cm ** 3),
-        dz=dz_profile.to_value(u.cm),
-        c_cgs=c_cgs,
-        eta_to_source_func_scale=eta_to_source_func_scale,
-    )
-
-    effective_chi = effective_chi_val << chi_unit
-    effective_source_func_matrix = effective_source_func_val << global_source_func_matrix.unit
-
-    tau = _layer_centre_tau(dtau)
-    return effective_source_func_matrix, tau, effective_chi, dtau
-
-
-@numba.njit(cache=True, error_model="numpy", inline="always")
-def _bezier_terms(dt: float) -> t.Tuple[float, float, float, float]:
-    """
-    Bezier short-characteristics terms for one layer boundary along one ray: exp(-dt), alpha, beta, gamma, where
-    dt = delta_tau / mu. Taylor expansion (Horner form) below dt = 0.14, exact formulas above.
-    """
-    if dt == 0.0:
-        # alpha, beta, gamma tend to 0 as dt -> 0.
-        return 1.0, 0.0, 0.0, 0.0
-    if dt < 1.4e-1:
-        alpha = dt * (dt * (
-                dt * (dt * (dt * (dt * ((10 - dt) * dt - 90) + 720) - 5040) + 30240) - 151200) + 604800) / 1814400
-        beta = dt * (dt * (dt * (
-                dt * (dt * (dt * ((140 - 18 * dt) * dt - 945) + 5400) - 25200) + 90720) - 226800) + 302400) / 907200
-        gamma = dt * (dt * (dt * (
-                dt * (dt * (dt * ((35 - 4 * dt) * dt - 270) + 1800) - 10080) + 45360) - 151200) + 302400) / 907200
-        return np.exp(-dt), alpha, beta, gamma
-    exp_neg_tau = np.exp(-dt)
-    dt_sq = dt * dt
-    return (exp_neg_tau, (2 + dt_sq - 2 * dt - 2 * exp_neg_tau) / dt_sq,
-            (2 - (2 + 2 * dt + dt_sq) * exp_neg_tau) / dt_sq,
-            (2 * dt - 4 + (2 * dt + 4) * exp_neg_tau) / dt_sq)
-
-
-@numba.njit(parallel=True, cache=True, error_model="numpy")
-def _compute_control_points_outward(
-        tau_matrix: npt.NDArray[np.float64],
-        source_function_matrix: npt.NDArray[np.float64],
-        control_points: npt.NDArray[np.float64],
-        start: int = 0,
-        end: int | None = None,
-) -> None:
-    """
-    Compute outward control points (index 0) of control_points, shape (n_layers, 2, n_wavelengths).
-
-    Control points do not depend on the ray angle: along a ray with direction cosine mu every optical depth difference
-    is dtau / mu, so the source-function derivative estimate scales as mu and each control point
-    S + 0.5 * (dtau / mu) * dS/dtau_mu is independent of mu; the clamps only compare source function values and test
-    the sign of dtau. They are therefore computed from the vertical optical depth and shared by all angles.
-    """
-    n_layers, n_wavelengths = tau_matrix.shape
-    if end is None or end > n_layers - 1:
-        end = n_layers - 1
-
-    # derivative indices required: i in [start-2, end).
-    deriv_start = max(start - 2, 1)
-    deriv_end = min(end, n_layers - 1)
-
-    for k in numba.prange(n_wavelengths):
-        # Compute derivatives
-        d_s_d_tau_out = np.zeros(n_layers, dtype=np.float64)
-
-        for i in range(deriv_start, deriv_end):
-            tau_diff = tau_matrix[i, k] - tau_matrix[i + 1, k]
-            if tau_diff != 0:
-                d_diff = (source_function_matrix[i, k] - source_function_matrix[i + 1, k]) / tau_diff
-
-                if i > 0:
-                    tau_diff_prev = tau_matrix[i - 1, k] - tau_matrix[i, k]
-                    if tau_diff_prev != 0:
-                        d_diff_prev = (source_function_matrix[i - 1, k] - source_function_matrix[i, k]) / tau_diff_prev
-                    else:
-                        d_diff_prev = 0
-
-                    zeta_denom = tau_matrix[i - 1, k] - tau_matrix[i + 1, k]
-                    if zeta_denom != 0:
-                        zeta = (1 + (tau_matrix[i - 1, k] - tau_matrix[i, k]) / zeta_denom) / 3
-                    else:
-                        zeta = 1.0 / 3.0
-
-                    numerator = d_diff * d_diff_prev
-                    denominator = zeta * d_diff_prev + (1 - zeta) * d_diff
-
-                    if numerator >= 0 and denominator != 0:
-                        d_s_d_tau_out[i] = numerator / denominator
-
-        # Compute control points with clamping
-        for i in range(max(start, 1), min(end + 1, n_layers)):
-            tau_diff = tau_matrix[i - 1, k] - tau_matrix[i, k]
-
-            control_0 = source_function_matrix[i, k] + 0.5 * tau_diff * d_s_d_tau_out[i]
-            control_1 = source_function_matrix[i - 1, k] - 0.5 * tau_diff * d_s_d_tau_out[i - 1]
-
-            min_source = min(source_function_matrix[i - 1, k], source_function_matrix[i, k])
-            max_source = max(source_function_matrix[i - 1, k], source_function_matrix[i, k])
-
-            control_0 = max(min(control_0, max_source), min_source)
-            control_1 = max(min(control_1, max_source), min_source)
-
-            if i == 1:
-                control_points[i, 0, k] = control_1
-            else:
-                control_points[i, 0, k] = 0.5 * (control_0 + control_1)
-
-            # Clamp to non-negative if gamma > 0; sign of gamma*C must be +. gamma of boundary i (coefficients[i, 3])
-            # is positive at every angle exactly when that boundary's dtau = tau[i - 1] - tau[i] is.
-            if tau_diff > 0 > control_points[i, 0, k]:
-                # TODO: Check gamma index offset.
-                control_points[i, 0, k] = 0.0
-    # End.
-
-
-@numba.njit(parallel=True, cache=True, error_model="numpy")
-def _compute_control_points_inward(
-        tau_matrix: npt.NDArray[np.float64],
-        source_function_matrix: npt.NDArray[np.float64],
-        control_points: npt.NDArray[np.float64],
-        start: int = 0,
-        end: int | None = None,
-) -> None:
-    """Compute inward control points (index 1). Angle-independent; see :func:`_compute_control_points_outward`."""
-    n_layers, n_wavelengths = tau_matrix.shape
-
-    if end is None or end > n_layers - 1:
-        end = n_layers - 1
-
-    # derivative indices required: i in [start, end+2).
-    deriv_start = start
-    deriv_end = min(end + 2, n_layers - 1)
-
-    for k in numba.prange(n_wavelengths):
-        # Compute derivatives
-        d_s_d_tau_in = np.zeros(n_layers, dtype=np.float64)
-
-        for i in range(deriv_start, deriv_end):
-            tau_diff = tau_matrix[i + 1, k] - tau_matrix[i, k]
-            if tau_diff != 0:
-                d_diff = (source_function_matrix[i + 1, k] - source_function_matrix[i, k]) / tau_diff
-
-                if i < n_layers - 2:
-                    tau_diff_next = tau_matrix[i + 2, k] - tau_matrix[i + 1, k]
-                    if tau_diff_next != 0:
-                        d_diff_next = (
-                                (source_function_matrix[i + 2, k] - source_function_matrix[i + 1, k]) / tau_diff_next
-                        )
-                    else:
-                        d_diff_next = 0
-
-                    zeta_denom = tau_matrix[i + 2, k] - tau_matrix[i, k]
-                    if zeta_denom != 0:
-                        zeta = (1 + (tau_matrix[i + 2, k] - tau_matrix[i + 1, k]) / zeta_denom) / 3
-                    else:
-                        zeta = 1.0 / 3.0
-
-                    numerator = d_diff * d_diff_next
-                    denominator = zeta * d_diff_next + (1 - zeta) * d_diff
-
-                    if numerator >= 0 and denominator != 0:
-                        d_s_d_tau_in[i + 1] = numerator / denominator
-
-        # Compute control points with clamping
-        for i in range(max(start, 0), min(end + 1, n_layers - 1)):
-            tau_diff = tau_matrix[i + 1, k] - tau_matrix[i, k]
-
-            control_0 = source_function_matrix[i, k] + 0.5 * tau_diff * d_s_d_tau_in[i]
-            control_1 = source_function_matrix[i + 1, k] - 0.5 * tau_diff * d_s_d_tau_in[i + 1]
-
-            min_source = min(source_function_matrix[i, k], source_function_matrix[i + 1, k])
-            max_source = max(source_function_matrix[i, k], source_function_matrix[i + 1, k])
-
-            control_0 = max(min(control_0, max_source), min_source)
-            control_1 = max(min(control_1, max_source), min_source)
-
-            if i == n_layers - 2:
-                control_points[i, 1, k] = control_1
-            else:
-                control_points[i, 1, k] = 0.5 * (control_0 + control_1)
-
-            # Clamp to non-negative if gamma > 0; sign of gamma*C must be +. gamma of boundary i (coefficients[i, 3])
-            # is positive at every angle exactly when that boundary's dtau = tau[i - 1] - tau[i] is.
-            if i > 0 > control_points[i, 1, k] and tau_matrix[i - 1, k] - tau_matrix[i, k] > 0:
-                # TODO: Check gamma index offset.
-                control_points[i, 1, k] = 0
-    # End.
-
-
-def bezier_delta_tau_and_control_points(
-        tau_matrix: npt.NDArray[np.float64],
-        source_function_matrix: u.Quantity,
-) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-    """
-    Layer-boundary optical depths and control points for the Bezier formal solution.
-
-    The Bezier coefficients exp(-dtau/mu), alpha, beta and gamma are not stored: each is a closed-form function of
-    dtau / mu (:func:`_bezier_terms`), computed by :func:`update_inward_layer`/:func:`update_outward_layer` where
-    they are used. Storing them for every (boundary, angle, wavenumber) took 4 + 2 derived arrays of shape
-    (n_layers + 1, n_angles, n_wavelengths) (~11 GB at 100 layers, 50 angles, R = 15k) and was slower overall than
-    recomputing them in the passes.
-
-    Parameters
-    ----------
-    tau_matrix : ndarray
-        Optical depth [n_layers, n_wavelengths].
-    source_function_matrix : Quantity
-        Source function [n_layers, n_wavelengths].
-
-    Returns
-    -------
-    delta_tau : ndarray, shape (n_layers + 1, n_wavelengths)
-        delta_tau[i] = tau[i - 1] - tau[i] for 1 <= i < n_layers; delta_tau[0] = -tau[0], delta_tau[n_layers] =
-        tau[n_layers - 1] (boundary rows).
-    control_points : ndarray, shape (n_layers, 2, n_wavelengths)
-        The same for every angle (see :func:`_compute_control_points_outward`).
-    """
-    n_layers, n_wavelengths = tau_matrix.shape
-    tau_matrix = np.ascontiguousarray(tau_matrix)
-    source_func_val = np.ascontiguousarray(source_function_matrix.value)
-
-    delta_tau = np.zeros((n_layers + 1, n_wavelengths), dtype=np.float64)
-    delta_tau[1:, :] = tau_matrix
-    delta_tau[:-1, :] -= tau_matrix
-
-    control_points = np.zeros((n_layers, 2, n_wavelengths), dtype=np.float64)
-    _compute_control_points_outward(
-        tau_matrix=tau_matrix, source_function_matrix=source_func_val, control_points=control_points,
-    )
-    _compute_control_points_inward(
-        tau_matrix=tau_matrix, source_function_matrix=source_func_val, control_points=control_points,
-    )
-    return delta_tau, control_points
-
-
-@numba.njit(parallel=True, cache=True, error_model="numpy")
-def update_layer_coefficients(
-        layer_idx: int,
-        tau_matrix: npt.NDArray[np.float64],
-        source_function_matrix: npt.NDArray[np.float64],
-        delta_tau: npt.NDArray[np.float64],
-        control_points: npt.NDArray[np.float64]
-) -> None:
-    """
-    Refresh delta_tau and the control points for the one or two layer boundaries touched by ``layer_idx``, after that
-    layer's opacity or source function changed.
-    """
-    n_layers, n_wavelengths = tau_matrix.shape
-
-    update_idxs = []
-    if layer_idx > 0:
-        update_idxs.append(layer_idx)
-    if layer_idx < n_layers - 1:
-        update_idxs.append(layer_idx + 1)
-
-    for k in numba.prange(n_wavelengths):
-        for i in update_idxs:
-            delta_tau[i, k] = tau_matrix[i - 1, k] - tau_matrix[i, k]
-
-    # Recompute control_points[i, 0] and control_points[i, 1] for i in range [layer_idx-2 ... layer_idx+2]
-    min_update_idx = min(update_idxs)
-    max_update_idx = max(update_idxs)
-    # i_low and i_high are the inclusive indices for updating; looping must account for range bounds.
-    i_low = max(min_update_idx - 1, 0)
-    i_high = min(max_update_idx + 1, n_layers - 1)
-
-    _compute_control_points_outward(
-        tau_matrix=tau_matrix, source_function_matrix=source_function_matrix, control_points=control_points,
-        start=i_low, end=i_high,
-    )
-    _compute_control_points_inward(
-        tau_matrix=tau_matrix, source_function_matrix=source_function_matrix, control_points=control_points,
-        start=i_low, end=i_high,
-    )
-    # Done.
-
-
-@numba.njit(parallel=True, cache=True, error_model="numpy")
-def update_inward_layer(
-        layer_idx: int,
-        i_in_matrix: npt.NDArray[np.float64],
-        lambda_in_layer: npt.NDArray[np.float64],
-        delta_tau: npt.NDArray[np.float64],
-        mu_values: npt.NDArray[np.float64],
-        control_points: npt.NDArray[np.float64],
-        source_function_matrix: npt.NDArray[np.float64],
-        with_lambda: bool = True,
-) -> None:
-    """
-    Update ``i_in_matrix[layer_idx]`` in place during a Gauss-Seidel inward pass:
-
-        I_in[l] = I_in[l + 1] * exp(-dt) + alpha * S[l] + beta * S[l + 1] + gamma * C_in[l]
-
-    with the Bezier terms of boundary l + 1 computed here from delta_tau and mu (:func:`_bezier_terms`), and write this
-    layer's inward Lambda* into ``lambda_in_layer`` (n_angles, n_grid). ``i_in_matrix`` keeps every layer, as the
-    outward pass needs the inward intensity above each layer it reaches; Lambda* is only ever used at the current layer.
-
-    Lambda* is the exact dI_in[l] / dS[l] (see :func:`_ray_inward_step`): the control points and their derivatives do
-    not depend on the angle, so the derivatives are taken once per wavenumber, along a vertical ray whose steps are
-    ``delta_tau`` itself. ``with_lambda`` False leaves ``lambda_in_layer`` alone, for calls whose Lambda* is not used
-    (the inward pass above the first layer solved, LTE layers).
-    """
-    n_layers = source_function_matrix.shape[0]
-    n_angles, n_grid = i_in_matrix.shape[1], i_in_matrix.shape[2]
-    vertical_a, vertical_b = np.zeros((n_layers, 1)), np.ones((n_layers, 1))
-
-    for k in numba.prange(n_grid):
-        sf_here = source_function_matrix[layer_idx, k]
-        sf_next = source_function_matrix[layer_idx + 1, k]
-        control_in = control_points[layer_idx, 1, k]
-        dtau_next = delta_tau[layer_idx + 1, k]
-        if with_lambda:
-            d_control_in = _ray_control_point_inward(
-                source_function_matrix, delta_tau, vertical_a, vertical_b, -1, layer_idx, 0, k, layer_idx)[1]
-            has_prev = layer_idx + 2 < n_layers
-            d_control_prev = _ray_control_point_inward(
-                source_function_matrix, delta_tau, vertical_a, vertical_b, -1, layer_idx + 1, 0, k, layer_idx
-            )[1] if has_prev else 0.0
-
-        for j in range(n_angles):
-            exp_next, alpha_next, beta_next, gamma_next = _bezier_terms(dtau_next / mu_values[j])
-            i_in_matrix[layer_idx, j, k] = (
-                    i_in_matrix[layer_idx + 1, j, k] * exp_next
-                    + alpha_next * sf_here
-                    + beta_next * sf_next
-                    + gamma_next * control_in
-            )
-            if with_lambda:
-                gamma_prev = _bezier_terms(delta_tau[layer_idx + 2, k] / mu_values[j])[3] if has_prev else 0.0
-                lambda_in_layer[j, k] = (alpha_next + gamma_next * d_control_in
-                                         + exp_next * gamma_prev * d_control_prev)
-
-
-@numba.njit(parallel=True, cache=True, error_model="numpy")
-def update_outward_layer(
-        layer_idx: int,
-        i_out_below: npt.NDArray[np.float64],
-        i_out_layer: npt.NDArray[np.float64],
-        lambda_out_layer: npt.NDArray[np.float64],
-        delta_tau: npt.NDArray[np.float64],
-        mu_values: npt.NDArray[np.float64],
-        control_points: npt.NDArray[np.float64],
-        source_function_matrix: npt.NDArray[np.float64],
-        with_lambda: bool = True,
-) -> None:
-    """
-    Outward intensity and Lambda* at ``layer_idx`` during a Gauss-Seidel outward pass, written into ``i_out_layer`` and
-    ``lambda_out_layer`` (n_angles, n_grid) from the layer below's outward intensity ``i_out_below``: the outward pass
-    only ever needs these two layers.
-
-    See :func:`update_inward_layer`; this is the mirror-image formula for the outward direction. Assumes
-    ``layer_idx > 0`` - the ``layer_idx == 0`` boundary condition (blackbody, zero Lambda*) is the caller's
-    responsibility, same as before. ``with_lambda`` as for :func:`update_inward_layer`.
-    """
-    n_layers = source_function_matrix.shape[0]
-    n_angles, n_grid = i_out_layer.shape
-    vertical_a, vertical_b = np.zeros((n_layers, 1)), np.ones((n_layers, 1))
-
-    for k in numba.prange(n_grid):
-        sf_here = source_function_matrix[layer_idx, k]
-        sf_prev = source_function_matrix[layer_idx - 1, k]
-        control_out = control_points[layer_idx, 0, k]
-        dtau_here = delta_tau[layer_idx, k]
-        if with_lambda:
-            d_control_out = _ray_control_point_outward(
-                source_function_matrix, delta_tau, vertical_a, vertical_b, -1, layer_idx, 0, k, layer_idx)[1]
-            has_prev = layer_idx >= 2
-            d_control_prev = _ray_control_point_outward(
-                source_function_matrix, delta_tau, vertical_a, vertical_b, -1, layer_idx - 1, 0, k, layer_idx
-            )[1] if has_prev else 0.0
-
-        for j in range(n_angles):
-            exp_here, alpha_here, beta_here, gamma_here = _bezier_terms(dtau_here / mu_values[j])
-            i_out_layer[j, k] = (
-                    i_out_below[j, k] * exp_here
-                    + alpha_here * sf_here
-                    + beta_here * sf_prev
-                    + gamma_here * control_out
-            )
-            if with_lambda:
-                gamma_prev = _bezier_terms(delta_tau[layer_idx - 1, k] / mu_values[j])[3] if has_prev else 0.0
-                lambda_out_layer[j, k] = (alpha_here + gamma_here * d_control_out
-                                          + exp_here * gamma_prev * d_control_prev)
-
-class SphericalRays(t.NamedTuple):
-    """
-    Rays through concentric spherical shells (the impact-parameter or "p-z" method), for radiative transfer in a
-    spherically symmetric atmosphere. See :func:`spherical_rays`.
-
-    Arrays indexed ``[layer, ray]`` hold zeros where a ray does not reach that layer's centre.
-    """
-    impact_parameter: npt.NDArray[np.float64]  # (n_rays,) [m]
-    tangent_layer: npt.NDArray[np.int64]  # (n_rays,) layer whose centre the ray grazes; -1 for rays hitting the BOA
-    seg_a: npt.NDArray[np.float64]  # (n_layers, n_rays): optical depth between centres l-1 and l along the ray is
-    seg_b: npt.NDArray[np.float64]  # seg_a[l] * dtau[l-1] + seg_b[l] * dtau[l]; row 0 unused
-    mu: npt.NDArray[np.float64]  # (n_layers, n_rays) direction cosine of the ray at each layer centre
-    weights: npt.NDArray[np.float64]  # (n_layers, n_rays) trapezoidal weights in mu at each layer, summing to 1
-
-
-def spherical_rays(interface_radii: u.Quantity, n_core: int = 12, tangent_stride: int = 1) -> SphericalRays:
-    """
-    Build the rays for :func:`update_inward_layer_spherical`/:func:`update_outward_layer_spherical`.
-
-    Each ray is a straight line at impact parameter ``p`` from the planet's centre. At a layer centre of radius
-    ``r >= p`` it makes an angle with the local vertical of cosine ``mu = sqrt(1 - p^2 / r^2)``, so one ray serves every
-    layer it crosses, at a different angle in each: this is what makes the geometry spherical rather than
-    plane-parallel, where every layer sees the same directions. The rays are
-
-    * the central ray ``p = 0`` and ``n_core`` "core" rays, whose directions at the bottom layer centre are the
-      :func:`mu_quadrature` nodes. They reach the bottom of the atmosphere, where the planet below sets their
-      outward intensity.
-    * one ray tangent to every ``tangent_stride``-th layer centre counting down from the top, ``p = r_t``. It enters
-      from the top, reaches layer ``t`` travelling horizontally (``mu = 0``) and leaves outwards along the same line.
-      These carry the directions near the local horizon, including, high up, those that pass through the limb instead
-      of hitting the planet.
-
-    The optical depth between two neighbouring layer centres along a ray is the ray's path through the upper half of
-    the lower layer and the lower half of the upper layer, each weighted by that layer's opacity per unit length
-    (``dtau / dz``, constant within a layer as in the radial optical depth and :func:`tiramisu.eclipse.slant_tau`).
-    Written as ``seg_a[l] * dtau[l - 1] + seg_b[l] * dtau[l]``; in the plane-parallel limit
-    ``seg_a = seg_b = 1 / (2 mu)``.
-
-    Mean intensities use trapezoidal weights in ``mu`` over the rays reaching each layer, from the central ray
-    (``mu = 1``) down to the most horizontal one; where that is not the layer's own tangent ray (``tangent_stride >
-    1``), its weight also covers the remaining interval down to ``mu = 0``.
-
-    Parameters
-    ----------
-    interface_radii : Quantity, shape (n_layers + 1,)
-        Radii of the layer interfaces, bottom first. Layer centres are taken halfway between.
-    n_core : int
-        Number of core rays besides the central one. The tangent rays already resolve the near-horizontal directions,
-        so few are needed: for KELT-20b (80-100 layers), 12 give J to 0.2% (95th percentile) and 0.4% (max) of a
-        converged solution, 8 to 0.4% / 0.9%. Atmospheres much thinner relative to the planet's radius spread the
-        tangent rays over a narrower range of mu, and may need more.
-    tangent_stride : int
-        Keep a tangent ray at every ``tangent_stride``-th layer (always including the top layer). Every layer's own
-        tangent ray matters: a stride of 2 already raises the error in J to ~0.5% (95th) / 2% (max).
-    """
-    radii_int = interface_radii.to_value(u.m)
-    radii = 0.5 * (radii_int[:-1] + radii_int[1:])
-    dz = np.diff(radii_int)
-    n_layers = radii.size
-    mu_core, _ = mu_quadrature(n_core)
-    tangent_layers = np.arange(n_layers - 1, -1, -tangent_stride)[::-1]
-    p = np.concatenate(([0.0], radii[0] * np.sqrt(1 - mu_core ** 2), radii[tangent_layers]))
-    tangent_layer = np.concatenate((np.full(n_core + 1, -1), tangent_layers)).astype(np.int64)
-
-    present = radii[:, None] >= p[None, :]
-    # Path coordinate along the ray from its closest approach to the centre; (r - p)(r + p) avoids cancellation.
-    z = np.sqrt(np.clip((radii[:, None] - p) * (radii[:, None] + p), 0, None)) * present
-    z_int = np.sqrt(np.clip((radii_int[:, None] - p) * (radii_int[:, None] + p), 0, None))
-    # Path from centre l-1 up to interface l, and from interface l up to centre l, each as (R^2 - r^2) / (z_R + z_r).
-    seg_a = np.zeros((n_layers, p.size))
-    seg_b = np.zeros((n_layers, p.size))
-    reaches = present[:-1]
-    r_lo, r_int, r_hi = radii[:-1, None], radii_int[1:-1, None], radii[1:, None]
-    with np.errstate(divide="ignore", invalid="ignore"):
-        seg_a[1:] = np.where(reaches, (r_int - r_lo) * (r_int + r_lo) / (z_int[1:-1] + z[:-1]) / dz[:-1, None], 0.0)
-        seg_b[1:] = np.where(reaches, (r_hi - r_int) * (r_hi + r_int) / (z[1:] + z_int[1:-1]) / dz[1:, None], 0.0)
-
-    mu = z / radii[:, None]
-    weights = np.zeros_like(mu)
-    for layer_idx in range(n_layers):
-        idx = np.flatnonzero(present[layer_idx])
-        order = idx[np.argsort(mu[layer_idx, idx])]
-        d_mu = np.diff(mu[layer_idx, order])
-        weights[layer_idx, order[:-1]] += 0.5 * d_mu
-        weights[layer_idx, order[1:]] += 0.5 * d_mu
-        weights[layer_idx, order[0]] += mu[layer_idx, order[0]]  # flat down to mu = 0 without an own tangent ray
-    return SphericalRays(impact_parameter=p, tangent_layer=tangent_layer, seg_a=seg_a, seg_b=seg_b, mu=mu,
-                         weights=weights)
-
-
-@numba.njit(cache=True, error_model="numpy", inline="always")
-def _ray_dtau(
-        dtau: npt.NDArray[np.float64], seg_a: npt.NDArray[np.float64], seg_b: npt.NDArray[np.float64],
-        point: int, ray: int, k: int,
-) -> float:
-    """Optical depth along ``ray`` between the layer centres ``point - 1`` and ``point``."""
-    return seg_a[point, ray] * dtau[point - 1, k] + seg_b[point, ray] * dtau[point, k]
-
-
-@numba.njit(cache=True, error_model="numpy", inline="always")
-def _ray_source_derivative(
-        source_function_matrix: npt.NDArray[np.float64], dtau: npt.NDArray[np.float64],
-        seg_a: npt.NDArray[np.float64], seg_b: npt.NDArray[np.float64], tangent: int,
-        point: int, ray: int, k: int, inward: bool, seed: int,
-) -> t.Tuple[float, float, float]:
-    """
-    Source-function derivative at ``point`` along ``ray``, as in :func:`_compute_control_points_outward` (``inward``
-    False) and :func:`_compute_control_points_inward` (True), with the ray's own optical depths. Zero at the ray's ends
-    and at its tangent point, where the ray is symmetric about its closest approach.
-
-    Also returns its derivatives with respect to ``source_function_matrix[seed, k]`` for S[seed] increasing and
-    decreasing (forward-mode, through the same branches), for the exact Lambda*. They differ only at a kink of the
-    limiter, where one slope is exactly zero (next to a flat stretch of S, e.g. isothermal LTE layers).
-    """
-    n_layers = source_function_matrix.shape[0]
-    if point < 1 or point > n_layers - 2 or point <= tangent:
-        return 0.0, 0.0, 0.0
-    dtau_lo = _ray_dtau(dtau, seg_a, seg_b, point, ray, k)
-    dtau_hi = _ray_dtau(dtau, seg_a, seg_b, point + 1, ray, k)
-    if (dtau_lo if inward else dtau_hi) == 0:
-        return 0.0, 0.0, 0.0
-    s_lo, s_here, s_hi = (source_function_matrix[point - 1, k], source_function_matrix[point, k],
-                          source_function_matrix[point + 1, k])
-    slope_lo = (s_lo - s_here) / dtau_lo if dtau_lo != 0 else 0.0
-    slope_hi = (s_here - s_hi) / dtau_hi if dtau_hi != 0 else 0.0
-    total = dtau_lo + dtau_hi
-    if total != 0:
-        zeta = (1 + (dtau_hi if inward else dtau_lo) / total) / 3
-    else:
-        zeta = 1.0 / 3.0
-    numerator = slope_lo * slope_hi
-    denominator = zeta * slope_hi + (1 - zeta) * slope_lo if inward else zeta * slope_lo + (1 - zeta) * slope_hi
-    if numerator < 0 or denominator == 0:
-        return 0.0, 0.0, 0.0
-    value = numerator / denominator
-    if seed < point - 1 or seed > point + 1:  # S[seed] is not in the stencil (seed = -1: the value only)
-        return value, 0.0, 0.0
-    # d/dS[seed] of s_lo, s_here, s_hi.
-    ds_lo = 1.0 if seed == point - 1 else 0.0
-    ds_here = 1.0 if seed == point else 0.0
-    ds_hi = 1.0 if seed == point + 1 else 0.0
-    d_slope_lo = (ds_lo - ds_here) / dtau_lo if dtau_lo != 0 else 0.0
-    d_slope_hi = (ds_here - ds_hi) / dtau_hi if dtau_hi != 0 else 0.0
-    d_numerator = d_slope_lo * slope_hi + slope_lo * d_slope_hi
-    if inward:
-        d_denominator = zeta * d_slope_hi + (1 - zeta) * d_slope_lo
-    else:
-        d_denominator = zeta * d_slope_lo + (1 - zeta) * d_slope_hi
-    d_value = (d_numerator - value * d_denominator) / denominator
-    if numerator > 0:
-        return value, d_value, d_value
-    # A kink: the formula holds on the side where the numerator turns positive, S' = 0 on the other.
-    return value, d_value if d_numerator > 0 else 0.0, d_value if d_numerator < 0 else 0.0
-
-
-@numba.njit(cache=True, error_model="numpy", inline="always")
-def _above(x: float, dx: float, y: float, dy: float, step: float) -> bool:
-    """Is x above y after a small change of S[seed] of sign ``step``, x and y changing at rates dx and dy?"""
-    return x > y or (x == y and step * (dx - dy) > 0)
-
-
-@numba.njit(cache=True, error_model="numpy", inline="always")
-def _clip_rate(value: float, d_value: float, s_a: float, ds_a: float, s_b: float, ds_b: float, step: float) -> float:
-    """One-sided derivative of ``max(min(value, max(s_a, s_b)), min(s_a, s_b))`` for a change of S[seed] of sign
-    ``step``: a clipped value is an end point's S, and ties go the way the values move."""
-    lo, d_lo, hi, d_hi = (s_b, ds_b, s_a, ds_a) if _above(s_a, ds_a, s_b, ds_b, step) else (s_a, ds_a, s_b, ds_b)
-    if _above(value, d_value, hi, d_hi, step):
-        return d_hi
-    if _above(lo, d_lo, value, d_value, step):
-        return d_lo
-    return d_value
-
-
-@numba.njit(cache=True, error_model="numpy", inline="always")
-def _control_point_rates(
-        control: float, d_up: float, d_down: float, dtau_next: float,
-) -> t.Tuple[float, float]:
-    """The non-negativity clamp of a control point (where ``dtau_next > 0``), with its one-sided derivatives; returns
-    the control point and the mean of those, the Lambda* derivative (a central difference, at a kink)."""
-    if dtau_next > 0:
-        if _above(0.0, 0.0, control, d_up, 1.0):
-            d_up = 0.0
-        if _above(0.0, 0.0, control, d_down, -1.0):
-            d_down = 0.0
-        if control < 0:
-            control = 0.0
-    return control, 0.5 * (d_up + d_down)
-
-
-@numba.njit(cache=True, error_model="numpy", inline="always")
-def _ray_control_point_inward(
-        source_function_matrix: npt.NDArray[np.float64], dtau: npt.NDArray[np.float64],
-        seg_a: npt.NDArray[np.float64], seg_b: npt.NDArray[np.float64], tangent: int,
-        layer_idx: int, ray: int, k: int, seed: int = -1,
-) -> t.Tuple[float, float]:
-    """
-    Inward control point of the segment from centre ``layer_idx + 1`` to ``layer_idx`` (see
-    :func:`_compute_control_points_inward`), and its derivative with respect to ``source_function_matrix[seed, k]``:
-    the mean of the one-sided ones, which differ only at a kink (a tie of S, a clip or the clamp).
-    """
-    n_layers = source_function_matrix.shape[0]
-    dtau_seg = _ray_dtau(dtau, seg_a, seg_b, layer_idx + 1, ray, k)
-    s_here, s_hi = source_function_matrix[layer_idx, k], source_function_matrix[layer_idx + 1, k]
-    ds_here, ds_hi = (1.0 if seed == layer_idx else 0.0), (1.0 if seed == layer_idx + 1 else 0.0)
-    deriv_0, d_up_0, d_down_0 = _ray_source_derivative(
-        source_function_matrix, dtau, seg_a, seg_b, tangent, layer_idx, ray, k, True, seed)
-    deriv_1, d_up_1, d_down_1 = _ray_source_derivative(
-        source_function_matrix, dtau, seg_a, seg_b, tangent, layer_idx + 1, ray, k, True, seed)
-    control_0 = s_here - 0.5 * dtau_seg * deriv_0
-    control_1 = s_hi + 0.5 * dtau_seg * deriv_1
-    s_min, s_max = min(s_here, s_hi), max(s_here, s_hi)
-    if seed < layer_idx - 1 or seed > layer_idx + 2:  # S[seed] is not in the stencil: the value only
-        control_0 = max(min(control_0, s_max), s_min)
-        control_1 = max(min(control_1, s_max), s_min)
-        control = control_1 if layer_idx == n_layers - 2 else 0.5 * (control_0 + control_1)
-        return _control_point_rates(control, 0.0, 0.0, _inward_clamp_dtau(dtau, seg_a, seg_b, tangent, layer_idx,
-                                                                          ray, k, dtau_seg))
-    up_0 = _clip_rate(control_0, ds_here - 0.5 * dtau_seg * d_up_0, s_here, ds_here, s_hi, ds_hi, 1.0)
-    up_1 = _clip_rate(control_1, ds_hi + 0.5 * dtau_seg * d_up_1, s_here, ds_here, s_hi, ds_hi, 1.0)
-    down_0 = _clip_rate(control_0, ds_here - 0.5 * dtau_seg * d_down_0, s_here, ds_here, s_hi, ds_hi, -1.0)
-    down_1 = _clip_rate(control_1, ds_hi + 0.5 * dtau_seg * d_down_1, s_here, ds_here, s_hi, ds_hi, -1.0)
-    control_0 = max(min(control_0, s_max), s_min)
-    control_1 = max(min(control_1, s_max), s_min)
-    if layer_idx == n_layers - 2:
-        control, d_up, d_down = control_1, up_1, down_1
-    else:
-        control, d_up, d_down = 0.5 * (control_0 + control_1), 0.5 * (up_0 + up_1), 0.5 * (down_0 + down_1)
-    return _control_point_rates(control, d_up, d_down, _inward_clamp_dtau(dtau, seg_a, seg_b, tangent, layer_idx, ray,
-                                                                          k, dtau_seg))
-
-
-@numba.njit(cache=True, error_model="numpy", inline="always")
-def _inward_clamp_dtau(
-        dtau: npt.NDArray[np.float64], seg_a: npt.NDArray[np.float64], seg_b: npt.NDArray[np.float64], tangent: int,
-        layer_idx: int, ray: int, k: int, dtau_seg: float,
-) -> float:
-    """The step the inward non-negativity clamp tests, as in the plane-parallel kernel: the ray's next segment
-    (mirrored at a tangent point)."""
-    if layer_idx == tangent:
-        return dtau_seg
-    if layer_idx > 0:
-        return _ray_dtau(dtau, seg_a, seg_b, layer_idx, ray, k)
-    return 0.0
-
-
-@numba.njit(cache=True, error_model="numpy", inline="always")
-def _ray_control_point_outward(
-        source_function_matrix: npt.NDArray[np.float64], dtau: npt.NDArray[np.float64],
-        seg_a: npt.NDArray[np.float64], seg_b: npt.NDArray[np.float64], tangent: int,
-        layer_idx: int, ray: int, k: int, seed: int = -1,
-) -> t.Tuple[float, float]:
-    """Outward control point of the segment from centre ``layer_idx - 1`` to ``layer_idx`` (see
-    :func:`_compute_control_points_outward`), and its derivative; see :func:`_ray_control_point_inward`."""
-    dtau_seg = _ray_dtau(dtau, seg_a, seg_b, layer_idx, ray, k)
-    s_lo, s_here = source_function_matrix[layer_idx - 1, k], source_function_matrix[layer_idx, k]
-    ds_lo, ds_here = (1.0 if seed == layer_idx - 1 else 0.0), (1.0 if seed == layer_idx else 0.0)
-    deriv_0, d_up_0, d_down_0 = _ray_source_derivative(
-        source_function_matrix, dtau, seg_a, seg_b, tangent, layer_idx, ray, k, False, seed)
-    deriv_1, d_up_1, d_down_1 = _ray_source_derivative(
-        source_function_matrix, dtau, seg_a, seg_b, tangent, layer_idx - 1, ray, k, False, seed)
-    control_0 = s_here + 0.5 * dtau_seg * deriv_0
-    control_1 = s_lo - 0.5 * dtau_seg * deriv_1
-    s_min, s_max = min(s_lo, s_here), max(s_lo, s_here)
-    if seed < layer_idx - 2 or seed > layer_idx + 1:  # S[seed] is not in the stencil: the value only
-        control_0 = max(min(control_0, s_max), s_min)
-        control_1 = max(min(control_1, s_max), s_min)
-        control = control_1 if layer_idx == 1 and tangent < 0 else 0.5 * (control_0 + control_1)
-        return _control_point_rates(control, 0.0, 0.0, dtau_seg)
-    up_0 = _clip_rate(control_0, ds_here + 0.5 * dtau_seg * d_up_0, s_lo, ds_lo, s_here, ds_here, 1.0)
-    up_1 = _clip_rate(control_1, ds_lo - 0.5 * dtau_seg * d_up_1, s_lo, ds_lo, s_here, ds_here, 1.0)
-    down_0 = _clip_rate(control_0, ds_here + 0.5 * dtau_seg * d_down_0, s_lo, ds_lo, s_here, ds_here, -1.0)
-    down_1 = _clip_rate(control_1, ds_lo - 0.5 * dtau_seg * d_down_1, s_lo, ds_lo, s_here, ds_here, -1.0)
-    control_0 = max(min(control_0, s_max), s_min)
-    control_1 = max(min(control_1, s_max), s_min)
-    # The first segment above the BOA has no derivative below it; a tangent point's (zero) derivative is known.
-    if layer_idx == 1 and tangent < 0:
-        control, d_up, d_down = control_1, up_1, down_1
-    else:
-        control, d_up, d_down = 0.5 * (control_0 + control_1), 0.5 * (up_0 + up_1), 0.5 * (down_0 + down_1)
-    return _control_point_rates(control, d_up, d_down, dtau_seg)
-
-
-@numba.njit(cache=True, error_model="numpy", inline="always")
-def _ray_inward_step(
-        i_in_matrix: npt.NDArray[np.float64], dtau: npt.NDArray[np.float64],
-        seg_a: npt.NDArray[np.float64], seg_b: npt.NDArray[np.float64],
-        source_function_matrix: npt.NDArray[np.float64], tangent: int, layer_idx: int, ray: int, k: int,
-        with_lambda: bool,
-) -> t.Tuple[float, float]:
-    """
-    Inward Bezier step along ``ray`` from centre ``layer_idx + 1`` to ``layer_idx``: the intensity arriving at
-    ``layer_idx`` and its exact derivative with respect to ``S[layer_idx]`` (notes/lambda_star.tex, Sec. 5). Two
-    steps depend on that S: this one (``alpha S_l + gamma C_l``) and the one into ``layer_idx + 1``, whose control
-    point uses S_l through the source-function derivative at ``layer_idx + 1``, attenuated by this step (skipped where
-    that attenuation is exactly zero). Without ``with_lambda`` the derivative is 0.
-    """
-    n_layers = source_function_matrix.shape[0]
-    exp_next, alpha_next, beta_next, gamma_next = _bezier_terms(_ray_dtau(dtau, seg_a, seg_b, layer_idx + 1, ray, k))
-    control_in, d_control_in = _ray_control_point_inward(
-        source_function_matrix, dtau, seg_a, seg_b, tangent, layer_idx, ray, k, layer_idx if with_lambda else -1)
-    intensity = (
-            i_in_matrix[layer_idx + 1, ray, k] * exp_next
-            + alpha_next * source_function_matrix[layer_idx, k]
-            + beta_next * source_function_matrix[layer_idx + 1, k]
-            + gamma_next * control_in
-    )
-    if not with_lambda:
-        return intensity, 0.0
-    d_intensity = alpha_next + gamma_next * d_control_in
-    if layer_idx + 2 < n_layers and exp_next > 0:
-        gamma_prev = _bezier_terms(_ray_dtau(dtau, seg_a, seg_b, layer_idx + 2, ray, k))[3]
-        d_intensity += exp_next * gamma_prev * _ray_control_point_inward(
-            source_function_matrix, dtau, seg_a, seg_b, tangent, layer_idx + 1, ray, k, layer_idx)[1]
-    return intensity, d_intensity
-
-
-@numba.njit(parallel=True, cache=True, error_model="numpy")
-def update_inward_layer_spherical(
-        layer_idx: int,
-        i_in_matrix: npt.NDArray[np.float64],
-        lambda_in_layer: npt.NDArray[np.float64],
-        dtau: npt.NDArray[np.float64],
-        seg_a: npt.NDArray[np.float64],
-        seg_b: npt.NDArray[np.float64],
-        tangent_layer: npt.NDArray[np.int64],
-        source_function_matrix: npt.NDArray[np.float64],
-        with_lambda: bool = True,
-) -> None:
-    """
-    :func:`update_inward_layer` along spherical rays (:func:`spherical_rays`): the same Bezier short-characteristics
-    step from centre ``layer_idx + 1`` to ``layer_idx``, with the ray's own optical depth and control points in place
-    of the plane-parallel ``delta_tau / mu``. ``i_in_matrix`` has shape (n_layers, n_rays, n_grid) and
-    ``lambda_in_layer`` (n_rays, n_grid); rays that do not reach ``layer_idx`` are left untouched (zero).
-    """
-    n_rays, n_grid = i_in_matrix.shape[1], i_in_matrix.shape[2]
-    for k in numba.prange(n_grid):
-        for j in range(n_rays):
-            tangent = tangent_layer[j]
-            if tangent > layer_idx:
-                continue
-            intensity, d_intensity = _ray_inward_step(
-                i_in_matrix, dtau, seg_a, seg_b, source_function_matrix, tangent, layer_idx, j, k, with_lambda)
-            i_in_matrix[layer_idx, j, k] = intensity
-            if with_lambda:
-                lambda_in_layer[j, k] = d_intensity
-
-
-@numba.njit(parallel=True, cache=True, error_model="numpy")
-def update_outward_layer_spherical(
-        layer_idx: int,
-        i_out_below: npt.NDArray[np.float64],
-        i_out_layer: npt.NDArray[np.float64],
-        lambda_out_layer: npt.NDArray[np.float64],
-        sigma_below: npt.NDArray[np.float64],
-        sigma_layer: npt.NDArray[np.float64],
-        lambda_in_layer: npt.NDArray[np.float64],
-        i_in_matrix: npt.NDArray[np.float64],
-        dtau: npt.NDArray[np.float64],
-        seg_a: npt.NDArray[np.float64],
-        seg_b: npt.NDArray[np.float64],
-        tangent_layer: npt.NDArray[np.int64],
-        source_function_matrix: npt.NDArray[np.float64],
-        with_lambda: bool = True,
-) -> None:
-    """
-    :func:`update_outward_layer` along spherical rays: the Bezier step from centre ``layer_idx - 1`` (``i_out_below``)
-    to ``layer_idx`` (``i_out_layer``, ``lambda_out_layer``; all (n_rays, n_grid)). A ray tangent to ``layer_idx``
-    turns there: its outward intensity is the inward step arriving at the tangent point, recomputed from the current
-    source function and ``i_in_matrix``. Rays hitting the BOA (``tangent_layer < 0``) are skipped at ``layer_idx == 0``,
-    where the caller sets their boundary intensity.
-
-    ``lambda_out_layer`` is the exact dI_out / dS[layer_idx] per ray (notes/lambda_star.tex, Sec. 5). A tangent ray
-    crosses the layer on its way in as well, so S[layer_idx] also reaches the outward crossing through the inward steps
-    near the inward crossing, attenuated by the optical path down to the turning point and back. This needs
-    ``lambda_in_layer``, this layer's inward Lambda* from :func:`update_inward_layer_spherical` with the same source
-    function (zero at the top layer), and ``sigma_below``, each ray's optical path from its turning point up to
-    ``layer_idx - 1``; the path up to ``layer_idx`` is written to ``sigma_layer``, which the caller swaps with
-    ``sigma_below`` along with ``i_out_below``/``i_out_layer``, and must be kept up to date in every call; without
-    ``with_lambda`` (Lambda* not used), ``lambda_in_layer`` may hold anything and ``lambda_out_layer`` is left alone.
-    """
-    n_layers = source_function_matrix.shape[0]
-    n_rays, n_grid = i_out_layer.shape
-    for k in numba.prange(n_grid):
-        for j in range(n_rays):
-            tangent = tangent_layer[j]
-            if tangent > layer_idx:
-                continue
-            if tangent == layer_idx:
-                sigma_layer[j, k] = 0.0
-                if layer_idx == n_layers - 1:
-                    # Grazes the top point only: the incident intensity, with no local contribution.
-                    i_out_layer[j, k] = i_in_matrix[layer_idx, j, k]
-                    lambda_out_layer[j, k] = 0.0
-                else:
-                    intensity, d_intensity = _ray_inward_step(
-                        i_in_matrix, dtau, seg_a, seg_b, source_function_matrix, tangent, layer_idx, j, k, with_lambda)
-                    i_out_layer[j, k] = intensity
-                    if with_lambda:
-                        lambda_out_layer[j, k] = d_intensity
-                continue
-            if layer_idx == 0:
-                continue
-            dtau_here = _ray_dtau(dtau, seg_a, seg_b, layer_idx, j, k)
-            exp_here, alpha_here, beta_here, gamma_here = _bezier_terms(dtau_here)
-            control_out, d_control_out = _ray_control_point_outward(
-                source_function_matrix, dtau, seg_a, seg_b, tangent, layer_idx, j, k, layer_idx if with_lambda else -1)
-            i_out_layer[j, k] = (
-                    i_out_below[j, k] * exp_here
-                    + alpha_here * source_function_matrix[layer_idx, k]
-                    + beta_here * source_function_matrix[layer_idx - 1, k]
-                    + gamma_here * control_out
-            )
-            if tangent >= 0:
-                sigma_prev = sigma_below[j, k]
-                sigma_here = sigma_prev + dtau_here
-                sigma_layer[j, k] = sigma_here
-            if not with_lambda:
-                continue
-            # Terms attenuated to exactly zero are skipped (their derivatives are finite, so this changes nothing).
-            d_intensity = alpha_here + gamma_here * d_control_out
-            # The outward step into layer_idx - 1, if the ray's outward leg (from the BOA or the turning point) has one.
-            has_prev = layer_idx - 2 >= max(tangent, 0)
-            if has_prev:
-                dtau_prev = _ray_dtau(dtau, seg_a, seg_b, layer_idx - 1, j, k)
-                gamma_prev = _bezier_terms(dtau_prev)[3]
-                if exp_here > 0:
-                    d_intensity += exp_here * gamma_prev * _ray_control_point_outward(
-                        source_function_matrix, dtau, seg_a, seg_b, tangent, layer_idx - 1, j, k, layer_idx)[1]
-            if tangent >= 0:
-                # S[layer_idx] also acts on the way in, through the inward steps arriving at layer_idx + 1 ... layer_idx -
-                # 2, each attenuated down to the turning point and back up, exp(-(sigma(m) + sigma(layer_idx))). Those
-                # arriving at layer_idx + 1 and layer_idx make up the inward derivative at layer_idx, lambda_in_layer.
-                transmission = np.exp(-(sigma_prev + sigma_here))
-                if transmission > 0:
-                    d_q_prev = beta_here + gamma_here * _ray_control_point_inward(
-                        source_function_matrix, dtau, seg_a, seg_b, tangent, layer_idx - 1, j, k, layer_idx)[1]
-                    d_intensity += transmission * (exp_here * lambda_in_layer[j, k] + d_q_prev)
-                if has_prev:  # the inward step from layer_idx - 1 to layer_idx - 2
-                    sigma_prev_2 = sigma_prev - dtau_prev if layer_idx - 2 > tangent else 0.0
-                    transmission = np.exp(-(sigma_prev_2 + sigma_here))
-                    if transmission > 0:
-                        d_intensity += transmission * gamma_prev * _ray_control_point_inward(
-                            source_function_matrix, dtau, seg_a, seg_b, tangent, layer_idx - 2, j, k, layer_idx)[1]
-            lambda_out_layer[j, k] = d_intensity
-
-
-def four_pi_j_spherical(
-        dtau: npt.NDArray[np.float64],
-        source_function: u.Quantity,
-        rays: SphericalRays,
-        incident_radiation_field: t.Optional[u.Quantity] = None,
-        bottom_intensity: t.Optional[u.Quantity] = None,
-) -> t.Tuple[u.Quantity, u.Quantity]:
-    """
-    Outward and inward hemispheres' contributions to 4*pi*J at each layer centre, for a fixed source function, along
-    spherical rays (one inward then one outward Bezier sweep, as in the NLTE Gauss-Seidel iteration without population
-    updates). The spherical counterpart of :func:`four_pi_j_hemispheres`, whose values are at interfaces instead.
-
-    Parameters
-    ----------
-    dtau : ndarray, shape (n_layers, n_wn)
-        Optical thickness of each layer, bottom first.
-    source_function : Quantity, shape (n_layers, n_wn)
-    rays : SphericalRays
-    incident_radiation_field : Quantity, shape (n_wn,) or (n_rays, n_wn), optional
-        Downward specific intensity entering at the top along each ray; zero if omitted.
-    bottom_intensity : Quantity, shape (n_wn,), optional
-        Outward intensity at the bottom layer centre for rays hitting the BOA; defaults to the bottom source function.
-    """
-    unit = source_function.unit
-    source = np.ascontiguousarray(source_function.to_value(unit))
-    n_layers, n_grid = source.shape
-    layer_shape = (rays.impact_parameter.size, n_grid)
-    i_in = np.zeros((n_layers, *layer_shape))
-    lam_in, lam_out, i_out_below, i_out_layer, sigma_below, sigma_layer = (np.zeros(layer_shape) for _ in range(6))
-    if incident_radiation_field is not None:
-        i_in[-1] = incident_radiation_field.to_value(unit)
-    for layer_idx in range(n_layers - 2, -1, -1):
-        update_inward_layer_spherical(
-            layer_idx=layer_idx, i_in_matrix=i_in, lambda_in_layer=lam_in, dtau=dtau, seg_a=rays.seg_a,
-            seg_b=rays.seg_b, tangent_layer=rays.tangent_layer, source_function_matrix=source, with_lambda=False,
-        )
-    four_pi_j_out = np.zeros((n_layers, n_grid))
-    i_out_layer[rays.tangent_layer < 0] = source[0] if bottom_intensity is None else bottom_intensity.to_value(unit)
-    for layer_idx in range(n_layers):
-        if layer_idx > 0:
-            i_out_below, i_out_layer = i_out_layer, i_out_below
-            sigma_below, sigma_layer = sigma_layer, sigma_below
-        update_outward_layer_spherical(
-            layer_idx=layer_idx, i_out_below=i_out_below, i_out_layer=i_out_layer, lambda_out_layer=lam_out,
-            sigma_below=sigma_below, sigma_layer=sigma_layer, lambda_in_layer=lam_in, i_in_matrix=i_in, dtau=dtau,
-            seg_a=rays.seg_a, seg_b=rays.seg_b, tangent_layer=rays.tangent_layer, source_function_matrix=source,
-            with_lambda=False,
-        )
-        four_pi_j_out[layer_idx] = rays.weights[layer_idx] @ i_out_layer
-    four_pi = 2 * np.pi * u.sr * unit
-    return four_pi_j_out * four_pi, np.einsum("lj,ljk->lk", rays.weights, i_in) * four_pi
-
-def blackbody(spectral_grid: u.Quantity, temperature: u.Quantity) -> u.Quantity:
-    freq_grid = spectral_grid.to(u.Hz, equivalencies=u.spectral())
-    temperature = np.atleast_1d(temperature)[:, None]
-    return (ac_2_h_on_c_sq * freq_grid ** 3) / (np.exp(ac_h_on_kB * freq_grid / temperature) - 1) / u.sr
-
-
-def incident_srf(
-        star_temperature: float, star_logg: float, star_feh: float, wn_grid: u.Quantity, star_alpha: float = 0.0
-) -> u.Quantity:
-    """
-    Returns the disk-averaged specific intensity of the stellar surface (no limb darkening), I = F_s / pi, binned onto
-    wn_grid.
-
-    Specific intensity is conserved along a ray in vacuum, so this is also the intensity arriving at the planet from
-    within the stellar disk: it is a property of the star alone, independent of the orbital distance. The distance
-    only sets how much of the planet's sky the star covers, which is applied by :func:`incident_intensity`.
-
-    Parameters
-    ----------
-    star_temperature
-    star_logg
-    star_feh
-    wn_grid
-    star_alpha
-
-    Returns
-    -------
-        Stellar specific intensity [W / (m^2 Hz sr)].
-
-    """
-    srf_wavelength, srf_flux = get_spectrum(
-        teff=star_temperature,
-        logg=star_logg,
-        feh=star_feh,
-        alpha=star_alpha,
-        # source="synphot",
-        source="svo",
-        model_name="bt-settl-agss",
-        bounds_error=True,
-    )
-    # srf_flux is the stellar surface flux F_s, in erg / (Angstrom s cm^2)
-    srf_wn = srf_wavelength.to(1 / u.cm, equivalencies=u.spectral())
-
-    srf_flux_nu = srf_flux.to(
-        u.J / (u.s * u.m ** 2 * u.Hz),
-        equivalencies=u.spectral_density(srf_wavelength)
-    )
-
-    sort_idx = np.argsort(srf_wn)
-    srf_flux_binned = rebin_spectrum(
-        x_in=srf_wn[sort_idx].value,
-        y_in=srf_flux_nu[sort_idx].value,
-        new_centers=wn_grid.to_value(1 / u.cm),
-    ) << srf_flux_nu.unit
-    return (srf_flux_binned / (np.pi * u.sr)).to(u.W / (u.Hz * u.m ** 2 * u.sr))
-
-
-def mu_quadrature(n_mu: int = 50) -> t.Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-    """
-    Direction cosines and weights for every angular integral over one hemisphere: Gauss-Legendre nodes on (0, 1) with
-    weights summing to 1, so that J = 1/2 sum_i w_i (I_i^+ + I_i^-). Shared by the radiative-transfer solvers and
-    :func:`incident_intensity`, whose per-direction boundary must be built on the same nodes.
-    """
-    mu_values, mu_weights = np.polynomial.legendre.leggauss(n_mu)
-    return (mu_values + 1) * 0.5, mu_weights / 2
-
-
-def _stellar_ring_coverage(
-        mu: npt.NDArray[np.float64], mu0: npt.NDArray[np.float64], star_angular_radius: float
-) -> npt.NDArray[np.float64]:
-    """
-    Fraction of the ring of directions with zenith cosine ``mu`` (all azimuths) that lies inside the stellar disk, for
-    a star centred at zenith cosine ``mu0`` with angular radius ``star_angular_radius`` [rad]. Broadcasts ``mu``
-    against ``mu0``.
-
-    A direction at zenith angle psi and azimuth phi (measured from the star's azimuth) is inside the disk when its
-    angle to the disk centre is at most the angular radius theta: cos(psi) cos(psi0) + sin(psi) sin(psi0) cos(phi) >=
-    cos(theta). The covered azimuths are |phi| <= arccos(c), with c = (cos(theta) - cos(psi) cos(psi0)) /
-    (sin(psi) sin(psi0)), so the covered fraction of the ring is arccos(clip(c, -1, 1)) / pi. When either direction
-    is vertical the test reduces to |psi - psi0| <= theta.
-    """
-    sin_prod = np.sqrt(np.clip(1 - mu ** 2, 0, None) * np.clip(1 - mu0 ** 2, 0, None))
-    numerator = np.cos(star_angular_radius) - mu * mu0
-    vertical = sin_prod == 0
-    c = np.where(vertical, np.where(numerator <= 0, -1.0, 1.0), numerator / np.where(vertical, 1.0, sin_prod))
-    return np.arccos(np.clip(c, -1, 1)) / np.pi
-
-
-@dataclasses.dataclass(frozen=True, eq=False)
-class IncidentIntensity:
-    """
-    Stellar irradiation of the top of the atmosphere, built by :func:`incident_intensity` (see there for the physics).
-    Calling it on a solver's directions, ``field(mu_values=..., mu_weights=...)``, returns the downward specific
-    intensity on each, shape (n_mu, n_wn).
-    """
-    star_intensity: u.Quantity
-    star_radius: u.Quantity
-    orbital_radius: u.Quantity
-    location: t.Union[str, float] = "dayside"
-
-    def __call__(self, mu_values: npt.NDArray[np.float64], mu_weights: npt.NDArray[np.float64]) -> u.Quantity:
-        theta = float(np.arcsin((self.star_radius / self.orbital_radius).decompose().value))
-        location = self.location
-        if isinstance(location, str):
-            mu0_range = {"dayside": (0.0, 1.0), "planet_average": (-1.0, 1.0)}[location]
-            # Resolve the band of mu0 over which a ring is covered (width ~ theta) with ~20+ samples.
-            n_mu0 = int(max(2000, (mu0_range[1] - mu0_range[0]) * 20 / theta))
-            mu0 = mu0_range[0] + (np.arange(n_mu0) + 0.5) * (mu0_range[1] - mu0_range[0]) / n_mu0
-        else:
-            mu0 = np.array([float(location)])
-
-        # Ring coverage on the solver's nodes, averaged over the locations the column represents.
-        coverage = _stellar_ring_coverage(
-            mu=mu_values[:, None], mu0=mu0[None, :], star_angular_radius=theta
-        ).mean(axis=1)
-
-        # Exact target: integral of the coverage over mu in [0, 1], on the part of [0, 1] the disk can reach.
-        psi0 = np.arccos(np.clip(mu0, -1, 1))
-        mu_lo = np.clip(np.cos(np.minimum(psi0 + theta, np.pi)), 0, 1)
-        mu_hi = np.clip(np.cos(np.maximum(psi0 - theta, 0)), 0, 1)
-        x, wx = np.polynomial.legendre.leggauss(256)
-        mu_fine = mu_lo[None, :] + (x[:, None] + 1) * 0.5 * (mu_hi - mu_lo)[None, :]
-        visible = 0.5 * (mu_hi - mu_lo) * np.sum(
-            wx[:, None] * _stellar_ring_coverage(mu=mu_fine, mu0=mu0[None, :], star_angular_radius=theta), axis=0
-        )
-        target = visible.mean()
-
-        quadrature = np.sum(mu_weights * coverage)
-        if quadrature > 0:
-            coverage *= target / quadrature
-        elif target > 0:
-            nearest = np.argmin(np.abs(mu_values - np.clip(mu0.mean(), 0, 1)))
-            coverage = np.zeros_like(mu_values)
-            coverage[nearest] = target / mu_weights[nearest]
-        return coverage[:, None] * self.star_intensity[None, :]
-
-def incident_intensity(
-        star_intensity: u.Quantity,
-        star_radius: u.Quantity,
-        orbital_radius: u.Quantity,
-        location: t.Union[str, float] = "dayside",
-) -> IncidentIntensity:
-    """
-    The star's irradiation of the top of the atmosphere, as the ``incident_radiation_field`` of
-    :class:`tiramisu.xsec.XSecCollection` and :meth:`tiramisu.eclipse.ExoplanetEmission.compute_emission`. The solvers
-    evaluate it on their own directions (plane-parallel ``mu`` nodes or spherical rays), so the same object serves
-    either geometry; calling it, ``field(mu_values=..., mu_weights=...)``, gives the downward specific intensity on each
-    direction of that grid.
-
-    **What it represents.** The solvers are 1D and azimuthally symmetric: each ``mu`` node stands for the whole ring
-    of directions at that zenith cosine, seen from one point at the top of the column. The star is a disk of uniform
-    specific intensity ``star_intensity`` (:func:`incident_srf`) and angular radius theta = arcsin(R_star / a), so
-    the boundary value on a node is ``star_intensity`` times the fraction of that ring the disk covers
-    (:func:`_stellar_ring_coverage`); the part of the disk below the horizon is hidden by the planet.
-
-    **Why the distance enters here.** Specific intensity does not fall off with distance; the stellar radiation
-    reaching the planet does, because the disk covers less of the sky. That dilution is exactly the covered fraction
-    of the rings, so there is no separate (R_star / a)^2 factor: the mean intensity it produces at the top,
-    J = 1/2 sum_i w_i I_i, equals star_intensity * Omega_visible / (4 pi), which falls as (R_star / a)^2 through
-    theta.
-
-    **Locations.** The column stands for one of:
-
-    * ``"dayside"``: the area-average over the dayside. Area on a sphere is uniform in the stellar zenith cosine mu0,
-      so this is the ring coverage averaged over mu0 in (0, 1). For a small disk it is isotropic, with
-      I = (1 - cos theta) * star_intensity on every direction (J = Omega star_intensity / (4 pi), downward flux F_a / 2
-      with F_a = pi sin^2(theta) star_intensity the flux at the planet), the usual dayside redistribution f = 1/2.
-    * ``"planet_average"``: the same over the whole sphere, mu0 in (-1, 1); half the dayside value (f = 1/4). Every
-      disk direction is above the horizon on exactly one of any two antipodal points, so J is exactly
-      Omega star_intensity / (8 pi).
-    * a float mu0 in [-1, 1]: a single location with the disk centre at stellar zenith cosine mu0 (1 substellar, 0
-      terminator, < -sin(theta) no star). The attenuation below the top is plane-parallel, e^(-tau / mu), which
-      overestimates the path of grazing starlight: in a spherical atmosphere it is capped near
-      sqrt(pi R_p / (2 H)), so results for small mu0 (roughly below sqrt(2 H / R_p)) should not be trusted.
-
-    **Quadrature.** A narrow disk can fall between ``mu`` nodes, so the node values are rescaled so that
-    sum_i w_i I_i reproduces the exact J (the ring coverage integrated finely over mu). If no node lies inside the
-    disk (a distant star seen at one location), the whole J is put on the node closest to the disk centre.
-
-    Parameters
-    ----------
-    star_intensity : Quantity, shape (n_wn,)
-        Stellar surface specific intensity [W / (m^2 Hz sr)], from :func:`incident_srf`.
-    star_radius, orbital_radius : Quantity
-        Stellar radius and star-planet distance.
-    location : {"dayside", "planet_average"} or float
-        Region of the planet the column represents (see above).
-
-    Returns
-    -------
-    IncidentIntensity
-        Callable with ``(mu_values, mu_weights)`` (shape (n_mu,) each) returning a Quantity of shape (n_mu, n_wn), the
-        downward specific intensity on each direction at the top, in the units of ``star_intensity``.
-    """
-    return IncidentIntensity(
-        star_intensity=star_intensity, star_radius=star_radius, orbital_radius=orbital_radius, location=location,
-    )
-
 
 def boltzmann_population(states: pl.DataFrame, temperature: u.Quantity) -> pl.DataFrame:
     # TODO: This should be updated use implementations as elsewhere.
@@ -1752,357 +495,6 @@ def boltzmann_population(states: pl.DataFrame, temperature: u.Quantity) -> pl.Da
     return states.with_columns(pl.Series("q_lev", q_lev_np), pl.Series("n", n_np)).with_columns(
         pl.col("n").sum().over("id_agg").alias("n_agg")
     )
-
-
-@numba.njit(cache=True, error_model="numpy")
-def calc_ev_grid(wn_grid: npt.NDArray[np.float64], temperature: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
-    return (const_2_pi_h_c_sq_on_sigma_sba * wn_grid ** 3) / (
-            temperature ** 4 * (np.exp(const_h_c_on_kB * wn_grid / temperature) - 1)
-    )
-
-
-@numba.njit(cache=True, error_model="numpy", inline="always")
-def _sample_indices(
-        ev_cdf: npt.NDArray[np.float64],
-        temp_wn_grid: npt.NDArray[np.float64],
-        num_points: int,
-        max_step: float
-):
-    """
-    Finds the indices in the energy density cumulative distribution function (CDF) such that the energy density is uniform.
-    This is done by determining a uniform step size through the CDF based on the number of steps and ensuring the
-    difference in the cumulative CDF between each point does not exceed this step size. An additional constraint is
-    imposed such that the step size on the wavenumber grid also cannot exceed a maximum value. As such the number of
-    points requested by the function is the lower bound on theh number of points returned.
-
-    Parameters
-    ----------
-    ev_cdf: ndarray
-        Energy density cumulative distribution function.
-    temp_wn_grid: ndarray
-        Temporary high-resolution wavenumber grid (with linear spacing).
-    num_points: int
-        Lower bound on the number of indices to return to sample the CDF.
-    max_step: float
-        Maximum step size along the wavenumber grid between each successive index.
-
-    Returns
-    -------
-        Integer indices corresponding to the uniform sampling points in the CDF.
-
-    """
-    num_cdf_points = len(ev_cdf)
-    sample_idxs = [0]
-    current_idx = 0
-    step_size = 1.0 / num_points
-
-    while current_idx < num_cdf_points - 1:
-        next_step = ev_cdf[current_idx] + step_size
-        next_step_idx = np.searchsorted(ev_cdf, next_step) - 1
-        next_step_idx = min(max(next_step_idx, current_idx + 1), num_cdf_points - 1)
-
-        current_wn_val = temp_wn_grid[current_idx]
-        next_wn_val = temp_wn_grid[next_step_idx]
-
-        if max_step > 0.0 and (next_wn_val - current_wn_val) > max_step:
-            seek_wn_val = current_wn_val + max_step
-            seek_idx = np.searchsorted(temp_wn_grid, seek_wn_val) - 1
-            current_idx = min(seek_idx, num_cdf_points - 1)
-        elif next_step_idx >= num_cdf_points - 1:
-            current_idx = num_cdf_points - 1
-        else:
-            current_idx = next_step_idx
-        sample_idxs.append(current_idx)
-    return np.array(sample_idxs, dtype=np.int32)
-
-
-def cdf_opacity_sampling(
-        wn_start: float,
-        wn_end: float,
-        temperature_profile: npt.NDArray[np.float64],
-        num_points: int,
-        max_step: float,
-        num_cdf_points: int = 1000000,
-) -> u.Quantity:
-    temp_wn_grid = np.linspace(wn_start, wn_end, num_cdf_points, dtype=np.float64)
-    ev_grid = calc_ev_grid(wn_grid=temp_wn_grid, temperature=np.atleast_1d(temperature_profile)[:, None]).sum(axis=0)
-    temp_dx = np.diff(temp_wn_grid)
-    ev_norm = loglinear_normalise_1d_nonnegative(y_data=ev_grid, dx=temp_dx)
-
-    ev_cdf = cumulative_simpson(ev_norm, x=temp_wn_grid, initial=0)
-
-    sample_idxs = _sample_indices(ev_cdf, temp_wn_grid, num_points, max_step)
-
-    return temp_wn_grid[sample_idxs] / u.cm
-
-
-def _constant_s_step(
-        i_start: u.Quantity, dtau_layer: npt.NDArray[np.float64], source_layer: u.Quantity,
-        mu_values: npt.NDArray[np.float64],
-) -> u.Quantity:
-    """One layer of the constant-S formal solution along every direction: I e^(-dtau/mu) + S (1 - e^(-dtau/mu))."""
-    exp_term = np.exp(-dtau_layer / mu_values[:, None])
-    return i_start * exp_term + source_layer * (1 - exp_term)
-
-
-def four_pi_j_hemispheres(
-        dtau: u.Quantity,
-        source_function: u.Quantity,
-        mu_values: npt.NDArray[np.float64],
-        mu_weights: npt.NDArray[np.float64],
-        incident_radiation_field: u.Quantity = None,
-        surface_albedo: float = 0
-) -> t.Tuple[u.Quantity, u.Quantity]:
-    """
-    Solve the 1D plane–parallel radiative-transfer equation for a discretized atmosphere using the *formal solution* for
-    each direction cosine :math:`\\mu`.
-
-    This routine computes **upward** and **downward** specific intensities at every layer interface, then integrates
-    each hemisphere over solid angle to obtain its contribution to the angle-integrated mean intensity
-    :math:`4\\pi J`. These are **not** fluxes (no :math:`\\mu` weighting).
-
-    ----------------------------------------------------------------------
-    RADIATIVE-TRANSFER EQUATION
-    ----------------------------------------------------------------------
-
-    For a ray of direction cosine :math:`\\mu`, the monochromatic radiative-transfer equation in optical depth
-    :math:`\\tau` is
-
-    .. math::
-        \\mu \\frac{\\mathrm{d} I(\\tau,\\mu)}{\\mathrm{d}\\tau} = I(\\tau,\\mu) - S(\\tau),
-
-    where :math:`S(\\tau)` is the source function.
-
-    The *formal solution* between two optical-depth points :math:`\\tau_{k}` and :math:`\\tau_{k+1}` is:
-
-    .. math::
-        I(\\tau_k,\\mu)
-        = I(\\tau_{k+1},\\mu) \\, e^{-\\Delta\\tau/\\lvert\\mu\\rvert}
-        + S_{k} \\,\\left(1 - e^{-\\Delta\\tau/\\lvert\\mu\\rvert}\\right),
-
-    where :math:`\\Delta\\tau = \\tau_{k+1} - \\tau_{k}`.
-
-    This expression is used for **downward** (TOA to BOA) rays with :math:`\\mu > 0` and **upward** (BOA to TOA) rays
-    with :math:`\\mu < 0`.
-
-    ----------------------------------------------------------------------
-    NUMERICAL DISCRETIZATION
-    ----------------------------------------------------------------------
-
-    The atmosphere is divided into :math:`n_{\\mathrm{layers}}` layers. For each wavenumber :math:`\\tilde{\\nu}` the
-    inputs have shapes:
-
-    * :math:`\\Delta\\tau`: ``(n_layers, n_wn)`` optical-depth increment per layer.
-    * ``source_function``: ``(n_layers, n_wn)`` source function at each point.
-    * ``mu_values``: ``(n_mu,)`` direction cosines.
-    * ``mu_weights``: ``(n_mu,)`` quadrature weights.
-
-    Each layer's source function :math:`S_{k}` is its layer-centre value, held across the layer's full
-    :math:`\\Delta\\tau_{k}`. Intensities are stored at the **interfaces**, so the output arrays have dimension
-    ``n_layers + 1``; values at layer centres are the mean of the two bounding interfaces.
-
-    ----------------------------------------------------------------------
-    BOUNDARY CONDITIONS
-    ----------------------------------------------------------------------
-
-    * At the top of atmosphere (TOA):
-
-      .. math::
-         I^{-}_{n_{\\mathrm{layers}}}(\\mu>0) = I_{\\mathrm{incident}} \\text{(if given)}.
-
-    * At the bottom of the atmosphere (BOA):
-
-      If no surface reflection is treated explicitly, the upward intensity is set to the source function of the lowest
-      layer:
-
-      .. math::
-         I^{+}_{0}(\\mu<0) = S_{0}.
-
-    ----------------------------------------------------------------------
-    ANGULAR INTEGRATION
-    ----------------------------------------------------------------------
-
-    After computing intensities for each :math:`\\mu`, each hemisphere is integrated over solid angle:
-
-    .. math::
-        (4\\pi J)^{\\pm}(\\tilde{\\nu})
-        = 2\\pi \\int_{0}^{1} I^{\\pm}(\\mu) \\, \\mathrm{d}\\mu
-        \\approx 2\\pi \\sum_{i=1}^{n_{\\mu}} I^{\\pm}_i(\\tilde{\\nu}) \\, w_{i},
-
-    where :math:`w_{i}` are the angular quadrature weights on :math:`[0, 1]` (summing to 1), so that
-    :math:`(4\\pi J)^{+} + (4\\pi J)^{-} = 4\\pi J`. The hemispheric *fluxes* would instead need the extra cosine
-    factor, :math:`F^{\\pm} = 2\\pi \\sum_i I^{\\pm}_i \\mu_i w_i`, which this routine does not compute.
-
-    Parameters
-    ----------
-    dtau : Quantity, shape (n_layers, n_wn)
-        Optical-depth increment :math:`\\Delta\\tau_{j}(\\tilde{\\nu})` for each layer :math:`j` and wavenumber
-        :math:`\\tilde{\\nu}`.
-    source_function : Quantity, shape (n_layers, n_wn)
-        Source function :math:`S_{j}(\\tilde{\\nu})` per layer.
-    mu_values : ndarray, shape (n_mu,)
-        Direction cosines :math:`\\mu_{i}`.
-    mu_weights : ndarray, shape (n_mu,)
-        Angular quadrature weights :math:`w_{i}` corresponding to ``mu_values``.
-    incident_radiation_field : Quantity, shape (n_wn,) or (n_mu, n_wn), optional
-        Downward incident *specific intensity* at TOA, :math:`I^{-}(\\tau = 0, \\mu)`, applied to every downward
-        direction when given per wavenumber only; defaults to zero.
-    surface_albedo : float, optional
-        Surface albedo :math:`A \\in [0,1]`. If nonzero, reflection modifies the BOA upward intensity. (Current
-        implementation uses a simplified placeholder.)
-
-    Returns
-    -------
-    four_pi_j_up : Quantity, shape (n_layers + 1, n_wn)
-        Upward hemisphere's contribution to :math:`4\\pi J` at each interface:
-
-        .. math::
-            (4\\pi J)^{+}(\\tilde{\\nu}) = 2\\pi \\sum_{i} I^{+}_{i}(\\tilde{\\nu}) w_{i}.
-
-    four_pi_j_down : Quantity, shape (n_layers + 1, n_wn)
-        Downward hemisphere's contribution to :math:`4\\pi J` at each interface:
-
-        .. math::
-            (4\\pi J)^{-}(\\tilde{\\nu}) = 2\\pi \\sum_{i} I^{-}_{i}(\\tilde{\\nu}) w_{i}.
-    """
-    if surface_albedo < 0 or surface_albedo > 1:
-        log.warning(f"Surface albedo {surface_albedo} is outside of [0, 1], clipping.")
-        surface_albedo = np.clip(surface_albedo, 0, 1)
-
-    n_layers, n_wavelengths = dtau.shape
-
-    # Compute intensity at interfaces.
-    i_up = np.zeros((len(mu_values), n_layers + 1, n_wavelengths)) << source_function.unit
-    i_down = np.zeros((len(mu_values), n_layers + 1, n_wavelengths)) << source_function.unit
-
-    # Upper boundary condition at the top (level n_layers) is zero, unless incident radiation field!
-    if incident_radiation_field is not None:
-        i_down[:, n_layers, :] = incident_radiation_field
-    else:
-        i_down[:, n_layers, :] = 0.0 * source_function.unit
-
-    # Integrate from TOA (k=n_layers-1) down to BOA (k=0)
-    for k in range(n_layers - 1, -1, -1):
-        # Intensity at the bottom interface of each layer
-        i_down[:, k, :] = _constant_s_step(
-            i_start=i_down[:, k + 1, :], dtau_layer=dtau[k, :], source_layer=source_function[k, :], mu_values=mu_values
-        )
-
-    # Include an albedo for terrestrial planets?
-    # downward_flux = 2 * np.pi * (i_down[:, 0, :] * mu_values[:, None] * mu_weights[mu_weights > 0, None]).sum(axis=0)
-    # Reflected intensity is diffuse (same in all directions)
-    # reflected_intensity = surface_albedo * downward_flux / np.pi
-
-    # bb = blackbody(...)
-    # thermal_emission = bb(dtau.shape[1] * u.nm) # Wavelength version?
-    # thermal_emission = source_function[-1] * surface_emissivity # Placeholder for scaling?
-    # surface_emission = thermal_emission + reflected_intensity
-    surface_emission = source_function[0, :]  # USE THIS IN PROD!
-
-    # Lower boundary source function (black body) is surface upwards emission.
-    i_up[:, 0, :] = surface_emission
-
-    # Integrate from BOA (k=0) to TOA (k=n_layers-1)
-    for k in range(n_layers):
-        # Intensity at the top of the layer (level k+1)
-        i_up[:, k + 1, :] = _constant_s_step(
-            i_start=i_up[:, k, :], dtau_layer=dtau[k, :], source_layer=source_function[k, :], mu_values=mu_values
-        )
-
-    four_pi_j_up = 2 * np.pi * u.sr * np.sum(i_up * mu_weights[:, None, None], axis=0)
-    four_pi_j_down = 2 * np.pi * u.sr * np.sum(i_down * mu_weights[:, None, None], axis=0)
-
-    return four_pi_j_up, four_pi_j_down
-
-
-def emergent_flux(
-        dtau: npt.NDArray[np.float64],
-        source_function: u.Quantity,
-        mu_values: npt.NDArray[np.float64],
-        mu_weights: npt.NDArray[np.float64],
-) -> u.Quantity:
-    """
-    Emergent (upward) flux at the top of the atmosphere, the observable for an emission spectrum:
-
-    .. math::
-        F^{+}(\\tilde{\\nu}) = 2\\pi \\int_{0}^{1} I^{+}(\\mu) \\, \\mu \\, \\mathrm{d}\\mu
-        \\approx 2\\pi \\sum_{i} w_{i} \\, \\mu_{i} \\, I^{+}_{i}(\\tilde{\\nu}).
-
-    Uses the same constant-S upward solution, lower boundary (:math:`I^{+} = S_{0}`) and angular grid as
-    :func:`four_pi_j_hemispheres`, but keeps only the running intensity, so memory is ``O(n_mu * n_wn)``. For a
-    horizontally uniform planet, the flux received at distance :math:`d` is :math:`(R_p / d)^{2} F^{+}`: the integral
-    over directions at one point equals the integral of the emergent intensity over the visible disk.
-
-    Parameters
-    ----------
-    dtau : ndarray, shape (n_layers, n_wn)
-        Optical-depth increment per layer, bottom layer first.
-    source_function : Quantity, shape (n_layers, n_wn)
-        Layer-centre source function per layer.
-    mu_values : ndarray, shape (n_mu,)
-        Direction cosines on (0, 1].
-    mu_weights : ndarray, shape (n_mu,)
-        Quadrature weights on [0, 1] (summing to 1).
-
-    Returns
-    -------
-    flux_up : Quantity, shape (n_wn,)
-        Emergent flux :math:`F^{+}` at the top of the atmosphere [W / (m^2 Hz)].
-    """
-    i_up = np.ones((len(mu_values), 1)) * source_function[0]
-    for k in range(dtau.shape[0]):
-        i_up = _constant_s_step(i_start=i_up, dtau_layer=dtau[k], source_layer=source_function[k], mu_values=mu_values)
-    return (2 * np.pi * u.sr * np.sum((mu_weights * mu_values)[:, None] * i_up, axis=0)).to(u.W / (u.m ** 2 * u.Hz))
-
-
-def emergent_flux_spherical(
-        dtau: npt.NDArray[np.float64],
-        source_function: u.Quantity,
-        interface_radii: u.Quantity,
-        planet_radius: u.Quantity,
-        n_core: int = 50,
-) -> u.Quantity:
-    """
-    Emergent flux of a spherically symmetric atmosphere, normalised to ``planet_radius`` (R_p) so that it replaces
-    :func:`emergent_flux`: the flux received at distance d is (R_p / d)^2 times the returned value.
-
-    The disk seen by the observer is integrated over impact parameter p, F = (1 / R_p^2) int_0^R_top I(p) 2 pi p dp,
-    with ``I(p)`` the intensity leaving along the line of sight at ``p``. With R_0 the bottom radius
-    (``interface_radii[0]``), rays with ``p < R_0`` (Gauss-Legendre in ``p^2``) start at the planet (``I = S_0``, as in
-    :func:`emergent_flux`); rays with ``p > R_0``, one per shell at its ``p^2`` midpoint (the impact parameters of
-    :func:`tiramisu.eclipse.compute_transmission`), cross the far side of the limb from empty space and then the near
-    side, so the extended atmosphere's limb emission is included. Along each
-    ray, every shell is crossed with its opacity per unit length (``dtau / dz``) and constant source function, the
-    constant-S scheme of :func:`emergent_flux`. With ``R_p = R_0`` and ``R_0 -> infinity`` this reduces to
-    :func:`emergent_flux`.
-
-    Returns
-    -------
-    Quantity, shape (n_wn,)
-        Emergent flux [W / (m^2 Hz)], normalised to ``planet_radius``.
-    """
-    radii = interface_radii.to_value(u.m)
-    dz = np.diff(radii)
-    x, wx = np.polynomial.legendre.leggauss(n_core)
-    p_sq = np.concatenate((0.5 * (x + 1) * radii[0] ** 2, 0.5 * (radii[:-1] ** 2 + radii[1:] ** 2)))
-    d_p_sq = np.concatenate((0.5 * wx * radii[0] ** 2, np.diff(radii ** 2)))
-    core = np.arange(p_sq.size) < n_core
-    # Half-chord of each ray through each shell, (n_layers, n_rays).
-    half_chord = (np.sqrt(np.clip(radii[1:, None] ** 2 - p_sq, 0, None))
-                  - np.sqrt(np.clip(np.maximum(radii[:-1, None] ** 2, p_sq) - p_sq, 0, None)))
-    path_per_dz = half_chord / dz[:, None]
-
-    unit = source_function.unit
-    intensity = np.zeros((p_sq.size, dtau.shape[1])) << unit
-    for layer_idx in range(dtau.shape[0] - 1, -1, -1):  # far side of the limb, inwards
-        exp_term = np.exp(-dtau[layer_idx] * path_per_dz[layer_idx][:, None])
-        intensity = intensity * exp_term + source_function[layer_idx] * (1 - exp_term)
-    intensity[core] = source_function[0]
-    for layer_idx in range(dtau.shape[0]):  # near side, outwards
-        exp_term = np.exp(-dtau[layer_idx] * path_per_dz[layer_idx][:, None])
-        intensity = intensity * exp_term + source_function[layer_idx] * (1 - exp_term)
-    return (np.pi * u.sr * np.sum(d_p_sq[:, None] * intensity, axis=0) / planet_radius.to_value(u.m) ** 2).to(
-        u.W / (u.m ** 2 * u.Hz))
 
 
 _T = t.TypeVar("_T")
@@ -2280,7 +672,7 @@ class NLTEProcessor:
     agg_states = _Required[pl.DataFrame]()
     # Radiative rates between aggregates: band keys (n_rates, 2) as (id_agg_f, id_agg_i), sorted by id_agg_i then
     # id_agg_f, and per NLTE layer the population-weighted A_fi, B_fi, B_if (n_nlte_layers, n_rates, 3), see
-    # profiles._band_rate_sums. Layer-major, so each layer's slice is contiguous for _build_y_matrix_core.
+    # profiles.bands.band_rate_sums. Layer-major, so each layer's slice is contiguous for _build_y_matrix_core.
     rate_keys = _Required[npt.NDArray[np.int32]]()
     rates = _Required[npt.NDArray[np.float64]]()
     profile_store = _Required[ProfileStore]()
@@ -2512,7 +904,7 @@ class NLTEProcessor:
         wn_arr = wn_grid.value
         wn_min = wn_arr[0]
         wn_max = wn_arr[-1]
-        bin_edges = _bin_edges(wn_arr)
+        bin_edges = grid_bin_edges(wn_arr)
 
         # States lookup - much more memory efficient than duplicating it all with polars joins!
         state_ids = states_frac["id"].to_numpy()
@@ -2553,26 +945,26 @@ class NLTEProcessor:
         # absorption-weighted lifetime HWHM in profile_buffer[3].
         n_channels = 4 if self.do_super_lines else 3
         band_lookup, id_agg_offset, band_keys = _init_band_registry(states_frac["id_agg"].to_numpy())
-        inv_doppler, gamma_pressure = _layer_broadening_terms(
+        inv_doppler, gamma_pressure = layer_broadening_terms(
             temperatures=temperature_slice, pressures=pressure_slice, broad_n=broad_n, broad_gamma=broad_gamma,
             species_mass=self.species_mass, t_ref=296.0, pressure_ref=1.0,
         )
 
-        # The GPU keeps the profile buffer on the device for the whole batch loop (profiles_gpu.DeviceProfileBuffer), so
+        # The GPU keeps the profile buffer on the device for the whole batch loop (profiles.gpu.DeviceProfileBuffer), so
         # each batch only uploads its transitions. Its fixed costs (context, lookup upload, one buffer copy back) only pay
-        # off for large line lists (profiles_gpu.gpu_pays_off).
+        # off for large line lists (profiles.gpu.gpu_pays_off).
         device_buffer = None
         profile_buffer = None
         if config.USE_GPU and (self.do_super_lines or config.GPU_DIRECT_PROFILES):
-            from . import profiles_gpu
+            from .profiles import gpu
             # Upper bound on the buffer copied back at the end: every pair of aggregate levels forming a band.
-            if profiles_gpu.gpu_pays_off(
+            if gpu.gpu_pays_off(
                     trans_files=self.trans_files, n_layers=n_nlte_layers,
                     buffer_bytes=n_channels * self.n_agg_states ** 2 * n_nlte_layers * n_grid * 8,
                     label=str(self.species),
             ):
                 try:
-                    device_buffer = profiles_gpu.DeviceProfileBuffer(
+                    device_buffer = gpu.DeviceProfileBuffer(
                         n_channels=n_channels, n_bands=n_bands_max, wn_grid=wn_arr, bin_edges=bin_edges,
                         n_frac_lookup=n_frac_lookup, g_lookup=g_lookup, inv_g_lookup=inv_g_lookup,
                         gamma_lifetime_lookup=gamma_lifetime_lookup, inv_doppler=inv_doppler,
@@ -2582,7 +974,7 @@ class NLTEProcessor:
                     log.warning(f"{self.species}: {err} Using the CPU.")
         if device_buffer is None:
             profile_buffer = np.zeros((n_channels, n_bands_max, n_nlte_layers, n_grid), dtype=np.float64)
-        # Per-band, per-layer population-weighted sums of A_fi, B_fi and B_if (see _band_rate_sums).
+        # Per-band, per-layer population-weighted sums of A_fi, B_fi and B_if (see band_rate_sums).
         rate_sums = np.zeros((0, n_nlte_layers, 3), dtype=np.float64)
 
         process_time = time.perf_counter()
@@ -2591,7 +983,7 @@ class NLTEProcessor:
         # New
         for trans_file in self.trans_files:
             log.info(f"Processing file {trans_file}.")
-            for id_f, id_i, a_fi, energy_fi in _read_ahead(batches=_iter_trans_batches(
+            for id_f, id_i, a_fi, energy_fi in read_ahead(batches=iter_trans_batches(
                     trans_file=trans_file,
                     energy_lookup=energy_lookup,
                     wn_min=wn_min,
@@ -2612,7 +1004,7 @@ class NLTEProcessor:
                 # regroups the batch arrays (band_indices keeps the batch order).
                 rate_sums = np.pad(
                     rate_sums, ((0, n_bands_used - rate_sums.shape[0]), (0, 0), (0, 0))
-                ) + _band_rate_sums(
+                ) + band_rate_sums(
                     band_indices=band_indices, n_bands=n_bands_used, id_f=id_f, id_i=id_i, a_fi=a_fi,
                     energy_fi=energy_fi, g_lookup=g_lookup, inv_g_lookup=inv_g_lookup, n_frac_lookup=n_frac_lookup,
                 )
@@ -2634,7 +1026,7 @@ class NLTEProcessor:
                             band_indices=band_indices, id_f=id_f, id_i=id_i, a_fi=a_fi, energy_fi=energy_fi,
                         )
                     else:
-                        _accumulate_superline_band_batch(
+                        accumulate_superline_band_batch(
                             profile_buffer=profile_buffer,
                             band_indices=band_indices,
                             bin_edges=bin_edges,
@@ -2650,7 +1042,7 @@ class NLTEProcessor:
                         )
                 else:
                     # Make each band's transitions contiguous for the per-(band, layer) kernel.
-                    id_f, id_i, a_fi, energy_fi, group_bands, group_starts, group_ends = _group_by_band(
+                    id_f, id_i, a_fi, energy_fi, group_bands, group_starts, group_ends = group_by_band(
                         band_indices=band_indices, n_bands=n_bands_used, id_f=id_f, id_i=id_i, a_fi=a_fi,
                         energy_fi=energy_fi,
                     )
@@ -2660,7 +1052,7 @@ class NLTEProcessor:
                             group_ends=group_ends, a_fi=a_fi, energy_fi=energy_fi,
                         )
                     else:
-                        _band_profile_sampled_voigt(
+                        band_profile_sampled_voigt(
                             profile_buffer=profile_buffer,
                             wn_grid=wn_arr,
                             id_f=id_f,
@@ -2724,7 +1116,7 @@ class NLTEProcessor:
             log.log(_LOG_VERBOSE_2,
                     f"{self.species} rates/profiles duration = {time.perf_counter() - process_time:.3f}.")
         # Radiative rates between different aggregate states only, sorted by id_agg_i then id_agg_f; per NLTE layer,
-        # rates per molecule in the source aggregate (see _band_rate_sums).
+        # rates per molecule in the source aggregate (see band_rate_sums).
         inter_band = band_keys[:, 0] != band_keys[:, 1]
         keys = band_keys[inter_band].astype(np.int32)
         order = np.lexsort((keys[:, 0], keys[:, 1]))
@@ -2845,7 +1237,7 @@ class NLTEProcessor:
         wn_max = wn_arr[-1]
         n_grid = wn_grid.shape[0]
         # Bin edges for finding trans bins.
-        bin_edges = _bin_edges(wn_arr)
+        bin_edges = grid_bin_edges(wn_arr)
 
         # States lookup - much more memory efficient than duplicating it all with polars joins!
         state_ids = states_frac["id"].to_numpy()
@@ -2877,14 +1269,14 @@ class NLTEProcessor:
         n_channels = 2 if self.cont_do_super_lines else 1
         profile_buffer = np.zeros((n_channels, n_bands_max, n_nlte_layers, n_grid), dtype=np.float64)
         band_lookup, id_agg_offset, band_keys = _init_band_registry(states_frac["id_agg"].to_numpy())
-        # Per-band, per-layer population-weighted sums of A_fi, B_fi and B_if (see _band_rate_sums).
+        # Per-band, per-layer population-weighted sums of A_fi, B_fi and B_if (see band_rate_sums).
         rate_sums = np.zeros((0, n_nlte_layers, 3), dtype=np.float64)
 
         process_time = time.perf_counter()
 
         for cont_trans_file in self.cont_trans_files:
             log.info(f"Processing file {cont_trans_file}.")
-            for id_f, id_i, a_fi, energy_fi in _read_ahead(batches=_iter_trans_batches(
+            for id_f, id_i, a_fi, energy_fi in read_ahead(batches=iter_trans_batches(
                     trans_file=cont_trans_file,
                     energy_lookup=energy_lookup,
                     wn_min=wn_min,
@@ -2904,13 +1296,13 @@ class NLTEProcessor:
                 # regroups the batch arrays (band_indices keeps the batch order).
                 rate_sums = np.pad(
                     rate_sums, ((0, n_bands_used - rate_sums.shape[0]), (0, 0), (0, 0))
-                ) + _band_rate_sums(
+                ) + band_rate_sums(
                     band_indices=band_indices, n_bands=n_bands_used, id_f=id_f, id_i=id_i, a_fi=a_fi,
                     energy_fi=energy_fi, g_lookup=g_lookup, inv_g_lookup=inv_g_lookup, n_frac_lookup=n_frac_lookup,
                 )
                 profile_buffer = _grow_band_buffer(profile_buffer=profile_buffer, n_bands=n_bands_used)
                 if self.cont_do_super_lines:
-                    _accumulate_continuum_superline_band_batch(
+                    accumulate_continuum_superline_band_batch(
                         profile_buffer=profile_buffer,
                         band_indices=band_indices,
                         bin_edges=bin_edges,
@@ -2928,11 +1320,11 @@ class NLTEProcessor:
                     )
                 else:
                     # Make each band's transitions contiguous for the per-(band, layer) kernel.
-                    id_f, id_i, a_fi, energy_fi, group_bands, group_starts, group_ends = _group_by_band(
+                    id_f, id_i, a_fi, energy_fi, group_bands, group_starts, group_ends = group_by_band(
                         band_indices=band_indices, n_bands=n_bands_used, id_f=id_f, id_i=id_i, a_fi=a_fi,
                         energy_fi=energy_fi,
                     )
-                    _continuum_band_profile_sampled_gauss_layered(
+                    continuum_band_profile_sampled_gauss_layered(
                         profile_buffer=profile_buffer,
                         wn_grid=wn_arr,
                         id_f=id_f,
@@ -2956,7 +1348,7 @@ class NLTEProcessor:
         n_bands_used = band_keys.shape[0]
         profile_buffer = profile_buffer[:, :n_bands_used, :, :]
         if self.cont_do_super_lines:
-            profile_buffer = _broaden_continuum_superline_band_buffer(
+            profile_buffer = broaden_continuum_superline_band_buffer(
                 profile_buffer=profile_buffer,
                 wn_grid=wn_arr,
                 temperatures=temperature_slice,

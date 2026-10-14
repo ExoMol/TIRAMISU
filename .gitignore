@@ -3,3 +3,5 @@
 /.idea/
 /outputs/
 /tiramisu.egg-info/
+/colrate_pipeline/cache/
+/colrate_pipeline/data/*_basecol_raw.jsonl

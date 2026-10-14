@@ -9,7 +9,8 @@ from tiramisu import xsec
 from tiramisu.chemistry import ChemicalProfile
 from tiramisu.eclipse import ExoplanetEmission
 from tiramisu.config import log, output_dir
-from tiramisu.nlte import incident_stellar_radiation, cdf_opacity_sampling
+from tiramisu.nlte import incident_stellar_radiation
+from tiramisu.xsec import cdf_opacity_sampling
 from tiramisu.xsec import create_r_wn_grid
 from pathlib import Path
 
@@ -130,7 +131,6 @@ if __name__ == "__main__":
         toa_pressure=1e-6 << u.bar,
         nlayers=nlayers,
         chemistry_profile=chemistry_profile,
-        ngauss=4,
         central_pressure=central_pressure,
         pressure_levels=pressure_levels,
     )

@@ -213,14 +213,18 @@ CO + CO collisions (V-V exchange depends on two CO populations); reactions (the 
 .. rubric:: Change log
 
 - 2026-10-12: moved from ``colchem.py`` to ``colchem/co.py``.
-- 2026-10-12: H2 table corrected. It was the plain sum over the initial :math:`J` = 0-20 (``tests/co_collisions.py``),
-  19-24 times too fast; CO NLTE results with H2 from before then are not comparable.
+- 2026-10-12: H2 table corrected. It was the plain sum over the initial :math:`J` = 0-20
+  (``tests/colchem/co_collisions.py``), 19-24 times too fast; CO NLTE results with H2 from before then are not
+  comparable.
 - 2026-10-14: H from Song et al. (2015), replacing Balakrishnan, Yan & Dalgarno (2002); H2O added as a collider.
 - 2026-10-14: He from measured :math:`1 \to 0` rates, a single-quantum ladder and two-quantum steps, replacing
   Cecchi-Pestellini et al.'s (2002) table as published (see "He").
 - 2026-10-14: H2 rates include the H2-rotation channels in the flexible-H2 proportion (up 12-28%).
 - 2026-10-14: H2 rates computed from Forrey's cross sections, with para-H2 to :math:`J = 30` for :math:`v \le 1`
   (:math:`1 \to 0` up 3% above 1000 K).
+- 2026-10-14: physical constants from ``tiramisu.constants`` (astropy, CODATA 2018) instead of literals:
+  :math:`h c / k_B` = 1.43877688 cm K in place of the rounded 1.4387769 (:math:`\theta` of the H2O Landau-Teller
+  rate 1.6e-8 lower); :math:`k_B` and the atmosphere unchanged.
 
 .. rubric:: References
 
@@ -252,7 +256,9 @@ import typing as t
 
 import numpy as np
 import numpy.typing as npt
+from astropy import units as u
 
+from ..constants import const_atm, const_h_c_on_kB, const_k_B
 from .base import RateTransition, _interp_rate_batch
 
 
@@ -381,12 +387,9 @@ _CO_H2_RATES: t.Dict[t.Tuple[int, int], npt.NDArray[np.float64]] = {
 # Mosburg 1974) and 0.17 at 1230-2600 K (von Rosenberg, Bray & Pratt 1971), linear in T between and held outside;
 # CO's vibrational temperature theta = h c nu / k_B [K]; v -> v-1 relative to 1 -> 0 from Wang et al. (1999) at 300 K
 # for v = 1-8, continued in proportion to v up to _CO_V_MAX.
-_K_B = 1.380649e-16  # Boltzmann constant [erg/K]
-_ATM = 1.01325e6  # 1 standard atmosphere [dyn/cm^2]
-_US = 1e-6  # 1 microsecond [s]
-_HC_ON_KB = 1.4387769  # second radiation constant h c / k_B [cm K]
+_US = u.us.to(u.s)  # 1 microsecond [s]
 _CO_BAND_ORIGIN = 2143.271  # CO v = 1 -> 0 band origin [cm^-1] (ExoMol Li2015)
-_CO_THETA = _HC_ON_KB * _CO_BAND_ORIGIN  # CO's vibrational temperature [K], 3084 K
+_CO_THETA = const_h_c_on_kB * _CO_BAND_ORIGIN  # CO's vibrational temperature [K], 3084 K
 _CO_H2O_P_TAU_T = np.array([297.0, 1230.0])  # [K]
 _CO_H2O_P_TAU = np.array([0.205, 0.17])  # [atm us]
 _CO_H2O_WANG = np.array([1.7, 3.4, 6.2, 8.0, 9.0, 12.0, 16.0, 18.0])  # 1e-13 cm^3/s, v = 1-8
@@ -399,8 +402,8 @@ def _co_h2o_10(layer_temp: float) -> float:
     CO(v=1 -> 0) + H2O [cm^3/s] from the Landau-Teller relaxation time at 1 atm of H2O: 1/tau = n k (1 - exp(-theta/T))
     with n = p / (k_B T), so k = k_B T / (p tau (1 - exp(-theta / T))).
     """
-    p_tau = np.interp(layer_temp, _CO_H2O_P_TAU_T, _CO_H2O_P_TAU) * _ATM * _US  # [atm us] -> [dyn cm^-2 s]
-    return _K_B * layer_temp / (p_tau * (1.0 - np.exp(-_CO_THETA / layer_temp)))
+    p_tau = np.interp(layer_temp, _CO_H2O_P_TAU_T, _CO_H2O_P_TAU) * const_atm * _US  # [atm us] -> [dyn cm^-2 s]
+    return const_k_B * layer_temp / (p_tau * (1.0 - np.exp(-_CO_THETA / layer_temp)))
 
 
 _CO_RATE_GROUPS: t.List[t.Tuple[npt.NDArray[np.float64], t.Dict[t.Tuple[int, int], npt.NDArray[np.float64]], str]] = [

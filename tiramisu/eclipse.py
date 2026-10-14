@@ -7,8 +7,8 @@ import numpy as np
 from .chemistry import ChemicalProfile, SpeciesFormula
 from .atmos import build_pressure_profiles, density_profile, hydrostatic_radii
 from .xsec import XSecCollection
-from .nlte import (effective_source_tau_mu, four_pi_j_hemispheres, four_pi_j_spherical, emergent_flux,
-                   emergent_flux_spherical, mu_quadrature, spherical_rays)
+from .rt import (effective_source_tau_mu, four_pi_j_hemispheres, four_pi_j_spherical, emergent_flux,
+                 emergent_flux_spherical, mu_quadrature, spherical_rays)
 from .config import output_dir
 
 log = logging.getLogger(__name__)
@@ -44,7 +44,7 @@ class ExoplanetEmission:
 
         ``geometry`` sets the radiative transfer for the NLTE solution and the emission spectrum: ``"plane_parallel"``
         (the same directions at every layer) or ``"spherical"`` (rays through the concentric shells, see
-        :func:`tiramisu.nlte.spherical_rays`). Transmission chords are always spherical.
+        :func:`tiramisu.rt.spherical.spherical_rays`). Transmission chords are always spherical.
         """
         if geometry not in ("plane_parallel", "spherical"):
             raise ValueError(f"geometry must be 'plane_parallel' or 'spherical', not {geometry!r}.")
@@ -82,12 +82,12 @@ class ExoplanetEmission:
             incident_radiation_field: t.Union[u.Quantity, t.Callable[..., u.Quantity], None] = None,
     ) -> t.Tuple[u.Quantity, u.Quantity, npt.NDArray[np.float64], t.Dict[SpeciesFormula, u.Quantity]]:
         """
-        Returns the spectral grid, the emergent flux [W / (m^2 Hz)] (:func:`tiramisu.nlte.emergent_flux`, or
-        :func:`tiramisu.nlte.emergent_flux_spherical` normalised to ``planet_radius``), the per-layer optical depth and
-        the per-species opacities. With ``output_intensity``, also writes the emergent flux and the hemispheric 4*pi*J
-        profiles (at interfaces, :func:`tiramisu.nlte.four_pi_j_hemispheres`, or at layer centres,
-        :func:`tiramisu.nlte.four_pi_j_spherical`) to ``output_dir``. ``incident_radiation_field`` is as for
-        :class:`tiramisu.xsec.XSecCollection`.
+        Returns the spectral grid, the emergent flux [W / (m^2 Hz)] (:func:`tiramisu.rt.plane_parallel.emergent_flux`,
+        or :func:`tiramisu.rt.spherical.emergent_flux_spherical` normalised to ``planet_radius``), the per-layer optical
+        depth and the per-species opacities. With ``output_intensity``, also writes the emergent flux and the
+        hemispheric 4*pi*J profiles (at interfaces, :func:`tiramisu.rt.plane_parallel.four_pi_j_hemispheres`, or at
+        layer centres, :func:`tiramisu.rt.spherical.four_pi_j_spherical`) to ``output_dir``.
+        ``incident_radiation_field`` is as for :class:`tiramisu.xsec.XSecCollection`.
         """
         if spectral_grid is None:
             spectral_grid = xsecs.unified_grid
@@ -146,7 +146,7 @@ class ExoplanetEmission:
 
     def source_function(self, xsecs: XSecCollection) -> t.Tuple[u.Quantity, u.Quantity]:
         """Source function and opacity of the last ``xsecs.compute_opacities_profile``, with negative (masing) opacity
-        shielded as in the NLTE iteration (:func:`tiramisu.nlte.effective_source_tau_mu`)."""
+        shielded as in the NLTE iteration (:func:`tiramisu.rt.source.effective_source_tau_mu`)."""
         effective_source_func, _, effective_chi, _ = effective_source_tau_mu(
             global_source_func_matrix=xsecs._global_source_func_matrix,
             global_chi_matrix=xsecs._global_chi_matrix,
